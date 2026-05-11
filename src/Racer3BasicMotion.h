@@ -14,6 +14,14 @@ namespace RapidCode
 }
 }
 
+struct Racer3RunOptions
+{
+    bool dryRun = false;
+    bool enableOnly = true;
+    bool tinyMotion = false;
+    bool motionConfirmed = false;
+};
+
 class Racer3BasicMotion
 {
 public:
@@ -22,7 +30,7 @@ public:
     Racer3BasicMotion();
     ~Racer3BasicMotion();
 
-    void run();
+    void run(const Racer3RunOptions& options);
 
 private:
     RSI::RapidCode::MotionController* controller_;
@@ -33,7 +41,10 @@ private:
     void configureAxes();
     void clearFaults();
     void enableAmplifiers();
-    void runDemoMotion();
+    void enableOnlyTest();
+    void runTinyMotion();
+    void printMotionPlan() const;
+    void printActualPositions(const char* label);
     void disableAmplifiers();
     void safeShutdown() noexcept;
     void waitForMotionDone(int timeoutMilliseconds);

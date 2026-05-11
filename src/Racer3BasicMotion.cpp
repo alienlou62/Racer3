@@ -2,27 +2,46 @@
 
 #include <array>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
-#include <memory>
 #include <rsi.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace RR = RSI::RapidCode;
 
-static const std::array<std::array<double, Racer3BasicMotion::AxisCount>, 4> DemoOffsets = {
-    std::array<double, Racer3BasicMotion::AxisCount>{0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    std::array<double, Racer3BasicMotion::AxisCount>{5.0, -5.0, 5.0, 5.0, -5.0, 5.0},
-    std::array<double, Racer3BasicMotion::AxisCount>{-10.0, 10.0, -10.0, -10.0, 10.0, -10.0},
-    std::array<double, Racer3BasicMotion::AxisCount>{5.0, -5.0, 5.0, 5.0, -5.0, 5.0}
+namespace
+{
+using JointVector = std::array<double, Racer3BasicMotion::AxisCount>;
+
+// Extremely small relative offsets for the first real motion test.
+// These values assume RMP user units are degrees. Verify axis user units before motion.
+const std::array<JointVector, 4> TinyMotionOffsets = {
+    JointVector{0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    JointVector{0.25, -0.25, 0.25, 0.25, -0.25, 0.25},
+    JointVector{-0.50, 0.50, -0.50, -0.50, 0.50, -0.50},
+    JointVector{0.25, -0.25, 0.25, 0.25, -0.25, 0.25}
 };
 
-static constexpr double DemoVelocity = 5.0;
-static constexpr double DemoAcceleration = 10.0;
-static constexpr double DemoDeceleration = 10.0;
-static constexpr double DemoJerkPercent = 10.0;
+static constexpr double TinyVelocity = 0.5;
+static constexpr double TinyAcceleration = 1.0;
+static constexpr double TinyDeceleration = 1.0;
+static constexpr double TinyJerkPercent = 5.0;
 static constexpr int AmpEnableTimeoutMs = 10000;
 static constexpr int MotionTimeoutMs = 20000;
+static constexpr int EnableOnlyHoldSeconds = 2;
+
+void printJointVector(const JointVector& values)
+{
+    std::cout << std::fixed << std::setprecision(3);
+    for (double value : values)
+    {
+        std::cout << std::setw(8) << value << ' ';
+    }
+    std::cout << '\n';
+}
+}
 
 Racer3BasicMotion::Racer3BasicMotion()
     : controller_(nullptr), multiAxis_(nullptr), axes_{}
@@ -34,12 +53,32 @@ Racer3BasicMotion::~Racer3BasicMotion()
     safeShutdown();
 }
 
-void Racer3BasicMotion::run()
+void Racer3BasicMotion::run(const Racer3RunOptions& options)
 {
+    printMotionPlan();
+
+    if (options.dryRun)
+    {
+        std::cout << "Dry run complete. No RMP calls were made.\n";
+        return;
+    }
+
     connectController();
     clearFaults();
+    printActualPositions("Actual positions before amp enable");
     enableAmplifiers();
-    runDemoMotion();
+    printActualPositions("Actual positions after amp enable");
+
+    if (options.enableOnly)
+    {
+        enableOnlyTest();
+    }
+    else if (options.tinyMotion)
+    {
+        runTinyMotion();
+    }
+
+    printActualPositions("Actual positions before shutdown");
     disableAmplifiers();
     safeShutdown();
 }
@@ -50,10 +89,15 @@ void Racer3BasicMotion::connectController()
     controller_ = RR::MotionController::Create();
     if (!controller_)
     {
-        throw std::runtime_error("Failed to create MotionController.");
+        throw std::runtime_error("Failed to create MotionController. Confirm the RMP controller/network/server stack is running.");
     }
 
-    std::cout << "Creating/initializing MultiAxis group...\n";
+    configureAxes();
+}
+
+void Racer3BasicMotion::configureAxes()
+{
+    std::cout << "Creating/initializing Racer3 6-axis MultiAxis group...\n";
     multiAxis_ = controller_->MultiAxisGet(0);
     if (!multiAxis_)
     {
@@ -81,6 +125,7 @@ void Racer3BasicMotion::clearFaults()
     {
         throw std::runtime_error("MultiAxis object is not initialized.");
     }
+
     multiAxis_->ClearFaults();
 }
 
@@ -91,6 +136,7 @@ void Racer3BasicMotion::enableAmplifiers()
     {
         throw std::runtime_error("MultiAxis object is not initialized.");
     }
+
     const int result = multiAxis_->AmpEnableSet(true, AmpEnableTimeoutMs, false);
     if (result == 0)
     {
@@ -98,22 +144,76 @@ void Racer3BasicMotion::enableAmplifiers()
     }
 }
 
-void Racer3BasicMotion::runDemoMotion()
+void Racer3BasicMotion::enableOnlyTest()
 {
-    std::cout << "Starting demo motion sequence...\n";
+    std::cout << "Enable-only test active. Holding enabled state for " << EnableOnlyHoldSeconds << " seconds...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(EnableOnlyHoldSeconds));
+    std::cout << "Enable-only hold complete. No motion was commanded.\n";
+}
 
-    multiAxis_->VectorVelocitySet(DemoVelocity);
-    multiAxis_->VectorAccelerationSet(DemoAcceleration);
-    multiAxis_->VectorDecelerationSet(DemoDeceleration);
-    multiAxis_->VectorJerkPercentSet(DemoJerkPercent);
+void Racer3BasicMotion::runTinyMotion()
+{
+    std::cout << "Starting tiny relative joint-space motion sequence...\n";
+    std::cout << "IMPORTANT: These numbers assume the configured RMP user units are degrees.\n";
 
-    for (size_t stepIndex = 0; stepIndex < DemoOffsets.size(); ++stepIndex)
+    if (!multiAxis_)
     {
-        const auto& offset = DemoOffsets[stepIndex];
-        std::cout << "Motion step " << (stepIndex + 1) << " / " << DemoOffsets.size() << "\n";
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    multiAxis_->VectorVelocitySet(TinyVelocity);
+    multiAxis_->VectorAccelerationSet(TinyAcceleration);
+    multiAxis_->VectorDecelerationSet(TinyDeceleration);
+    multiAxis_->VectorJerkPercentSet(TinyJerkPercent);
+
+    for (size_t stepIndex = 0; stepIndex < TinyMotionOffsets.size(); ++stepIndex)
+    {
+        const auto& offset = TinyMotionOffsets[stepIndex];
+        std::cout << "Tiny motion step " << (stepIndex + 1) << " / " << TinyMotionOffsets.size() << ": ";
+        printJointVector(offset);
         multiAxis_->MoveVectorRelative(offset.data());
         waitForMotionDone(MotionTimeoutMs);
     }
+}
+
+void Racer3BasicMotion::printMotionPlan() const
+{
+    std::cout << "\nPlanned tiny relative joint offsets: J1 J2 J3 J4 J5 J6\n";
+    JointVector netOffset{};
+    for (size_t stepIndex = 0; stepIndex < TinyMotionOffsets.size(); ++stepIndex)
+    {
+        std::cout << "  Step " << (stepIndex + 1) << ": ";
+        printJointVector(TinyMotionOffsets[stepIndex]);
+        for (size_t axis = 0; axis < netOffset.size(); ++axis)
+        {
+            netOffset[axis] += TinyMotionOffsets[stepIndex][axis];
+        }
+    }
+
+    std::cout << "  Net relative offset after sequence: ";
+    printJointVector(netOffset);
+    std::cout << "  Velocity=" << TinyVelocity
+              << ", Acceleration=" << TinyAcceleration
+              << ", Deceleration=" << TinyDeceleration
+              << ", JerkPercent=" << TinyJerkPercent << "\n\n";
+}
+
+void Racer3BasicMotion::printActualPositions(const char* label)
+{
+    std::cout << label << ": ";
+    std::cout << std::fixed << std::setprecision(6);
+    for (auto* axis : axes_)
+    {
+        if (axis)
+        {
+            std::cout << axis->ActualPositionGet() << ' ';
+        }
+        else
+        {
+            std::cout << "<null> ";
+        }
+    }
+    std::cout << '\n';
 }
 
 void Racer3BasicMotion::disableAmplifiers()
@@ -158,7 +258,7 @@ void Racer3BasicMotion::safeShutdown() noexcept
             axes_.fill(nullptr);
         }
     }
-    catch (...) 
+    catch (...)
     {
         // Best effort cleanup; do not throw from destructor.
     }

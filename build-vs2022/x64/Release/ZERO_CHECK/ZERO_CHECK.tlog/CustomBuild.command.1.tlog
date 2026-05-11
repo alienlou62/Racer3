@@ -1,0 +1,10 @@
+^C:\USERS\JP\RACER3-RMP-BASIC-MOTION\BUILD-VS2022\CMAKEFILES\48C6FFC94A102CABFA56738E5B2909EC\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/JP/racer3-rmp-basic-motion -BC:/Users/JP/racer3-rmp-basic-motion/build-vs2022 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/JP/racer3-rmp-basic-motion/build-vs2022/racer3-rmp-basic-motion.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

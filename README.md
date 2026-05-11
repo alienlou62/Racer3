@@ -53,3 +53,24 @@ The program prints a safety warning and waits for Enter before sending motion co
 - `config/axes.json` now includes conservative Racer3 joint limits and historical hardware parameters from the legacy RapidRobot test driver.
 - The current implementation does not yet parse `config/axes.json`; it provides the starter configuration for later milestones.
 - Always keep the robot under manual control while testing.
+## Safe test commands
+
+Dry run only, no RMP connection:
+
+```cmd
+racer3-basic-motion.exe --dry-run
+```
+
+Enable then disable only, no motion:
+
+```cmd
+racer3-basic-motion.exe --enable-only
+```
+
+Tiny relative joint-space motion, requires explicit confirmation flag:
+
+```cmd
+racer3-basic-motion.exe --tiny-motion --confirm-motion
+```
+
+Default behavior is enable-only. Real motion is opt-in.

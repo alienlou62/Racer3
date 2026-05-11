@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\JP\racer3-rmp-basic-motion\build-vs2022\CMakeFiles\48c6ffc94a102cabfa56738e5b2909ec\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{9D43267C-724A-3FEE-B667-40EEA30AB56A}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
