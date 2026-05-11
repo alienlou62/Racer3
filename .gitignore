@@ -3,3 +3,6 @@ build/
 *.user
 *.log
 *.csv
+build/
+build-vs2022/
+
