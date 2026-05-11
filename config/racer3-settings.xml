@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<XMLSettings xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExpectedNodeCount>6</ExpectedNodeCount>
+  <ExpectedNodeTypes>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+  </ExpectedNodeTypes>
+  <NetworkStartTimeoutMilliseconds xsi:nil="true" />
+  <SampleRate>1000</SampleRate>
+  <AxisCount>6</AxisCount>
+  <MotionCount>6</MotionCount>
+  <UserLimitCount>0</UserLimitCount>
+  <RecorderCount>0</RecorderCount>
+  <RecorderBufferSize />
+  <CompensatorCount>0</CompensatorCount>
+  <CompensatorPointCount />
+  <AxisFrameBufferSize>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+  </AxisFrameBufferSize>
+  <MathBlockCount>0</MathBlockCount>
+  <XMLFiles>
+    <AxisXML>
+      <AxisNumber>0</AxisNumber>
+      <XMLFile>Axis 0.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>1</AxisNumber>
+      <XMLFile>Axis 1.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>2</AxisNumber>
+      <XMLFile>Axis 2.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>3</AxisNumber>
+      <XMLFile>Axis 3.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>4</AxisNumber>
+      <XMLFile>Axis 4.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>5</AxisNumber>
+      <XMLFile>Axis 5.xml</XMLFile>
+    </AxisXML>
+  </XMLFiles>
+  <MultiAxisXMLFiles />
+  <RTTaskManagers />
+</XMLSettings>

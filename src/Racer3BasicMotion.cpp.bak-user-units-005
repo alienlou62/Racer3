@@ -1,0 +1,383 @@
+#include "Racer3BasicMotion.h"
+
+#include <array>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <rsi.h>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace RR = RSI::RapidCode;
+
+namespace
+{
+using JointVector = std::array<double, Racer3BasicMotion::AxisCount>;
+
+// Racer3 axis units from the Racer 3 Info spreadsheet.
+// RapidCode expects counts per user unit. For this project, 1.0 user unit = 1 physical joint revolution.
+const JointVector Racer3CountsPerUserUnit = {
+    83886080.0, // Axis0 / J1: 80:1
+    83886080.0, // Axis1 / J2: 80:1
+    67108864.0, // Axis2 / J3: 64:1
+    67108864.0, // Axis3 / J4: 64:1
+    67108864.0, // Axis4 / J5: 64:1
+    41943040.0  // Axis5 / J6: 40:1
+};
+
+// Spreadsheet travel limits are also in user units/revolutions.
+// Axis5 was marked free in the sheet, so do not enforce a software limit for it yet.
+const JointVector Racer3NegativeLimitUserUnits = {
+    -0.49,
+    -0.25,
+    -0.50,
+    -0.58,
+    -0.33,
+    0.0
+};
+
+const JointVector Racer3PositiveLimitUserUnits = {
+    0.49,
+    0.35,
+    0.30,
+    0.56,
+    0.33,
+    0.0
+};
+
+static constexpr double DegreesPerUserUnit = 360.0;
+
+// Extremely small relative offsets for the first real motion test, expressed in degrees for readability.
+// These are converted to user units/revolutions before being sent to RMP.
+const std::array<JointVector, 4> TinyMotionOffsetsDegrees = {
+    JointVector{0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    JointVector{0.25, -0.25, 0.25, 0.25, -0.25, 0.25},
+    JointVector{-0.50, 0.50, -0.50, -0.50, 0.50, -0.50},
+    JointVector{0.25, -0.25, 0.25, 0.25, -0.25, 0.25}
+};
+
+// Motion rates are defined in degrees for readability and converted to user units/revolutions.
+// 0.5 deg/sec = 0.0013888889 rev/sec.
+static constexpr double TinyVelocityDegPerSec = 0.5;
+static constexpr double TinyAccelerationDegPerSec2 = 1.0;
+static constexpr double TinyDecelerationDegPerSec2 = 1.0;
+
+static constexpr double TinyVelocityUserUnits = TinyVelocityDegPerSec / DegreesPerUserUnit;
+static constexpr double TinyAccelerationUserUnits = TinyAccelerationDegPerSec2 / DegreesPerUserUnit;
+static constexpr double TinyDecelerationUserUnits = TinyDecelerationDegPerSec2 / DegreesPerUserUnit;
+static constexpr double TinyJerkPercent = 5.0;
+static constexpr int AmpEnableTimeoutMs = 10000;
+static constexpr int MotionTimeoutMs = 20000;
+static constexpr int EnableOnlyHoldSeconds = 2;
+
+JointVector degreesToUserUnits(const JointVector& degrees)
+{
+    JointVector userUnits{};
+    for (size_t axis = 0; axis < userUnits.size(); ++axis)
+    {
+        userUnits[axis] = degrees[axis] / DegreesPerUserUnit;
+    }
+    return userUnits;
+}
+
+std::array<JointVector, 4> tinyMotionOffsetsUserUnits()
+{
+    std::array<JointVector, 4> offsets{};
+    for (size_t stepIndex = 0; stepIndex < offsets.size(); ++stepIndex)
+    {
+        offsets[stepIndex] = degreesToUserUnits(TinyMotionOffsetsDegrees[stepIndex]);
+    }
+    return offsets;
+}
+
+void printJointVector(const JointVector& values)
+{
+    std::cout << std::fixed << std::setprecision(6);
+    for (double value : values)
+    {
+        std::cout << std::setw(8) << value << ' ';
+    }
+    std::cout << '\n';
+}
+}
+
+Racer3BasicMotion::Racer3BasicMotion()
+    : controller_(nullptr), multiAxis_(nullptr), axes_{}
+{
+}
+
+Racer3BasicMotion::~Racer3BasicMotion()
+{
+    safeShutdown();
+}
+
+void Racer3BasicMotion::run(const Racer3RunOptions& options)
+{
+    printMotionPlan();
+
+    if (options.dryRun)
+    {
+        std::cout << "Dry run complete. No RMP calls were made.\n";
+        return;
+    }
+
+    connectController();
+    clearFaults();
+
+    std::cout << "Setting current physical position as software zero for all axes...\n";
+    std::cout << "NOTE: This does not physically home the robot. It makes the current pose read as 0.0 user-units on J1-J6.\n";
+    for (auto* axis : axes_)
+    {
+        if (axis)
+        {
+            axis->PositionSet(0.0);
+        }
+    }
+    printActualPositions("Actual positions after software zero");
+
+    enableAmplifiers();
+    printActualPositions("Actual positions after amp enable");
+
+    if (options.enableOnly)
+    {
+        enableOnlyTest();
+    }
+    else if (options.tinyMotion)
+    {
+        runTinyMotion();
+    }
+
+    printActualPositions("Actual positions before shutdown");
+    disableAmplifiers();
+    safeShutdown();
+}
+
+void Racer3BasicMotion::connectController()
+{
+    std::cout << "Connecting to RSI MotionController...\n";
+    controller_ = RR::MotionController::Create();
+    if (!controller_)
+    {
+        throw std::runtime_error("Failed to create MotionController. Confirm the RMP controller/network/server stack is running.");
+    }
+
+    configureAxes();
+}
+
+void Racer3BasicMotion::configureAxes()
+{
+    std::cout << "Creating/initializing Racer3 6-axis MultiAxis group...\n";
+    multiAxis_ = controller_->MultiAxisGet(0);
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("Failed to get MultiAxis object.");
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        axes_[index] = controller_->AxisGet(index);
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Failed to get Axis " + std::to_string(index));
+        }
+
+        axes_[index]->UserUnitsSet(Racer3CountsPerUserUnit[index]);
+        std::cout << "Axis " << index
+                  << " user units set to " << Racer3CountsPerUserUnit[index]
+                  << " counts/user-unit; 1.0 user-unit = 1 joint revolution.\n";
+    }
+
+    multiAxis_->AxisRemoveAll();
+    multiAxis_->AxesAdd(axes_.data(), AxisCount);
+    multiAxis_->UserLabelSet("Racer3BasicMotion");
+}
+
+void Racer3BasicMotion::clearFaults()
+{
+    std::cout << "Clearing faults...\n";
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    multiAxis_->ClearFaults();
+}
+
+void Racer3BasicMotion::enableAmplifiers()
+{
+    std::cout << "Enabling amplifiers...\n";
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    const int result = multiAxis_->AmpEnableSet(true, AmpEnableTimeoutMs, false);
+    if (result == 0)
+    {
+        throw std::runtime_error("AmpEnableSet failed or timed out.");
+    }
+}
+
+void Racer3BasicMotion::enableOnlyTest()
+{
+    std::cout << "Enable-only test active. Holding enabled state for " << EnableOnlyHoldSeconds << " seconds...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(EnableOnlyHoldSeconds));
+    std::cout << "Enable-only hold complete. No motion was commanded.\n";
+}
+
+void Racer3BasicMotion::runTinyMotion()
+{
+    std::cout << "Starting tiny relative joint-space motion sequence...\n";
+    std::cout << "RMP user units are configured as revolutions: 1.0 user-unit = 360 degrees.\n";
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    const auto offsetsUserUnits = tinyMotionOffsetsUserUnits();
+
+    multiAxis_->VectorVelocitySet(TinyVelocityUserUnits);
+    multiAxis_->VectorAccelerationSet(TinyAccelerationUserUnits);
+    multiAxis_->VectorDecelerationSet(TinyDecelerationUserUnits);
+    multiAxis_->VectorJerkPercentSet(TinyJerkPercent);
+
+    for (size_t stepIndex = 0; stepIndex < offsetsUserUnits.size(); ++stepIndex)
+    {
+        const auto& offsetUserUnits = offsetsUserUnits[stepIndex];
+
+        std::cout << "Tiny motion step " << (stepIndex + 1) << " / " << offsetsUserUnits.size() << " degrees: ";
+        printJointVector(TinyMotionOffsetsDegrees[stepIndex]);
+
+        std::cout << "Tiny motion step " << (stepIndex + 1) << " / " << offsetsUserUnits.size() << " user-units/rev: ";
+        printJointVector(offsetUserUnits);
+
+        multiAxis_->MoveVectorRelative(offsetUserUnits.data());
+        waitForMotionDone(MotionTimeoutMs);
+    }
+}
+
+void Racer3BasicMotion::printMotionPlan() const
+{
+    const auto offsetsUserUnits = tinyMotionOffsetsUserUnits();
+
+    std::cout << "\nRacer3 user-unit mapping: 1.0 user-unit = 1 physical joint revolution = 360 degrees.\n";
+    std::cout << "Counts per user unit: ";
+    printJointVector(Racer3CountsPerUserUnit);
+    std::cout << "Negative soft/reference limits, user-units/rev: ";
+    printJointVector(Racer3NegativeLimitUserUnits);
+    std::cout << "Positive soft/reference limits, user-units/rev: ";
+    printJointVector(Racer3PositiveLimitUserUnits);
+
+    std::cout << "\nPlanned tiny relative joint offsets in degrees: J1 J2 J3 J4 J5 J6\n";
+    JointVector netOffsetDegrees{};
+    for (size_t stepIndex = 0; stepIndex < TinyMotionOffsetsDegrees.size(); ++stepIndex)
+    {
+        std::cout << "  Step " << (stepIndex + 1) << ": ";
+        printJointVector(TinyMotionOffsetsDegrees[stepIndex]);
+        for (size_t axis = 0; axis < netOffsetDegrees.size(); ++axis)
+        {
+            netOffsetDegrees[axis] += TinyMotionOffsetsDegrees[stepIndex][axis];
+        }
+    }
+
+    std::cout << "  Net relative offset after sequence, degrees: ";
+    printJointVector(netOffsetDegrees);
+
+    std::cout << "\nPlanned tiny relative joint offsets in RMP user-units/revolutions: J1 J2 J3 J4 J5 J6\n";
+    JointVector netOffsetUserUnits{};
+    for (size_t stepIndex = 0; stepIndex < offsetsUserUnits.size(); ++stepIndex)
+    {
+        std::cout << "  Step " << (stepIndex + 1) << ": ";
+        printJointVector(offsetsUserUnits[stepIndex]);
+        for (size_t axis = 0; axis < netOffsetUserUnits.size(); ++axis)
+        {
+            netOffsetUserUnits[axis] += offsetsUserUnits[stepIndex][axis];
+        }
+    }
+
+    std::cout << "  Net relative offset after sequence, user-units/rev: ";
+    printJointVector(netOffsetUserUnits);
+
+    std::cout << "  Velocity=" << TinyVelocityDegPerSec << " deg/sec = " << TinyVelocityUserUnits << " rev/sec\n"
+              << "  Acceleration=" << TinyAccelerationDegPerSec2 << " deg/sec^2 = " << TinyAccelerationUserUnits << " rev/sec^2\n"
+              << "  Deceleration=" << TinyDecelerationDegPerSec2 << " deg/sec^2 = " << TinyDecelerationUserUnits << " rev/sec^2\n"
+              << "  JerkPercent=" << TinyJerkPercent << "\n\n";
+}
+
+void Racer3BasicMotion::printActualPositions(const char* label)
+{
+    std::cout << label << " user-units/rev: ";
+    std::cout << std::fixed << std::setprecision(6);
+    JointVector positionsUserUnits{};
+
+    for (size_t axisIndex = 0; axisIndex < axes_.size(); ++axisIndex)
+    {
+        auto* axis = axes_[axisIndex];
+        if (axis)
+        {
+            positionsUserUnits[axisIndex] = axis->ActualPositionGet();
+            std::cout << positionsUserUnits[axisIndex] << ' ';
+        }
+        else
+        {
+            std::cout << "<null> ";
+        }
+    }
+
+    std::cout << '\n' << label << " degrees: ";
+    for (double positionUserUnits : positionsUserUnits)
+    {
+        std::cout << (positionUserUnits * DegreesPerUserUnit) << ' ';
+    }
+    std::cout << '\n';
+}
+
+void Racer3BasicMotion::disableAmplifiers()
+{
+    if (!multiAxis_)
+    {
+        return;
+    }
+
+    std::cout << "Disabling amplifiers...\n";
+    multiAxis_->AmpEnableSet(false);
+}
+
+void Racer3BasicMotion::waitForMotionDone(int timeoutMilliseconds)
+{
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    const int32_t done = multiAxis_->MotionDoneWait(timeoutMilliseconds);
+    if (done == 0)
+    {
+        throw std::runtime_error("Motion did not complete within the timeout period.");
+    }
+}
+
+void Racer3BasicMotion::safeShutdown() noexcept
+{
+    try
+    {
+        if (controller_)
+        {
+            if (multiAxis_)
+            {
+                multiAxis_->AmpEnableSet(false);
+            }
+
+            controller_->Delete();
+            controller_ = nullptr;
+            multiAxis_ = nullptr;
+            axes_.fill(nullptr);
+        }
+    }
+    catch (...)
+    {
+        // Best effort cleanup; do not throw from destructor.
+    }
+}
