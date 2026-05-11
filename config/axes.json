@@ -1,0 +1,40 @@
+{
+  "robot": "Comau Racer 3",
+  "controller": "RSI RMP",
+  "axis_map": {
+    "J1": 0,
+    "J2": 1,
+    "J3": 2,
+    "J4": 3,
+    "J5": 4,
+    "J6": 5
+  },
+  "axis_limits": {
+    "J1": { "min_deg": -150.0, "max_deg": 150.0 },
+    "J2": { "min_deg": -95.0, "max_deg": 135.0 },
+    "J3": { "min_deg": -155.0, "max_deg": 90.0 },
+    "J4": { "min_deg": -200.0, "max_deg": 200.0 },
+    "J5": { "min_deg": -125.0, "max_deg": 125.0 },
+    "J6": { "min_deg": -540.0, "max_deg": 540.0 }
+  },
+  "motion_limits": {
+    "velocity_deg_per_s": 5.0,
+    "acceleration_deg_per_s2": 10.0,
+    "deceleration_deg_per_s2": 10.0,
+    "jerk_percent": 10.0,
+    "max_safe_velocity_deg_per_s": 100.0,
+    "max_safe_acceleration_deg_per_s2": 1500.0
+  },
+  "hardware_limits": {
+    "drive_units": [238312.7272, 233016.88888, 209715.2, 178257.92, 178257.92, 116508.4444],
+    "joint_velocity_limits_deg_per_s": [440.0, 450.0, 500.0, 600.0, 600.0, 900.0],
+    "joint_acceleration_limits_deg_per_s2": [1500.0, 1500.0, 1500.0, 1500.0, 1500.0, 1800.0]
+  },
+  "homing_pose_deg": [0.0, 0.0, -90.0, 0.0, 90.0, 0.0],
+  "demo_sequence": [
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [5.0, -5.0, 5.0, 5.0, -5.0, 5.0],
+    [-10.0, 10.0, -10.0, -10.0, 10.0, -10.0],
+    [5.0, -5.0, 5.0, 5.0, -5.0, 5.0]
+  ]
+}
