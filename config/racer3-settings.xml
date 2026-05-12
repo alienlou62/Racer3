@@ -12,7 +12,7 @@
   <NetworkStartTimeoutMilliseconds xsi:nil="true" />
   <SampleRate>1000</SampleRate>
   <AxisCount>6</AxisCount>
-  <MotionCount>6</MotionCount>
+  <MotionCount>7</MotionCount>
   <UserLimitCount>0</UserLimitCount>
   <RecorderCount>0</RecorderCount>
   <RecorderBufferSize />
@@ -53,6 +53,10 @@
       <XMLFile>Axis 5.xml</XMLFile>
     </AxisXML>
   </XMLFiles>
-  <MultiAxisXMLFiles />
-  <RTTaskManagers />
+  <MultiAxisXMLFiles>
+  <MultiAxisXML>
+    <MotionSupervisorIndex>6</MotionSupervisorIndex>
+    <XMLFile>MultiAxis.xml</XMLFile>
+  </MultiAxisXML>
+  </MultiAxisXMLFiles>
 </XMLSettings>

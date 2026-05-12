@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <SerializableAxis xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <AxisNumber>5</AxisNumber>
-  <UserUnits>1</UserUnits>
+  <UserUnits>41943040</UserUnits>
   <MotorType>RSIMotorTypeSERVO</MotorType>
   <Properties>
     <string>BacklashWidth=0</string>
