@@ -33,7 +33,9 @@ void printUsage()
         << "  racer3-basic-motion --all-motion --confirm-motion [--step 0.01] [--velocity 0.02] [--diagnostics]\n"
         << "  racer3-basic-motion --joint-vector --confirm-motion --joints j1,j2,j3,j4,j5,j6 [--velocity 0.02] [--return-warn 0.00025] [--return-fail 0.001] [--diagnostics]\n"
         << "  racer3-basic-motion --robot-model-probe [--diagnostics]\n"
-        << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n\n"
+        << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n"
+        << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
+        << "  racer3-basic-motion --cartesian-vector [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -43,10 +45,13 @@ void printUsage()
         << "  --joint-vector     Enable all drives, remap MultiAxis to J1-J6, and move a custom joint vector.\n"
         << "  --robot-model-probe Connect/load MultiAxis and probe the RSI_Racer3 Cartesian Robot model. No amp enable or motion.\n"
         << "  --robot-pose-probe  Connect/load MultiAxis and probe read-only Robot pose/FK/IK APIs. No amp enable or motion.\n"
+        << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
+        << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
         << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
         << "  --joints <list>    Six comma-separated user-unit deltas for --joint-vector, e.g. 0,0,0,0,0.005,0.005.\n"
+        << "  --cartesian <list> Six comma-separated Cartesian deltas for --kinematics-dry-run or --cartesian-vector: dx,dy,dz meters and droll,dpitch,dyaw radians.\n"
         << "  --velocity <value> Velocity in user-units/sec. Default 0.05.\n"
         << "  --return-warn <value> Warn if final absolute actual position exceeds this user-unit tolerance. Default 0.00025.\n"
         << "  --return-fail <value> Fail if final absolute actual position exceeds this user-unit tolerance. Default 0.001.\n"
@@ -149,7 +154,7 @@ std::string getStringOption(
     return defaultValue;
 }
 
-std::array<double, AxisCount> parseJointVector(const std::string& text)
+std::array<double, AxisCount> parseSixValueVector(const std::string& text, const std::string& optionName)
 {
     std::array<double, AxisCount> values{};
 
@@ -161,19 +166,29 @@ std::array<double, AxisCount> parseJointVector(const std::string& text)
     {
         if (index >= AxisCount)
         {
-            throw std::runtime_error("--joints must contain exactly six comma-separated values.");
+            throw std::runtime_error(optionName + " must contain exactly six comma-separated values.");
         }
 
-        values[index] = parseDoubleValue(token, "--joints");
+        values[index] = parseDoubleValue(token, optionName);
         ++index;
     }
 
     if (index != AxisCount)
     {
-        throw std::runtime_error("--joints must contain exactly six comma-separated values.");
+        throw std::runtime_error(optionName + " must contain exactly six comma-separated values.");
     }
 
     return values;
+}
+
+std::array<double, AxisCount> parseJointVector(const std::string& text)
+{
+    return parseSixValueVector(text, "--joints");
+}
+
+std::array<double, AxisCount> parseCartesianVector(const std::string& text)
+{
+    return parseSixValueVector(text, "--cartesian");
 }
 
 bool jointVectorHasMotion(const std::array<double, AxisCount>& values)
@@ -273,7 +288,9 @@ int main(int argc, char* argv[])
         options.jointVectorMotion = hasArg(args, "--joint-vector");
         options.robotModelProbe = hasArg(args, "--robot-model-probe");
         options.robotPoseProbe = hasArg(args, "--robot-pose-probe");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe);
+        options.kinematicsDryRun = hasArg(args, "--kinematics-dry-run");
+        options.cartesianVectorMotion = hasArg(args, "--cartesian-vector");
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.cartesianVectorMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
@@ -291,6 +308,12 @@ int main(int argc, char* argv[])
             options.jointVectorUserUnits = parseJointVector(jointsText);
         }
 
+        const std::string cartesianText = getStringOption(args, "--cartesian", "0,0,0,0,0,0");
+        if (options.kinematicsDryRun || options.cartesianVectorMotion)
+        {
+            options.cartesianVector = parseCartesianVector(cartesianText);
+        }
+
         if (hasArg(args, "--vel"))
         {
             options.velocityUserUnitsPerSecond = getDoubleOption(args, "--vel", DefaultVelocityUserUnitsPerSecond);
@@ -304,10 +327,12 @@ int main(int argc, char* argv[])
             (options.allMotion ? 1 : 0) +
             (options.jointVectorMotion ? 1 : 0) +
             (options.robotModelProbe ? 1 : 0) +
-            (options.robotPoseProbe ? 1 : 0);
+            (options.robotPoseProbe ? 1 : 0) +
+            (options.kinematicsDryRun ? 1 : 0) +
+            (options.cartesianVectorMotion ? 1 : 0);
         if (motionModeCount > 1)
         {
-            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, or --robot-pose-probe.\n";
+            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, --robot-pose-probe, --kinematics-dry-run, or --cartesian-vector.\n";
             return 2;
         }
 
@@ -354,6 +379,21 @@ int main(int argc, char* argv[])
         {
             std::cout << "Mode: ROBOT POSE PROBE - no amp enable, no motion.\n";
         }
+        else if (options.kinematicsDryRun)
+        {
+            std::cout << "Mode: KINEMATICS DRY RUN - custom OpenRAVE Racer3 FK scaffold, no amp enable, no motion.\n";
+        }
+        else if (options.cartesianVectorMotion)
+        {
+            if (options.motionConfirmed)
+            {
+                std::cout << "Mode: CARTESIAN VECTOR - guarded Cartesian IK candidate with motion enabled only if validation gates pass.\n";
+            }
+            else
+            {
+                std::cout << "Mode: CARTESIAN VECTOR DRY RUN - compute guarded Cartesian IK candidate only; no amp enable, no motion.\n";
+            }
+        }
 
         std::cout << "Motion step: " << options.stepUserUnits
                   << " user units = " << (options.stepUserUnits * 360.0) << " degrees.\n";
@@ -363,6 +403,16 @@ int main(int argc, char* argv[])
         {
             std::cout << "Joint vector [J1..J6] user units:";
             for (double value : options.jointVectorUserUnits)
+            {
+                std::cout << " " << value;
+            }
+            std::cout << "\n";
+        }
+
+        if (options.kinematicsDryRun || options.cartesianVectorMotion)
+        {
+            std::cout << "Cartesian delta [dx,dy,dz meters, droll,dpitch,dyaw radians]:";
+            for (double value : options.cartesianVector)
             {
                 std::cout << " " << value;
             }

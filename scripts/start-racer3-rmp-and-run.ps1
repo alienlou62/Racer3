@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe", "kinematics-dry-run", "cartesian-vector")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -22,7 +22,9 @@ param(
 
     [switch]$Diagnostics,
 
-    [string]$Joints = ""
+    [string]$Joints = "",
+
+    [string]$Cartesian = "0,0,0,0,0,0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +53,7 @@ Write-Host "Velocity:  $Velocity user-units/sec"
 Write-Host "ReturnWarn: $ReturnWarn user units"
 Write-Host "ReturnFail: $ReturnFail user units"
 if ($Mode -eq "joint-vector") { Write-Host "Joints:    $Joints" }
+if ($Mode -eq "kinematics-dry-run" -or $Mode -eq "cartesian-vector") { Write-Host "Cartesian: $Cartesian" }
 Write-Host "Diag:      $Diagnostics"
 Write-Host "Dry run:   $DryRun"
 
@@ -195,6 +198,26 @@ switch ($Mode) {
         else {
             $ExeArgs += "--robot-pose-probe"
         }
+    }
+    "kinematics-dry-run" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--kinematics-dry-run"
+        }
+        else {
+            $ExeArgs += "--kinematics-dry-run"
+        }
+        $ExeArgs += "--cartesian"
+        $ExeArgs += $Cartesian
+    }
+    "cartesian-vector" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+        }
+        $ExeArgs += "--cartesian-vector"
+        $ExeArgs += "--cartesian"
+        $ExeArgs += $Cartesian
+        if ($ConfirmMotion) { $ExeArgs += "--confirm-motion" }
     }
     "joint-vector" {
         if ([string]::IsNullOrWhiteSpace($Joints)) {

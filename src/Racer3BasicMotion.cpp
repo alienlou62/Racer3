@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
+#include <limits>
 #include <iostream>
 #include <rsi.h>
 #include <cartesianrobot.h>
@@ -22,6 +23,7 @@ namespace RC = RSI::RapidCode::Cartesian;
 namespace
 {
 using JointVector = std::array<double, Racer3BasicMotion::AxisCount>;
+using CartesianVector = std::array<double, Racer3BasicMotion::AxisCount>;
 
 static constexpr int MultiAxisIndex = 6;
 static constexpr int Axis5Index = 4;
@@ -78,9 +80,13 @@ static bool AllMotionEnabled = false;
 static bool JointVectorMotionEnabled = false;
 static bool RobotModelProbeEnabled = false;
 static bool RobotPoseProbeEnabled = false;
+static bool KinematicsDryRunEnabled = false;
+static bool CartesianVectorMotionEnabled = false;
+static bool CartesianVectorMotionConfirmed = false;
 static double ReturnWarnToleranceUserUnits = 0.00025;
 static double ReturnFailToleranceUserUnits = 0.00100;
 static JointVector RequestedJointVector{};
+static CartesianVector RequestedCartesianVector{};
 
 double toDegrees(double userUnits)
 {
@@ -113,6 +119,1358 @@ JointVector makeAxis5And6Vector(double axis5Value, double axis6Value)
     values[Axis6Index] = axis6Value;
     return values;
 }
+
+static constexpr double Pi = 3.141592653589793238462643383279502884;
+static constexpr double RevolutionsToRadians = 2.0 * Pi;
+
+// OpenRAVE/RapidRobot Racer3 geometry extracted from racer3.kinbody.xml
+// and racer3.robot.xml. Units are meters and radians.
+struct FkVec3
+{
+    double x;
+    double y;
+    double z;
+};
+
+struct FkMat4
+{
+    double m[4][4];
+};
+
+const std::array<FkVec3, Racer3BasicMotion::AxisCount> OpenRaveJointAnchors = {{
+    {0.0,  0.0, 0.0},
+    {0.05, 0.0, 0.365},
+    {0.05, 0.0, 0.635},
+    {0.0,  0.0, 0.676},
+    {0.0,  0.0, 0.94094},
+    {0.0,  0.0, 1.01194}
+}};
+
+const std::array<FkVec3, Racer3BasicMotion::AxisCount> OpenRaveJointAxes = {{
+    {0.0,  0.0, -1.0},
+    {0.0,  1.0,  0.0},
+    {0.0, -1.0,  0.0},
+    {0.0,  0.0, -1.0},
+    {0.0,  1.0,  0.0},
+    {0.0,  0.0, -1.0}
+}};
+
+const JointVector RapidRobotAbsoluteSingleTurnHomeRadians = {
+    1.6844493899891712e-06,
+    0.0,
+    -1.5707960000000001,
+    0.0,
+    1.5707960000000001,
+    0.0
+};
+
+static constexpr FkVec3 OpenRaveToolPointAtZero = {0.0, 0.0, 1.012};
+
+FkVec3 addVec(const FkVec3& a, const FkVec3& b)
+{
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+FkVec3 subtractVec(const FkVec3& a, const FkVec3& b)
+{
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+FkVec3 scaleVec(const FkVec3& value, double scale)
+{
+    return {value.x * scale, value.y * scale, value.z * scale};
+}
+
+double dotVec(const FkVec3& a, const FkVec3& b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+FkVec3 crossVec(const FkVec3& a, const FkVec3& b)
+{
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+FkVec3 normalizeVec(const FkVec3& value)
+{
+    const double norm = std::sqrt(dotVec(value, value));
+    if (norm <= 1e-12)
+    {
+        throw std::runtime_error("Cannot normalize a zero-length kinematic axis.");
+    }
+
+    return scaleVec(value, 1.0 / norm);
+}
+
+FkVec3 rotateVecAboutOrigin(const FkVec3& axisInput, double theta, const FkVec3& value)
+{
+    const FkVec3 axis = normalizeVec(axisInput);
+    const double c = std::cos(theta);
+    const double s = std::sin(theta);
+
+    const FkVec3 term1 = scaleVec(value, c);
+    const FkVec3 term2 = scaleVec(crossVec(axis, value), s);
+    const FkVec3 term3 = scaleVec(axis, dotVec(axis, value) * (1.0 - c));
+
+    return addVec(addVec(term1, term2), term3);
+}
+
+FkMat4 identityMat4()
+{
+    FkMat4 result{};
+
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+        {
+            result.m[row][col] = (row == col) ? 1.0 : 0.0;
+        }
+    }
+
+    return result;
+}
+
+FkMat4 multiplyMat4(const FkMat4& a, const FkMat4& b)
+{
+    FkMat4 result{};
+
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+        {
+            double value = 0.0;
+            for (int k = 0; k < 4; ++k)
+            {
+                value += a.m[row][k] * b.m[k][col];
+            }
+            result.m[row][col] = value;
+        }
+    }
+
+    return result;
+}
+
+FkMat4 revoluteTransformAboutLine(const FkVec3& axisInput, const FkVec3& anchor, double theta)
+{
+    const FkVec3 axis = normalizeVec(axisInput);
+    const double x = axis.x;
+    const double y = axis.y;
+    const double z = axis.z;
+    const double c = std::cos(theta);
+    const double s = std::sin(theta);
+    const double v = 1.0 - c;
+
+    FkMat4 result = identityMat4();
+
+    result.m[0][0] = x * x * v + c;
+    result.m[0][1] = x * y * v - z * s;
+    result.m[0][2] = x * z * v + y * s;
+
+    result.m[1][0] = y * x * v + z * s;
+    result.m[1][1] = y * y * v + c;
+    result.m[1][2] = y * z * v - x * s;
+
+    result.m[2][0] = z * x * v - y * s;
+    result.m[2][1] = z * y * v + x * s;
+    result.m[2][2] = z * z * v + c;
+
+    const FkVec3 rotatedAnchor = rotateVecAboutOrigin(axis, theta, anchor);
+    const FkVec3 translation = subtractVec(anchor, rotatedAnchor);
+
+    result.m[0][3] = translation.x;
+    result.m[1][3] = translation.y;
+    result.m[2][3] = translation.z;
+
+    return result;
+}
+
+FkMat4 zeroToolTransform()
+{
+    FkMat4 result = identityMat4();
+    result.m[0][3] = OpenRaveToolPointAtZero.x;
+    result.m[1][3] = OpenRaveToolPointAtZero.y;
+    result.m[2][3] = OpenRaveToolPointAtZero.z;
+    return result;
+}
+
+FkMat4 openRaveRacer3ForwardKinematics(const JointVector& jointRadians)
+{
+    FkMat4 result = identityMat4();
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        result = multiplyMat4(
+            result,
+            revoluteTransformAboutLine(
+                OpenRaveJointAxes[index],
+                OpenRaveJointAnchors[index],
+                jointRadians[index]));
+    }
+
+    result = multiplyMat4(result, zeroToolTransform());
+    return result;
+}
+
+FkVec3 positionFromTransform(const FkMat4& transform)
+{
+    return {transform.m[0][3], transform.m[1][3], transform.m[2][3]};
+}
+
+FkVec3 rpyFromTransform(const FkMat4& transform)
+{
+    const double roll = std::atan2(transform.m[2][1], transform.m[2][2]);
+    const double pitch = std::atan2(
+        -transform.m[2][0],
+        std::sqrt(transform.m[2][1] * transform.m[2][1] + transform.m[2][2] * transform.m[2][2]));
+    const double yaw = std::atan2(transform.m[1][0], transform.m[0][0]);
+
+    return {roll, pitch, yaw};
+}
+
+void printFkVec3(const char* label, const FkVec3& value, const char* units)
+{
+    std::cout << "  " << label
+              << " X=" << std::fixed << std::setprecision(9) << value.x
+              << " Y=" << value.y
+              << " Z=" << value.z
+              << " " << units << "\n";
+}
+
+void printJointRadians(const char* label, const JointVector& values)
+{
+    std::cout << label << ": ";
+    std::cout << std::fixed << std::setprecision(9);
+
+    for (double value : values)
+    {
+        std::cout << std::setw(14) << value << ' ';
+    }
+
+    std::cout << '\n';
+}
+
+void printJointDegreesFromRadians(const char* label, const JointVector& values)
+{
+    std::cout << label << ": ";
+    std::cout << std::fixed << std::setprecision(6);
+
+    for (double value : values)
+    {
+        std::cout << std::setw(11) << (value * 180.0 / Pi) << ' ';
+    }
+
+    std::cout << '\n';
+}
+
+void printCartesianVector(const char* label, const CartesianVector& values)
+{
+    std::cout << label
+              << " [dx,dy,dz meters, droll,dpitch,dyaw radians]: ";
+    std::cout << std::fixed << std::setprecision(9);
+
+    for (double value : values)
+    {
+        std::cout << std::setw(14) << value << ' ';
+    }
+
+    std::cout << '\n';
+}
+
+void printOpenRaveFkReport(const char* label, const JointVector& jointRadians)
+{
+    const FkMat4 transform = openRaveRacer3ForwardKinematics(jointRadians);
+    const FkVec3 position = positionFromTransform(transform);
+    const FkVec3 rpy = rpyFromTransform(transform);
+
+    std::cout << "\n" << label << "\n";
+    printJointRadians("  Joint radians", jointRadians);
+    printJointDegreesFromRadians("  Joint degrees", jointRadians);
+    printFkVec3("  TCP position", position, "meters");
+    printFkVec3("  TCP RPY", rpy, "radians");
+    std::cout << "  TCP RPY degrees"
+              << " R=" << std::fixed << std::setprecision(6) << (rpy.x * 180.0 / Pi)
+              << " P=" << (rpy.y * 180.0 / Pi)
+              << " Y=" << (rpy.z * 180.0 / Pi)
+              << "\n";
+}
+
+
+double degreesToRadians(double degrees)
+{
+    return degrees * Pi / 180.0;
+}
+
+double wrapToPi(double value)
+{
+    while (value > Pi)
+    {
+        value -= 2.0 * Pi;
+    }
+
+    while (value < -Pi)
+    {
+        value += 2.0 * Pi;
+    }
+
+    return value;
+}
+
+const JointVector OpenRaveJointMinRadians = {
+    degreesToRadians(-150.0),
+    degreesToRadians(-95.0),
+    degreesToRadians(-155.0),
+    degreesToRadians(-200.0),
+    degreesToRadians(-125.0),
+    degreesToRadians(-540.0)
+};
+
+const JointVector OpenRaveJointMaxRadians = {
+    degreesToRadians(150.0),
+    degreesToRadians(135.0),
+    degreesToRadians(90.0),
+    degreesToRadians(200.0),
+    degreesToRadians(125.0),
+    degreesToRadians(540.0)
+};
+
+struct IkDryRunResult
+{
+    bool converged = false;
+    bool hitJointLimit = false;
+    int iterations = 0;
+    double residualNorm = 0.0;
+    double maxResidualComponent = 0.0;
+    JointVector solutionRadians{};
+    JointVector deltaRadians{};
+    CartesianVector residual{};
+};
+
+// Dry-run validation gates for promoting an IK result toward future motion testing.
+// These are intentionally conservative. The code still does not command motion.
+static constexpr double CandidateResidualNormAccept = 2e-4;
+static constexpr double CandidateMaxResidualComponentAccept = 1e-4;
+static constexpr double CandidateMaxJointDeltaDegreesAccept = 90.0;
+
+CartesianVector poseVectorFromJoints(const JointVector& jointRadians)
+{
+    const FkMat4 transform = openRaveRacer3ForwardKinematics(jointRadians);
+    const FkVec3 position = positionFromTransform(transform);
+    const FkVec3 rpy = rpyFromTransform(transform);
+
+    return {
+        position.x,
+        position.y,
+        position.z,
+        rpy.x,
+        rpy.y,
+        rpy.z
+    };
+}
+
+CartesianVector subtractPoseVectorWrapped(const CartesianVector& target, const CartesianVector& current)
+{
+    return {
+        target[0] - current[0],
+        target[1] - current[1],
+        target[2] - current[2],
+        wrapToPi(target[3] - current[3]),
+        wrapToPi(target[4] - current[4]),
+        wrapToPi(target[5] - current[5])
+    };
+}
+
+double residualNorm(const CartesianVector& residual)
+{
+    double sum = 0.0;
+
+    for (double value : residual)
+    {
+        sum += value * value;
+    }
+
+    return std::sqrt(sum);
+}
+
+double maxAbsResidualComponent(const CartesianVector& residual)
+{
+    double result = 0.0;
+
+    for (double value : residual)
+    {
+        result = std::max(result, std::fabs(value));
+    }
+
+    return result;
+}
+
+void printCartesianResidual(const char* label, const CartesianVector& residual)
+{
+    std::cout << label
+              << " [dx,dy,dz meters, droll,dpitch,dyaw radians]: ";
+    std::cout << std::fixed << std::setprecision(9);
+
+    for (double value : residual)
+    {
+        std::cout << std::setw(14) << value << ' ';
+    }
+
+    std::cout << '\n';
+}
+
+void printJointUserUnitsFromRadians(const char* label, const JointVector& values)
+{
+    std::cout << label << ": ";
+    std::cout << std::fixed << std::setprecision(9);
+
+    for (double value : values)
+    {
+        std::cout << std::setw(14) << (value / RevolutionsToRadians) << ' ';
+    }
+
+    std::cout << '\n';
+}
+
+void printJointLimitReport(const JointVector& jointRadians)
+{
+    std::cout << "  Joint limit check using rapidrobot test-driver limits:\n";
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        const bool below = jointRadians[index] < OpenRaveJointMinRadians[index];
+        const bool above = jointRadians[index] > OpenRaveJointMaxRadians[index];
+        const char* status = (below || above) ? "OUTSIDE" : "inside";
+
+        std::cout << "    J" << (index + 1)
+                  << " q=" << std::fixed << std::setprecision(6) << (jointRadians[index] * 180.0 / Pi)
+                  << " deg, limit=["
+                  << (OpenRaveJointMinRadians[index] * 180.0 / Pi)
+                  << ", "
+                  << (OpenRaveJointMaxRadians[index] * 180.0 / Pi)
+                  << "] deg => "
+                  << status
+                  << "\n";
+    }
+}
+
+bool isOutsideJointLimits(const JointVector& jointRadians)
+{
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (jointRadians[index] < OpenRaveJointMinRadians[index] ||
+            jointRadians[index] > OpenRaveJointMaxRadians[index])
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void clampToJointLimits(JointVector& jointRadians, bool& hitLimit)
+{
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (jointRadians[index] < OpenRaveJointMinRadians[index])
+        {
+            jointRadians[index] = OpenRaveJointMinRadians[index];
+            hitLimit = true;
+        }
+
+        if (jointRadians[index] > OpenRaveJointMaxRadians[index])
+        {
+            jointRadians[index] = OpenRaveJointMaxRadians[index];
+            hitLimit = true;
+        }
+    }
+}
+
+bool solveLinearSystem6x6(
+    std::array<std::array<double, Racer3BasicMotion::AxisCount>, Racer3BasicMotion::AxisCount> matrix,
+    std::array<double, Racer3BasicMotion::AxisCount> rhs,
+    std::array<double, Racer3BasicMotion::AxisCount>& solution)
+{
+    constexpr int n = Racer3BasicMotion::AxisCount;
+
+    for (int pivot = 0; pivot < n; ++pivot)
+    {
+        int bestRow = pivot;
+        double bestAbs = std::fabs(matrix[pivot][pivot]);
+
+        for (int row = pivot + 1; row < n; ++row)
+        {
+            const double candidate = std::fabs(matrix[row][pivot]);
+            if (candidate > bestAbs)
+            {
+                bestAbs = candidate;
+                bestRow = row;
+            }
+        }
+
+        if (bestAbs < 1e-14)
+        {
+            return false;
+        }
+
+        if (bestRow != pivot)
+        {
+            std::swap(matrix[pivot], matrix[bestRow]);
+            std::swap(rhs[pivot], rhs[bestRow]);
+        }
+
+        const double diagonal = matrix[pivot][pivot];
+        for (int col = pivot; col < n; ++col)
+        {
+            matrix[pivot][col] /= diagonal;
+        }
+        rhs[pivot] /= diagonal;
+
+        for (int row = 0; row < n; ++row)
+        {
+            if (row == pivot)
+            {
+                continue;
+            }
+
+            const double factor = matrix[row][pivot];
+            for (int col = pivot; col < n; ++col)
+            {
+                matrix[row][col] -= factor * matrix[pivot][col];
+            }
+            rhs[row] -= factor * rhs[pivot];
+        }
+    }
+
+    for (int index = 0; index < n; ++index)
+    {
+        solution[index] = rhs[index];
+    }
+
+    return true;
+}
+
+IkDryRunResult solveNumericalIkDampedLeastSquares(
+    const JointVector& seedRadians,
+    const CartesianVector& targetPoseVector)
+{
+    static constexpr int MaxIterations = 80;
+    static constexpr double FiniteDifferenceStepRadians = 1e-5;
+    static constexpr double Damping = 0.025;
+    static constexpr double MaxJointStepRadians = 0.050;
+    static constexpr double ConvergedResidualNorm = 1e-5;
+    static constexpr double ConvergedMaxComponent = 1e-5;
+
+    IkDryRunResult result{};
+    JointVector q = seedRadians;
+
+    clampToJointLimits(q, result.hitJointLimit);
+
+    for (int iteration = 0; iteration < MaxIterations; ++iteration)
+    {
+        const CartesianVector currentPose = poseVectorFromJoints(q);
+        const CartesianVector error = subtractPoseVectorWrapped(targetPoseVector, currentPose);
+
+        result.iterations = iteration;
+        result.residual = error;
+        result.residualNorm = residualNorm(error);
+        result.maxResidualComponent = maxAbsResidualComponent(error);
+
+        if (result.residualNorm < ConvergedResidualNorm &&
+            result.maxResidualComponent < ConvergedMaxComponent)
+        {
+            result.converged = true;
+            break;
+        }
+
+        std::array<std::array<double, Racer3BasicMotion::AxisCount>, Racer3BasicMotion::AxisCount> jacobian{};
+
+        for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
+        {
+            JointVector qPerturbed = q;
+            qPerturbed[joint] += FiniteDifferenceStepRadians;
+
+            const CartesianVector perturbedPose = poseVectorFromJoints(qPerturbed);
+            const CartesianVector difference = subtractPoseVectorWrapped(perturbedPose, currentPose);
+
+            for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+            {
+                jacobian[row][joint] = difference[row] / FiniteDifferenceStepRadians;
+            }
+        }
+
+        std::array<std::array<double, Racer3BasicMotion::AxisCount>, Racer3BasicMotion::AxisCount> normal{};
+        std::array<double, Racer3BasicMotion::AxisCount> rhs{};
+
+        for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+        {
+            for (int col = 0; col < Racer3BasicMotion::AxisCount; ++col)
+            {
+                double value = 0.0;
+                for (int k = 0; k < Racer3BasicMotion::AxisCount; ++k)
+                {
+                    value += jacobian[k][row] * jacobian[k][col];
+                }
+
+                if (row == col)
+                {
+                    value += Damping * Damping;
+                }
+
+                normal[row][col] = value;
+            }
+
+            double rhsValue = 0.0;
+            for (int k = 0; k < Racer3BasicMotion::AxisCount; ++k)
+            {
+                rhsValue += jacobian[k][row] * error[k];
+            }
+            rhs[row] = rhsValue;
+        }
+
+        std::array<double, Racer3BasicMotion::AxisCount> delta{};
+
+        if (!solveLinearSystem6x6(normal, rhs, delta))
+        {
+            break;
+        }
+
+        double maxStep = 0.0;
+        for (double value : delta)
+        {
+            maxStep = std::max(maxStep, std::fabs(value));
+        }
+
+        if (maxStep > MaxJointStepRadians)
+        {
+            const double scale = MaxJointStepRadians / maxStep;
+            for (double& value : delta)
+            {
+                value *= scale;
+            }
+        }
+
+        for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
+        {
+            q[joint] += delta[joint];
+        }
+
+        clampToJointLimits(q, result.hitJointLimit);
+    }
+
+    const CartesianVector finalPose = poseVectorFromJoints(q);
+    result.residual = subtractPoseVectorWrapped(targetPoseVector, finalPose);
+    result.residualNorm = residualNorm(result.residual);
+    result.maxResidualComponent = maxAbsResidualComponent(result.residual);
+    result.solutionRadians = q;
+
+    for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
+    {
+        result.deltaRadians[joint] = q[joint] - seedRadians[joint];
+    }
+
+    if (result.residualNorm < 1e-5 && result.maxResidualComponent < 1e-5)
+    {
+        result.converged = true;
+    }
+
+    result.hitJointLimit = result.hitJointLimit || isOutsideJointLimits(result.solutionRadians);
+
+    return result;
+}
+
+void printIkDryRunReport(
+    const char* label,
+    const JointVector& seedRadians,
+    const CartesianVector& targetPoseVector)
+{
+    std::cout << "\n" << label << "\n";
+
+    const IkDryRunResult result = solveNumericalIkDampedLeastSquares(
+        seedRadians,
+        targetPoseVector);
+
+    std::cout << "  Solver: damped least-squares numerical IK, finite-difference Jacobian.\n";
+    std::cout << "  Converged: " << (result.converged ? "true" : "false") << "\n";
+    std::cout << "  Iterations: " << result.iterations << "\n";
+    std::cout << "  Residual norm: " << std::fixed << std::setprecision(9) << result.residualNorm << "\n";
+    std::cout << "  Max residual component: " << result.maxResidualComponent << "\n";
+    std::cout << "  Hit joint limit during solve: " << (result.hitJointLimit ? "true" : "false") << "\n";
+    printCartesianResidual("  Final residual", result.residual);
+
+    printJointRadians("  Seed joint radians", seedRadians);
+    printJointDegreesFromRadians("  Seed joint degrees", seedRadians);
+
+    printJointRadians("  Candidate joint radians", result.solutionRadians);
+    printJointDegreesFromRadians("  Candidate joint degrees", result.solutionRadians);
+
+    printJointRadians("  Candidate delta radians", result.deltaRadians);
+    printJointDegreesFromRadians("  Candidate delta degrees", result.deltaRadians);
+    printJointUserUnitsFromRadians("  Candidate delta user units/revolutions", result.deltaRadians);
+
+    printJointLimitReport(result.solutionRadians);
+    printOpenRaveFkReport("  FK of candidate IK solution", result.solutionRadians);
+
+    if (result.converged && !result.hitJointLimit)
+    {
+        std::cout << "  IK dry-run verdict: candidate joint-vector found. Motion is still disabled in this patch.\n";
+    }
+    else
+    {
+        std::cout << "  IK dry-run verdict: no validated candidate for motion yet. Do not command this target.\n";
+    }
+}
+
+
+struct IkSeedCandidate
+{
+    std::string name;
+    JointVector seedRadians{};
+    IkDryRunResult result{};
+    double score = std::numeric_limits<double>::infinity();
+};
+
+struct IkBestCandidate
+{
+    bool found = false;
+    std::string seedName;
+    JointVector seedRadians{};
+    IkDryRunResult result{};
+    double score = std::numeric_limits<double>::infinity();
+};
+
+JointVector withJointOffsetDegrees(const JointVector& base, int jointIndex, double degrees)
+{
+    JointVector seed = base;
+    seed[jointIndex] += degreesToRadians(degrees);
+    return seed;
+}
+
+JointVector withBendOffsetDegrees(
+    const JointVector& base,
+    double joint2Degrees,
+    double joint3Degrees,
+    double joint5Degrees)
+{
+    JointVector seed = base;
+    seed[1] += degreesToRadians(joint2Degrees);
+    seed[2] += degreesToRadians(joint3Degrees);
+    seed[4] += degreesToRadians(joint5Degrees);
+    return seed;
+}
+
+std::vector<IkSeedCandidate> makeIkSeedCandidates(const JointVector& baseSeedRadians)
+{
+    std::vector<IkSeedCandidate> candidates;
+
+    auto addSeed = [&](const std::string& name, JointVector seed) {
+        bool hitLimit = false;
+        clampToJointLimits(seed, hitLimit);
+        candidates.push_back({name, seed, {}, std::numeric_limits<double>::infinity()});
+    };
+
+    addSeed("current", baseSeedRadians);
+    addSeed("J1 +5 deg", withJointOffsetDegrees(baseSeedRadians, 0, 5.0));
+    addSeed("J1 -5 deg", withJointOffsetDegrees(baseSeedRadians, 0, -5.0));
+    addSeed("J1 +15 deg", withJointOffsetDegrees(baseSeedRadians, 0, 15.0));
+    addSeed("J1 -15 deg", withJointOffsetDegrees(baseSeedRadians, 0, -15.0));
+
+    // Wider J1 seeds are important near the software-zero vertical pose.
+    // At that pose the TCP is nearly on the base rotation axis, so pure +/-Y
+    // targets can require rotating the arm into a different azimuth before
+    // bending J2/J3/J5 creates useful lateral reach.
+    addSeed("J1 +45 deg", withJointOffsetDegrees(baseSeedRadians, 0, 45.0));
+    addSeed("J1 -45 deg", withJointOffsetDegrees(baseSeedRadians, 0, -45.0));
+    addSeed("J1 +90 deg", withJointOffsetDegrees(baseSeedRadians, 0, 90.0));
+    addSeed("J1 -90 deg", withJointOffsetDegrees(baseSeedRadians, 0, -90.0));
+    addSeed("J1 +135 deg", withJointOffsetDegrees(baseSeedRadians, 0, 135.0));
+    addSeed("J1 -135 deg", withJointOffsetDegrees(baseSeedRadians, 0, -135.0));
+
+    addSeed("small positive bend", withBendOffsetDegrees(baseSeedRadians, 2.0, 2.0, -0.5));
+    addSeed("small negative bend", withBendOffsetDegrees(baseSeedRadians, -2.0, -2.0, -0.5));
+    addSeed("larger positive bend", withBendOffsetDegrees(baseSeedRadians, 8.0, 8.0, -1.0));
+    addSeed("larger negative bend", withBendOffsetDegrees(baseSeedRadians, -8.0, -8.0, -1.0));
+
+    addSeed("J1 +5 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 5.0), 4.0, 4.0, -0.5));
+    addSeed("J1 -5 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -5.0), 4.0, 4.0, -0.5));
+    addSeed("J1 +5 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 5.0), -4.0, -4.0, -0.5));
+    addSeed("J1 -5 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -5.0), -4.0, -4.0, -0.5));
+
+    addSeed("J1 +45 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 45.0), 4.0, 4.0, -0.5));
+    addSeed("J1 -45 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -45.0), 4.0, 4.0, -0.5));
+    addSeed("J1 +45 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 45.0), -4.0, -4.0, -0.5));
+    addSeed("J1 -45 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -45.0), -4.0, -4.0, -0.5));
+
+    addSeed("J1 +90 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 90.0), 4.0, 4.0, -0.5));
+    addSeed("J1 -90 deg + positive bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -90.0), 4.0, 4.0, -0.5));
+    addSeed("J1 +90 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, 90.0), -4.0, -4.0, -0.5));
+    addSeed("J1 -90 deg + negative bend", withBendOffsetDegrees(withJointOffsetDegrees(baseSeedRadians, 0, -90.0), -4.0, -4.0, -0.5));
+
+    return candidates;
+}
+
+double candidateJointDeltaNorm(const JointVector& deltaRadians)
+{
+    double sum = 0.0;
+
+    for (double value : deltaRadians)
+    {
+        sum += value * value;
+    }
+
+    return std::sqrt(sum);
+}
+
+double maxAbsJointDeltaDegrees(const JointVector& deltaRadians)
+{
+    double result = 0.0;
+
+    for (double value : deltaRadians)
+    {
+        result = std::max(result, std::fabs(value * 180.0 / Pi));
+    }
+
+    return result;
+}
+
+bool residualAcceptedForDryRunCandidate(const IkDryRunResult& result)
+{
+    return result.residualNorm <= CandidateResidualNormAccept &&
+           result.maxResidualComponent <= CandidateMaxResidualComponentAccept;
+}
+
+bool jointDeltaAcceptedForDryRunCandidate(const IkDryRunResult& result)
+{
+    return maxAbsJointDeltaDegrees(result.deltaRadians) <= CandidateMaxJointDeltaDegreesAccept;
+}
+
+bool acceptedForFutureMotionDryRunCandidate(const IkDryRunResult& result)
+{
+    return residualAcceptedForDryRunCandidate(result) &&
+           jointDeltaAcceptedForDryRunCandidate(result) &&
+           !result.hitJointLimit;
+}
+
+double scoreIkCandidate(const IkDryRunResult& result)
+{
+    const double jointDeltaNorm = candidateJointDeltaNorm(result.deltaRadians);
+    double score =
+        result.residualNorm +
+        0.25 * result.maxResidualComponent +
+        0.001 * jointDeltaNorm;
+
+    if (!result.converged)
+    {
+        score += 10.0;
+    }
+
+    if (result.hitJointLimit)
+    {
+        score += 100.0;
+    }
+
+    return score;
+}
+
+void printCompactIkCandidateLine(const IkSeedCandidate& candidate)
+{
+    const double maxDeltaDegrees = maxAbsJointDeltaDegrees(candidate.result.deltaRadians);
+
+    std::cout << "  "
+              << std::left << std::setw(28) << candidate.name
+              << " conv=" << std::setw(5) << (candidate.result.converged ? "true" : "false")
+              << " limit=" << std::setw(5) << (candidate.result.hitJointLimit ? "true" : "false")
+              << " resOK=" << std::setw(5) << (residualAcceptedForDryRunCandidate(candidate.result) ? "true" : "false")
+              << " dOK=" << std::setw(5) << (jointDeltaAcceptedForDryRunCandidate(candidate.result) ? "true" : "false")
+              << " iter=" << std::right << std::setw(3) << candidate.result.iterations
+              << " norm=" << std::fixed << std::setprecision(9) << candidate.result.residualNorm
+              << " max=" << candidate.result.maxResidualComponent
+              << " maxDdeg=" << maxDeltaDegrees
+              << " score=" << candidate.score
+              << "\n";
+}
+
+IkBestCandidate solveBestMultiSeedIkCandidate(
+    const JointVector& baseSeedRadians,
+    const CartesianVector& targetPoseVector)
+{
+    std::vector<IkSeedCandidate> candidates = makeIkSeedCandidates(baseSeedRadians);
+
+    IkBestCandidate best{};
+
+    for (IkSeedCandidate& candidate : candidates)
+    {
+        candidate.result = solveNumericalIkDampedLeastSquares(
+            candidate.seedRadians,
+            targetPoseVector);
+
+        candidate.score = scoreIkCandidate(candidate.result);
+
+        if (!best.found || candidate.score < best.score)
+        {
+            best.found = true;
+            best.seedName = candidate.name;
+            best.seedRadians = candidate.seedRadians;
+            best.result = candidate.result;
+            best.score = candidate.score;
+        }
+    }
+
+    return best;
+}
+
+JointVector subtractJointVectors(const JointVector& a, const JointVector& b)
+{
+    JointVector result{};
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        result[index] = a[index] - b[index];
+    }
+
+    return result;
+}
+
+JointVector radiansToUserUnits(const JointVector& radians)
+{
+    JointVector result{};
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        result[index] = radians[index] / RevolutionsToRadians;
+    }
+
+    return result;
+}
+
+void printCartesianVectorMotionCandidateSummary(
+    const IkBestCandidate& candidate,
+    const JointVector& currentRadians,
+    const CartesianVector& targetPoseVector)
+{
+    if (!candidate.found)
+    {
+        std::cout << "No IK candidate was evaluated.\n";
+        return;
+    }
+
+    const JointVector commandDeltaRadians =
+        subtractJointVectors(candidate.result.solutionRadians, currentRadians);
+    const JointVector commandDeltaUserUnits = radiansToUserUnits(commandDeltaRadians);
+    const double commandMaxDeltaDegrees = maxAbsJointDeltaDegrees(commandDeltaRadians);
+
+    const bool residualOk = residualAcceptedForDryRunCandidate(candidate.result);
+    const bool commandDeltaOk = commandMaxDeltaDegrees <= CandidateMaxJointDeltaDegreesAccept;
+    const bool futureMotionCandidateOk =
+        residualOk &&
+        commandDeltaOk &&
+        !candidate.result.hitJointLimit;
+
+    std::cout << "\nGuarded Cartesian-vector candidate summary\n";
+    std::cout << "  Best seed: " << candidate.seedName << "\n";
+    std::cout << "  Solver converged flag: " << (candidate.result.converged ? "true" : "false") << "\n";
+    std::cout << "  Hit joint limit: " << (candidate.result.hitJointLimit ? "true" : "false") << "\n";
+    std::cout << "  Residual norm: " << std::fixed << std::setprecision(9) << candidate.result.residualNorm << "\n";
+    std::cout << "  Max residual component: " << candidate.result.maxResidualComponent << "\n";
+    std::cout << "  Max command joint delta from current pose: " << commandMaxDeltaDegrees << " degrees\n";
+    std::cout << "  Residual gate <= " << CandidateResidualNormAccept
+              << " norm and <= "
+              << CandidateMaxResidualComponentAccept
+              << " max component: "
+              << (residualOk ? "PASS" : "FAIL")
+              << "\n";
+    std::cout << "  Joint-delta gate <= " << CandidateMaxJointDeltaDegreesAccept
+              << " deg max command delta: "
+              << (commandDeltaOk ? "PASS" : "FAIL")
+              << "\n";
+    std::cout << "  Future motion dry-run candidate: "
+              << (futureMotionCandidateOk ? "YES" : "NO")
+              << "\n";
+
+    printCartesianResidual("  Final residual", candidate.result.residual);
+    printJointDegreesFromRadians("  Current joint degrees", currentRadians);
+    printJointDegreesFromRadians("  Candidate joint degrees", candidate.result.solutionRadians);
+    printJointDegreesFromRadians("  Command delta degrees", commandDeltaRadians);
+    printJointUserUnitsFromRadians("  Command delta user units/revolutions", commandDeltaRadians);
+    printJointLimitReport(candidate.result.solutionRadians);
+    printOpenRaveFkReport("  FK verification for guarded Cartesian-vector candidate", candidate.result.solutionRadians);
+
+    if (!futureMotionCandidateOk)
+    {
+        std::cout << "  Guarded Cartesian-vector verdict: rejected. Motion will not be commanded.\n";
+
+        if (residualOk && !commandDeltaOk)
+        {
+            std::cout << "  Note: the solver got close, but the command delta is too large for this guarded tiny-motion path.\n";
+            std::cout << "  Use a staged ready/pre-bend pose or a smaller/different Cartesian delta before live testing.\n";
+        }
+    }
+    else
+    {
+        std::cout << "  Guarded Cartesian-vector verdict: accepted by dry-run validation gates.\n";
+    }
+}
+
+
+CartesianVector scaleCartesianVector(const CartesianVector& values, double scale)
+{
+    CartesianVector result{};
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        result[index] = values[index] * scale;
+    }
+
+    return result;
+}
+
+CartesianVector targetPoseVectorForCartesianDelta(
+    const JointVector& currentRadians,
+    const CartesianVector& delta)
+{
+    const FkMat4 currentTransform = openRaveRacer3ForwardKinematics(currentRadians);
+    const FkVec3 currentPosition = positionFromTransform(currentTransform);
+    const FkVec3 currentRpy = rpyFromTransform(currentTransform);
+
+    return {
+        currentPosition.x + delta[0],
+        currentPosition.y + delta[1],
+        currentPosition.z + delta[2],
+        currentRpy.x + delta[3],
+        currentRpy.y + delta[4],
+        currentRpy.z + delta[5]
+    };
+}
+
+IkBestCandidate solveBestCandidateForCartesianDelta(
+    const JointVector& currentRadians,
+    const CartesianVector& delta)
+{
+    return solveBestMultiSeedIkCandidate(
+        currentRadians,
+        targetPoseVectorForCartesianDelta(currentRadians, delta));
+}
+
+struct CartesianSegmentCandidate
+{
+    int segmentNumber = 0;
+    CartesianVector requestedCartesianDelta{};
+    JointVector startRadians{};
+    IkBestCandidate candidate{};
+    JointVector commandDeltaRadians{};
+    JointVector commandDeltaUserUnits{};
+    double maxCommandDeltaDegrees = 0.0;
+    bool accepted = false;
+};
+
+struct CartesianSegmentPlan
+{
+    bool accepted = false;
+    int segmentCount = 0;
+    std::vector<CartesianSegmentCandidate> segments;
+    std::string rejectionReason;
+};
+
+bool guardedCandidateAcceptedFromCurrent(
+    const IkBestCandidate& candidate,
+    const JointVector& currentRadians,
+    double* maxCommandDeltaDegrees = nullptr)
+{
+    if (!candidate.found)
+    {
+        if (maxCommandDeltaDegrees)
+        {
+            *maxCommandDeltaDegrees = 0.0;
+        }
+
+        return false;
+    }
+
+    const JointVector commandDeltaRadians =
+        subtractJointVectors(candidate.result.solutionRadians, currentRadians);
+
+    const double maxDelta = maxAbsJointDeltaDegrees(commandDeltaRadians);
+
+    if (maxCommandDeltaDegrees)
+    {
+        *maxCommandDeltaDegrees = maxDelta;
+    }
+
+    return residualAcceptedForDryRunCandidate(candidate.result) &&
+           maxDelta <= CandidateMaxJointDeltaDegreesAccept &&
+           !candidate.result.hitJointLimit;
+}
+
+CartesianSegmentCandidate makeCartesianSegmentCandidate(
+    int segmentNumber,
+    const JointVector& currentRadians,
+    const CartesianVector& segmentDelta)
+{
+    CartesianSegmentCandidate segment{};
+    segment.segmentNumber = segmentNumber;
+    segment.requestedCartesianDelta = segmentDelta;
+    segment.startRadians = currentRadians;
+    segment.candidate = solveBestCandidateForCartesianDelta(currentRadians, segmentDelta);
+
+    if (segment.candidate.found)
+    {
+        segment.commandDeltaRadians =
+            subtractJointVectors(segment.candidate.result.solutionRadians, currentRadians);
+        segment.commandDeltaUserUnits = radiansToUserUnits(segment.commandDeltaRadians);
+        segment.accepted = guardedCandidateAcceptedFromCurrent(
+            segment.candidate,
+            currentRadians,
+            &segment.maxCommandDeltaDegrees);
+    }
+
+    return segment;
+}
+
+CartesianSegmentPlan buildSegmentedCartesianPlan(
+    const JointVector& startRadians,
+    const CartesianVector& requestedCartesianDelta)
+{
+    static constexpr int MaxCartesianSegments = 8;
+
+    CartesianSegmentPlan bestRejected{};
+    bestRejected.rejectionReason = "No segmented Cartesian plan was evaluated.";
+
+    for (int segmentCount = 1; segmentCount <= MaxCartesianSegments; ++segmentCount)
+    {
+        CartesianSegmentPlan plan{};
+        plan.segmentCount = segmentCount;
+
+        const CartesianVector segmentDelta =
+            scaleCartesianVector(requestedCartesianDelta, 1.0 / static_cast<double>(segmentCount));
+
+        JointVector currentRadians = startRadians;
+        bool allSegmentsAccepted = true;
+
+        for (int segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex)
+        {
+            CartesianSegmentCandidate segment =
+                makeCartesianSegmentCandidate(segmentIndex + 1, currentRadians, segmentDelta);
+
+            if (!segment.accepted)
+            {
+                allSegmentsAccepted = false;
+
+                if (!segment.candidate.found)
+                {
+                    plan.rejectionReason =
+                        "Segment " + std::to_string(segmentIndex + 1) +
+                        " did not produce an IK candidate.";
+                }
+                else if (segment.candidate.result.hitJointLimit)
+                {
+                    plan.rejectionReason =
+                        "Segment " + std::to_string(segmentIndex + 1) +
+                        " hit a joint limit.";
+                }
+                else if (!residualAcceptedForDryRunCandidate(segment.candidate.result))
+                {
+                    plan.rejectionReason =
+                        "Segment " + std::to_string(segmentIndex + 1) +
+                        " failed the residual gate.";
+                }
+                else
+                {
+                    plan.rejectionReason =
+                        "Segment " + std::to_string(segmentIndex + 1) +
+                        " failed the joint-delta gate.";
+                }
+
+                plan.segments.push_back(segment);
+                break;
+            }
+
+            currentRadians = segment.candidate.result.solutionRadians;
+            plan.segments.push_back(segment);
+        }
+
+        if (allSegmentsAccepted)
+        {
+            plan.accepted = true;
+            return plan;
+        }
+
+        bestRejected = plan;
+    }
+
+    if (bestRejected.rejectionReason.empty())
+    {
+        bestRejected.rejectionReason =
+            "No segmented Cartesian plan passed all validation gates.";
+    }
+
+    return bestRejected;
+}
+
+void printCartesianSegmentPlanSummary(const CartesianSegmentPlan& plan)
+{
+    std::cout << "\nSegmented Cartesian-vector plan summary\n";
+    std::cout << "  Accepted: " << (plan.accepted ? "YES" : "NO") << "\n";
+    std::cout << "  Segment count: " << plan.segmentCount << "\n";
+
+    if (!plan.accepted)
+    {
+        std::cout << "  Rejection reason: " << plan.rejectionReason << "\n";
+    }
+
+    for (const CartesianSegmentCandidate& segment : plan.segments)
+    {
+        std::cout << "\n  Segment " << segment.segmentNumber << " / " << plan.segmentCount << "\n";
+        printCartesianVector("    Requested segment delta", segment.requestedCartesianDelta);
+
+        if (!segment.candidate.found)
+        {
+            std::cout << "    No IK candidate found.\n";
+            continue;
+        }
+
+        std::cout << "    Best seed: " << segment.candidate.seedName << "\n";
+        std::cout << "    Solver converged flag: "
+                  << (segment.candidate.result.converged ? "true" : "false") << "\n";
+        std::cout << "    Hit joint limit: "
+                  << (segment.candidate.result.hitJointLimit ? "true" : "false") << "\n";
+        std::cout << "    Residual norm: "
+                  << std::fixed << std::setprecision(9)
+                  << segment.candidate.result.residualNorm << "\n";
+        std::cout << "    Max residual component: "
+                  << segment.candidate.result.maxResidualComponent << "\n";
+        std::cout << "    Max command joint delta from segment start: "
+                  << segment.maxCommandDeltaDegrees << " degrees\n";
+        std::cout << "    Residual gate: "
+                  << (residualAcceptedForDryRunCandidate(segment.candidate.result) ? "PASS" : "FAIL")
+                  << "\n";
+        std::cout << "    Joint-delta gate: "
+                  << (segment.maxCommandDeltaDegrees <= CandidateMaxJointDeltaDegreesAccept ? "PASS" : "FAIL")
+                  << "\n";
+        std::cout << "    Segment accepted: "
+                  << (segment.accepted ? "YES" : "NO")
+                  << "\n";
+        printJointDegreesFromRadians("    Command delta degrees", segment.commandDeltaRadians);
+        std::cout << "    Command delta user units/revolutions: ";
+        printJointVector(segment.commandDeltaUserUnits);
+    }
+}
+
+std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
+    const CartesianSegmentPlan& plan)
+{
+    std::vector<JointVector> sequence;
+
+    for (const CartesianSegmentCandidate& segment : plan.segments)
+    {
+        sequence.push_back(segment.commandDeltaUserUnits);
+    }
+
+    for (auto it = plan.segments.rbegin(); it != plan.segments.rend(); ++it)
+    {
+        JointVector negativeReturnStep{};
+
+        for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+        {
+            negativeReturnStep[index] = -it->commandDeltaUserUnits[index];
+        }
+
+        sequence.push_back(negativeReturnStep);
+    }
+
+    return sequence;
+}
+
+
+void printMultiSeedIkDryRunReport(
+    const char* label,
+    const JointVector& baseSeedRadians,
+    const CartesianVector& targetPoseVector)
+{
+    std::cout << "\n" << label << "\n";
+    std::cout << "  Multi-seed numerical IK search with wide J1 azimuth seeds. Motion is disabled.\n";
+
+    std::vector<IkSeedCandidate> candidates = makeIkSeedCandidates(baseSeedRadians);
+
+    int bestIndex = -1;
+    double bestScore = std::numeric_limits<double>::infinity();
+
+    for (size_t index = 0; index < candidates.size(); ++index)
+    {
+        candidates[index].result = solveNumericalIkDampedLeastSquares(
+            candidates[index].seedRadians,
+            targetPoseVector);
+
+        candidates[index].score = scoreIkCandidate(candidates[index].result);
+
+        if (candidates[index].score < bestScore)
+        {
+            bestScore = candidates[index].score;
+            bestIndex = static_cast<int>(index);
+        }
+    }
+
+    std::cout << "  Seed results:\n";
+    for (const IkSeedCandidate& candidate : candidates)
+    {
+        printCompactIkCandidateLine(candidate);
+    }
+
+    if (bestIndex < 0)
+    {
+        std::cout << "  No IK candidates were evaluated.\n";
+        return;
+    }
+
+    const IkSeedCandidate& best = candidates[bestIndex];
+
+    std::cout << "\n  Best candidate summary:\n";
+    std::cout << "    Seed name: " << best.name << "\n";
+    std::cout << "    Converged: " << (best.result.converged ? "true" : "false") << "\n";
+    std::cout << "    Hit joint limit: " << (best.result.hitJointLimit ? "true" : "false") << "\n";
+    const double bestMaxDeltaDegrees = maxAbsJointDeltaDegrees(best.result.deltaRadians);
+    const bool residualOk = residualAcceptedForDryRunCandidate(best.result);
+    const bool jointDeltaOk = jointDeltaAcceptedForDryRunCandidate(best.result);
+    const bool futureMotionCandidateOk = acceptedForFutureMotionDryRunCandidate(best.result);
+
+    std::cout << "    Residual norm: " << std::fixed << std::setprecision(9) << best.result.residualNorm << "\n";
+    std::cout << "    Max residual component: " << best.result.maxResidualComponent << "\n";
+    std::cout << "    Max candidate joint delta: " << bestMaxDeltaDegrees << " degrees\n";
+    std::cout << "    Residual gate <= " << CandidateResidualNormAccept << " norm and <= "
+              << CandidateMaxResidualComponentAccept << " max component: "
+              << (residualOk ? "PASS" : "FAIL") << "\n";
+    std::cout << "    Joint-delta gate <= " << CandidateMaxJointDeltaDegreesAccept
+              << " deg max joint delta: "
+              << (jointDeltaOk ? "PASS" : "FAIL") << "\n";
+    std::cout << "    Future motion dry-run candidate: "
+              << (futureMotionCandidateOk ? "YES" : "NO") << "\n";
+    printCartesianResidual("    Final residual", best.result.residual);
+
+    printJointDegreesFromRadians("    Best seed joint degrees", best.seedRadians);
+    printJointDegreesFromRadians("    Candidate joint degrees", best.result.solutionRadians);
+    printJointDegreesFromRadians("    Candidate delta degrees", best.result.deltaRadians);
+    printJointUserUnitsFromRadians("    Candidate delta user units/revolutions", best.result.deltaRadians);
+
+    printJointLimitReport(best.result.solutionRadians);
+    printOpenRaveFkReport("    FK verification for best multi-seed candidate", best.result.solutionRadians);
+
+    if (futureMotionCandidateOk)
+    {
+        std::cout << "    Multi-seed IK verdict: candidate passes dry-run validation gates. Motion is still disabled in this patch.\n";
+    }
+    else
+    {
+        std::cout << "    Multi-seed IK verdict: no future-motion candidate yet. Do not command this target.\n";
+
+        if (residualOk && !jointDeltaOk)
+        {
+            std::cout << "    Note: residual is small, but the required joint reconfiguration is too large for a tiny Cartesian test.\n";
+            std::cout << "    This usually means the target is near a singular or symmetric pose and should be approached through a staged pre-bend/ready pose, not as one tiny Cartesian command from software zero.\n";
+        }
+    }
+}
+
 
 JointVector makeAllAxesVector(double value)
 {
@@ -429,9 +1787,13 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     JointVectorMotionEnabled = options.jointVectorMotion;
     RobotModelProbeEnabled = options.robotModelProbe;
     RobotPoseProbeEnabled = options.robotPoseProbe;
+    KinematicsDryRunEnabled = options.kinematicsDryRun;
+    CartesianVectorMotionEnabled = options.cartesianVectorMotion;
+    CartesianVectorMotionConfirmed = options.motionConfirmed;
     ReturnWarnToleranceUserUnits = options.returnWarnToleranceUserUnits;
     ReturnFailToleranceUserUnits = options.returnFailToleranceUserUnits;
     RequestedJointVector = options.jointVectorUserUnits;
+    RequestedCartesianVector = options.cartesianVector;
 
     if (ReturnWarnToleranceUserUnits < 0.0)
     {
@@ -466,6 +1828,11 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         throw std::runtime_error("--joints must contain at least one nonzero joint value for --joint-vector.");
     }
 
+    if (CartesianVectorMotionEnabled && !hasAnyNonZeroJoint(RequestedCartesianVector))
+    {
+        throw std::runtime_error("--cartesian must contain at least one nonzero value for --cartesian-vector.");
+    }
+
     printMotionPlan();
 
     if (options.dryRun)
@@ -488,6 +1855,20 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         if (options.robotPoseProbe)
         {
             runRobotPoseProbe();
+            safeShutdown();
+            return;
+        }
+
+        if (options.kinematicsDryRun)
+        {
+            runKinematicsDryRun();
+            safeShutdown();
+            return;
+        }
+
+        if (options.cartesianVectorMotion)
+        {
+            runCartesianVectorMotion();
             safeShutdown();
             return;
         }
@@ -523,7 +1904,7 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
             runJointVectorMotion();
         }
 
-        if (options.tinyMotion || options.dualMotion || options.allMotion || options.jointVectorMotion)
+        if (options.tinyMotion || options.dualMotion || options.allMotion || options.jointVectorMotion || options.cartesianVectorMotion)
         {
             printReturnToZeroReport("Return-to-zero check after motion", true);
         }
@@ -658,7 +2039,7 @@ void Racer3BasicMotion::configureAxes()
         std::cout << "Axis 5 / J5 HomeActionSet(RSIActionNONE) applied.\n";
     }
 
-    if (AllMotionEnabled || JointVectorMotionEnabled || RobotPoseProbeEnabled)
+    if (AllMotionEnabled || JointVectorMotionEnabled || RobotPoseProbeEnabled || KinematicsDryRunEnabled || CartesianVectorMotionEnabled)
     {
         configureAllAxesForAllMotion();
     }
@@ -1597,6 +2978,151 @@ void Racer3BasicMotion::runJointVectorMotion()
 
 
 
+
+void printRapidVectorDouble(const char* label, const RR::RapidVector<double>& values)
+{
+    std::cout << "  " << label << " [size=" << values.Size() << "]: ";
+    std::cout << std::fixed << std::setprecision(9);
+
+    for (size_t index = 0; index < values.Size(); ++index)
+    {
+        std::cout << values.At(index);
+        if (index + 1 < values.Size())
+        {
+            std::cout << ", ";
+        }
+    }
+
+    std::cout << "\n";
+}
+
+void printVector3d(const char* label, const RC::Vector3d& vector)
+{
+    std::cout << "  " << label
+              << " X=" << std::fixed << std::setprecision(9) << vector.X
+              << " Y=" << vector.Y
+              << " Z=" << vector.Z
+              << "\n";
+}
+
+void printQuaternion(const char* label, const RC::Quaternion& quaternion)
+{
+    std::cout << "  " << label
+              << " W=" << std::fixed << std::setprecision(9) << quaternion.W
+              << " X=" << quaternion.V.X
+              << " Y=" << quaternion.V.Y
+              << " Z=" << quaternion.V.Z
+              << "\n";
+}
+
+void printPose(const char* label, const RC::Pose& pose)
+{
+    std::cout << "  " << label << ":\n";
+    printVector3d("    Position", pose.Position);
+    printQuaternion("    Quaternion", pose.Orientation);
+
+    try
+    {
+        const RC::Vector3d eulerRadians = pose.Orientation.ToEuler();
+        printVector3d("    EulerRadians", eulerRadians);
+        std::cout << "  " << "    EulerDegrees"
+                  << " R=" << std::fixed << std::setprecision(9) << (eulerRadians.X * 180.0 / 3.14159265358979323846)
+                  << " P=" << (eulerRadians.Y * 180.0 / 3.14159265358979323846)
+                  << " Y=" << (eulerRadians.Z * 180.0 / 3.14159265358979323846)
+                  << "\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    ToEuler threw RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+    catch (...)
+    {
+        std::cout << "    ToEuler threw unknown exception.\n";
+    }
+}
+
+void printRobotPosition(const char* label, const RC::RobotPosition& position)
+{
+    std::cout << "  " << label << ":\n";
+    printPose("    Pose", position.Pose);
+    printRapidVectorDouble("    FreeAxes", position.FreeAxes);
+}
+
+RR::RapidVector<double> makeJointRapidVector(const JointVector& values)
+{
+    RR::RapidVector<double> vector(values.size());
+
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        vector.At(index) = values[index];
+    }
+
+    return vector;
+}
+
+void printFkForSyntheticVector(
+    RC::Robot* robot,
+    const char* label,
+    const JointVector& jointValues)
+{
+    std::cout << "\n  Synthetic FK vector: " << label << "\n";
+
+    try
+    {
+        const RR::RapidVector<double> joints = makeJointRapidVector(jointValues);
+        printRapidVectorDouble("    Input joints", joints);
+
+        const RC::Pose fkPose = robot->ForwardKinematics(joints);
+        printPose("    ForwardKinematics Pose", fkPose);
+
+        const RC::RobotPosition fkPosition = robot->ForwardKinematicsPosition(joints);
+        printRobotPosition("    ForwardKinematicsPosition", fkPosition);
+
+        const RR::RapidVector<double> ikFromFkPose = robot->InverseKinematics(fkPose);
+        printRapidVectorDouble("    InverseKinematics(FK Pose)", ikFromFkPose);
+
+        const RR::RapidVector<double> ikFromFkPosition = robot->InverseKinematics(fkPosition);
+        printRapidVectorDouble("    InverseKinematics(FK Position)", ikFromFkPosition);
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Synthetic FK/IK RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "    Synthetic FK/IK std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "    Synthetic FK/IK unknown exception.\n";
+    }
+}
+
+void printSyntheticFkComparisonSet(RC::Robot* robot)
+{
+    static constexpr double testDelta = 0.01;
+
+    JointVector zeros{};
+    printFkForSyntheticVector(robot, "all zeros", zeros);
+
+    for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+    {
+        JointVector vector{};
+        vector[axis] = testDelta;
+
+        std::ostringstream label;
+        label << "J" << (axis + 1) << " +" << testDelta;
+        printFkForSyntheticVector(robot, label.str().c_str(), vector);
+    }
+
+    JointVector all{};
+    all.fill(testDelta);
+    printFkForSyntheticVector(robot, "all axes +0.01", all);
+}
+
+
 template <typename Callable>
 void probeReadOnlyRobotCall(const char* label, Callable callable)
 {
@@ -1627,7 +3153,7 @@ void runReadOnlyRobotApiProbe(
     const char* modelLabel,
     const char* probeLabel)
 {
-    std::cout << "\n" << probeLabel << ": read-only Robot API probe using LinearModelBuilder(\""
+    std::cout << "\n" << probeLabel << ": numeric read-only Robot API probe using LinearModelBuilder(\""
               << modelLabel
               << "\")\n";
 
@@ -1643,56 +3169,121 @@ void runReadOnlyRobotApiProbe(
         robot = RC::Robot::RobotCreate(controller, multiAxis, &builder);
         if (!robot)
         {
-            std::cout << "  RobotCreate returned null. Skipping read-only API calls.\n";
+            std::cout << "  RobotCreate returned null. Skipping numeric read-only API calls.\n";
             return;
         }
 
         std::cout << "  RobotCreate returned a non-null Robot pointer.\n";
-        printErrorLog("  Robot(read-only probe)", robot);
+        printErrorLog("  Robot(read-only numeric probe)", robot);
 
-        probeReadOnlyRobotCall("JointsActualPositionsGet", [&]() {
-            return robot->JointsActualPositionsGet();
-        });
+        try
+        {
+            const RR::RapidVector<double> jointsActual = robot->JointsActualPositionsGet();
+            printRapidVectorDouble("JointsActualPositionsGet", jointsActual);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  JointsActualPositionsGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("JointsCommandPositionsGet", [&]() {
-            return robot->JointsCommandPositionsGet();
-        });
+        try
+        {
+            const RR::RapidVector<double> jointsCommand = robot->JointsCommandPositionsGet();
+            printRapidVectorDouble("JointsCommandPositionsGet", jointsCommand);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  JointsCommandPositionsGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("ActualPoseGet", [&]() {
-            return robot->ActualPoseGet();
-        });
+        try
+        {
+            const RC::Pose actualPose = robot->ActualPoseGet();
+            printPose("ActualPoseGet", actualPose);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  ActualPoseGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("CommandPoseGet", [&]() {
-            return robot->CommandPoseGet();
-        });
+        try
+        {
+            const RC::Pose commandPose = robot->CommandPoseGet();
+            printPose("CommandPoseGet", commandPose);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  CommandPoseGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("ActualPositionGet", [&]() {
-            return robot->ActualPositionGet();
-        });
+        try
+        {
+            const RC::RobotPosition actualPosition = robot->ActualPositionGet();
+            printRobotPosition("ActualPositionGet", actualPosition);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  ActualPositionGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("CommandPositionGet", [&]() {
-            return robot->CommandPositionGet();
-        });
+        try
+        {
+            const RC::RobotPosition commandPosition = robot->CommandPositionGet();
+            printRobotPosition("CommandPositionGet", commandPosition);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  CommandPositionGet RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("ForwardKinematics(JointsActualPositionsGet())", [&]() {
-            const auto joints = robot->JointsActualPositionsGet();
-            return robot->ForwardKinematics(joints);
-        });
+        try
+        {
+            const RR::RapidVector<double> jointsActual = robot->JointsActualPositionsGet();
+            const RC::Pose fkPose = robot->ForwardKinematics(jointsActual);
+            printPose("ForwardKinematics(JointsActualPositionsGet())", fkPose);
 
-        probeReadOnlyRobotCall("ForwardKinematicsPosition(JointsActualPositionsGet())", [&]() {
-            const auto joints = robot->JointsActualPositionsGet();
-            return robot->ForwardKinematicsPosition(joints);
-        });
+            const RC::RobotPosition fkPosition = robot->ForwardKinematicsPosition(jointsActual);
+            printRobotPosition("ForwardKinematicsPosition(JointsActualPositionsGet())", fkPosition);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  ForwardKinematics actual-joints RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("InverseKinematics(ActualPoseGet())", [&]() {
-            const auto pose = robot->ActualPoseGet();
-            return robot->InverseKinematics(pose);
-        });
+        try
+        {
+            const RC::Pose actualPose = robot->ActualPoseGet();
+            const RR::RapidVector<double> ik = robot->InverseKinematics(actualPose);
+            printRapidVectorDouble("InverseKinematics(ActualPoseGet())", ik);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  InverseKinematics(ActualPoseGet()) RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
 
-        probeReadOnlyRobotCall("InverseKinematics(ActualPositionGet())", [&]() {
-            const auto position = robot->ActualPositionGet();
-            return robot->InverseKinematics(position);
-        });
+        try
+        {
+            const RC::RobotPosition actualPosition = robot->ActualPositionGet();
+            const RR::RapidVector<double> ik = robot->InverseKinematics(actualPosition);
+            printRapidVectorDouble("InverseKinematics(ActualPositionGet())", ik);
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  InverseKinematics(ActualPositionGet()) RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
+
+        std::cout << "\n  Synthetic FK/IK comparison set for " << modelLabel << ":\n";
+        std::cout << "  Test delta is 0.01 in robot joint units. For a purely linear XYZABC model, J1/J2/J3 should map directly to X/Y/Z and J4/J5/J6 to orientation axes.\n";
+        printSyntheticFkComparisonSet(robot);
     }
     catch (const RR::RsiError& error)
     {
@@ -1726,7 +3317,6 @@ void runReadOnlyRobotApiProbe(
         }
     }
 }
-
 
 
 void Racer3BasicMotion::runRobotPoseProbe()
@@ -1770,8 +3360,8 @@ void Racer3BasicMotion::runRobotPoseProbe()
     printErrorLog("MotionController", controller_);
     printErrorLog("MultiAxis 6", multiAxis_);
 
-    std::cout << "Robot pose/FK API probe complete.\n";
-    std::cout << "If both configured models return OK for the same read-only calls, the next step is to print numeric Pose and joint-vector values and compare RSI_Racer3 versus RSI_XYZABC_Millimeters behavior.\n";
+    std::cout << "Robot pose/FK numeric probe complete.\n";
+    std::cout << "Compare the RSI_Racer3 synthetic FK outputs against RSI_XYZABC_Millimeters. If they match exactly, the configured Racer3 builder is behaving like a linear XYZABC mapping rather than true articulated arm kinematics.\n";
 }
 
 
@@ -1890,8 +3480,445 @@ void Racer3BasicMotion::runRobotModelProbe()
 }
 
 
+
+void Racer3BasicMotion::runKinematicsDryRun()
+{
+    std::cout << "Starting no-motion custom Racer3 kinematics dry-run.\n";
+    std::cout << "No amp enable and no motion commands will be sent in this mode.\n";
+    std::cout << "This is a FK scaffold from the old rapidrobot OpenRAVE model, not a validated production IK planner yet.\n";
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    std::cout << "\nOpenRAVE/RapidRobot model inputs used by this scaffold:\n";
+    std::cout << "  Tool point at zero pose: [0, 0, 1.012] meters.\n";
+    std::cout << "  Joint anchors and axes are hardcoded from racer3.kinbody.xml.\n";
+    std::cout << "  RapidRobot saved AbsoluteSingleTurn home offset is also printed for comparison.\n";
+    std::cout << "  RMP user units are still 1.0 revolution per joint; radians = user_units * 2*pi.\n";
+
+    printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
+
+    JointVector actualUserUnits{};
+    JointVector commandUserUnits{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        actualUserUnits[index] = axes_[index]->ActualPositionGet();
+        commandUserUnits[index] = axes_[index]->CommandPositionGet();
+    }
+
+    std::cout << "\nCurrent RMP joint state after software-zero/configuration:\n";
+    std::cout << "  Actual user units/revolutions: ";
+    printJointVector(actualUserUnits);
+    std::cout << "  Command user units/revolutions: ";
+    printJointVector(commandUserUnits);
+
+    JointVector actualRadians{};
+    JointVector commandRadians{};
+    JointVector openRaveHomeAdjustedActualRadians{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+        commandRadians[index] = commandUserUnits[index] * RevolutionsToRadians;
+        openRaveHomeAdjustedActualRadians[index] =
+            actualRadians[index] + RapidRobotAbsoluteSingleTurnHomeRadians[index];
+    }
+
+    printOpenRaveFkReport(
+        "FK from current RMP actual joints interpreted relative to the current software zero",
+        actualRadians);
+
+    printOpenRaveFkReport(
+        "FK from current RMP command joints interpreted relative to the current software zero",
+        commandRadians);
+
+    printOpenRaveFkReport(
+        "FK from current actual joints plus rapidrobot AbsoluteSingleTurn home offset",
+        openRaveHomeAdjustedActualRadians);
+
+    const FkMat4 currentTransform = openRaveRacer3ForwardKinematics(actualRadians);
+    const FkVec3 currentPosition = positionFromTransform(currentTransform);
+    const FkVec3 currentRpy = rpyFromTransform(currentTransform);
+
+    const FkVec3 targetPosition = {
+        currentPosition.x + RequestedCartesianVector[0],
+        currentPosition.y + RequestedCartesianVector[1],
+        currentPosition.z + RequestedCartesianVector[2]
+    };
+
+    const FkVec3 targetRpy = {
+        currentRpy.x + RequestedCartesianVector[3],
+        currentRpy.y + RequestedCartesianVector[4],
+        currentRpy.z + RequestedCartesianVector[5]
+    };
+
+    std::cout << "\nCartesian target preview from requested delta:\n";
+    printFkVec3("  Current TCP position", currentPosition, "meters");
+    printFkVec3("  Current TCP RPY", currentRpy, "radians");
+    printFkVec3("  Target TCP position", targetPosition, "meters");
+    printFkVec3("  Target TCP RPY", targetRpy, "radians");
+
+    CartesianVector targetPoseVector = {
+        targetPosition.x,
+        targetPosition.y,
+        targetPosition.z,
+        targetRpy.x,
+        targetRpy.y,
+        targetRpy.z
+    };
+
+    printMultiSeedIkDryRunReport(
+        "Multi-seed numerical IK dry-run from current software-zero joint neighborhood",
+        actualRadians,
+        targetPoseVector);
+
+    printMultiSeedIkDryRunReport(
+        "Multi-seed numerical IK dry-run from rapidrobot AbsoluteSingleTurn home-offset neighborhood",
+        openRaveHomeAdjustedActualRadians,
+        targetPoseVector);
+
+    std::cout << "\nKinematics dry-run result:\n";
+    std::cout << "  FK scaffold: available.\n";
+    std::cout << "  Multi-seed numerical IK dry-run with dry-run validation gates: available.\n";
+    std::cout << "  Motion execution: intentionally disabled.\n";
+    std::cout << "  Next step: use only candidates that pass residual and joint-delta gates, then add a guarded Cartesian dry-run-to-motion path.\n";
+
+    std::cout << "\nSafety note:\n";
+    std::cout << "  The IK result is a candidate only. It is not commanded in this patch.\n";
+    std::cout << "  Absolute FK/IK pose is only meaningful after we confirm the physical robot zero/home convention matches the OpenRAVE/RapidRobot model convention.\n";
+    std::cout << "  Until then, use this as a model-development diagnostic, not as a live Cartesian motion command.\n";
+
+    std::cout << "\nController and MultiAxis error logs after kinematics dry-run:\n";
+    printErrorLog("MotionController", controller_);
+    printErrorLog("MultiAxis 6", multiAxis_);
+}
+
+
+void Racer3BasicMotion::runCartesianVectorMotion()
+{
+    std::cout << "Starting guarded segmented Cartesian-vector IK mode.\n";
+    std::cout << "This mode computes custom OpenRAVE IK candidates for one or more Cartesian segments.\n";
+    std::cout << "A large request can pass by being split into smaller validated segments instead of raising the joint-delta gate.\n";
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
+
+    JointVector actualUserUnits{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        actualUserUnits[index] = axes_[index]->ActualPositionGet();
+    }
+
+    JointVector actualRadians{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+    }
+
+    const FkMat4 currentTransform = openRaveRacer3ForwardKinematics(actualRadians);
+    const FkVec3 currentPosition = positionFromTransform(currentTransform);
+    const FkVec3 currentRpy = rpyFromTransform(currentTransform);
+
+    const FkVec3 targetPosition = {
+        currentPosition.x + RequestedCartesianVector[0],
+        currentPosition.y + RequestedCartesianVector[1],
+        currentPosition.z + RequestedCartesianVector[2]
+    };
+
+    const FkVec3 targetRpy = {
+        currentRpy.x + RequestedCartesianVector[3],
+        currentRpy.y + RequestedCartesianVector[4],
+        currentRpy.z + RequestedCartesianVector[5]
+    };
+
+    std::cout << "\nCurrent and final target pose preview:\n";
+    printJointDegreesFromRadians("  Current joint degrees", actualRadians);
+    printFkVec3("  Current TCP position", currentPosition, "meters");
+    printFkVec3("  Current TCP RPY", currentRpy, "radians");
+    printFkVec3("  Final target TCP position", targetPosition, "meters");
+    printFkVec3("  Final target TCP RPY", targetRpy, "radians");
+
+    const CartesianSegmentPlan segmentPlan =
+        buildSegmentedCartesianPlan(actualRadians, RequestedCartesianVector);
+
+    printCartesianSegmentPlanSummary(segmentPlan);
+
+    if (!segmentPlan.accepted)
+    {
+        std::cout << "\nSegmented Cartesian-vector candidate rejected by validation gates. No motion commanded.\n";
+        return;
+    }
+
+    if (segmentPlan.segmentCount > 1)
+    {
+        std::cout << "\nDirect one-shot motion would exceed the guarded joint-delta limit, so this request will use "
+                  << segmentPlan.segmentCount
+                  << " validated Cartesian segment(s).\n";
+    }
+    else
+    {
+        std::cout << "\nOne validated Cartesian segment is sufficient for this request.\n";
+    }
+
+    if (!CartesianVectorMotionConfirmed)
+    {
+        std::cout << "\nNo --confirm-motion was supplied. This was a guarded segmented Cartesian-vector dry run only.\n";
+        std::cout << "No amps were enabled and no motion was commanded.\n";
+        std::cout << "To execute the accepted segmented plan, rerun this mode with --confirm-motion after reviewing the segment deltas.\n";
+        return;
+    }
+
+    std::cout << "\n--confirm-motion supplied and all segment gates passed.\n";
+    std::cout << "Executing the segmented Cartesian IK plan through the existing MultiAxis joint-vector path.\n";
+    std::cout << "The robot will execute each outbound segment, then execute the reverse segment sequence to return to software zero.\n";
+
+    clearFaults();
+
+    printActualPositions("Actual positions after segmented Cartesian validation, before amp enable");
+    printDiagnosticSnapshot("After segmented Cartesian validation and clear faults, before amp enable");
+
+    enableAmplifiers();
+
+    printActualPositions("Actual positions after amp enable for segmented Cartesian-vector motion");
+    printDiagnosticSnapshot("After amp enable for segmented Cartesian-vector motion");
+
+    const std::vector<JointVector> relativeSequence =
+        makeOutAndBackSequenceFromSegmentPlan(segmentPlan);
+
+    std::cout << "\nStarting segmented Cartesian-vector MultiAxis execution.\n";
+    std::cout << "Sequence contains " << relativeSequence.size()
+              << " joint-vector step(s): "
+              << segmentPlan.segmentCount
+              << " outbound and "
+              << segmentPlan.segmentCount
+              << " return.\n";
+
+    if (relativeSequence.empty())
+    {
+        throw std::runtime_error("Segmented Cartesian sequence is empty.");
+    }
+
+    isolateAllAxesForAllMotion();
+
+    std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
+    bool errorLimitsTemporarilyChanged = false;
+
+    if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+    {
+        std::cout << "Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for segmented Cartesian-vector motion.\n";
+        std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            originalErrorLimitActions[index] = axes_[index]->ErrorLimitActionGet();
+            std::cout << "  Original Axis " << (index + 1)
+                      << " ErrorLimitAction: " << actionName(originalErrorLimitActions[index]) << "\n";
+            axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        }
+
+        errorLimitsTemporarilyChanged = true;
+    }
+
+    const JointVector velocity = makeAllAxesVector(MotionVelocity);
+    const JointVector acceleration = makeAllAxesVector(MotionAcceleration);
+    const JointVector deceleration = makeAllAxesVector(MotionDeceleration);
+    const JointVector jerk = makeAllAxesVector(MotionJerkPercent);
+
+    try
+    {
+        for (size_t stepIndex = 0; stepIndex < relativeSequence.size(); ++stepIndex)
+        {
+            const JointVector& relativePosition = relativeSequence[stepIndex];
+
+            std::cout << "\n=== Segmented Cartesian-vector MoveRelative step "
+                      << (stepIndex + 1)
+                      << " / "
+                      << relativeSequence.size()
+                      << " ===\n";
+
+            if (stepIndex < static_cast<size_t>(segmentPlan.segmentCount))
+            {
+                std::cout << "Direction: outbound Cartesian segment "
+                          << (stepIndex + 1)
+                          << " / "
+                          << segmentPlan.segmentCount
+                          << "\n";
+            }
+            else
+            {
+                const size_t returnIndex = stepIndex - static_cast<size_t>(segmentPlan.segmentCount) + 1;
+                std::cout << "Direction: return segment "
+                          << returnIndex
+                          << " / "
+                          << segmentPlan.segmentCount
+                          << "\n";
+            }
+
+            std::cout << "Relative position array [J1..J6] in user units: ";
+            printJointVector(relativePosition);
+
+            std::cout << "Relative position array [J1..J6] in approx degrees: ";
+            JointVector degrees{};
+            for (size_t axis = 0; axis < relativePosition.size(); ++axis)
+            {
+                degrees[axis] = toDegrees(relativePosition[axis]);
+            }
+            printJointVector(degrees);
+
+            std::cout << "Velocity array [J1..J6] in user-units/sec: ";
+            printJointVector(velocity);
+
+            clearErrorLog("MotionController", controller_);
+            clearErrorLog("MultiAxis 6", multiAxis_);
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+            }
+
+            configureMultiAxisMotionAttributes("before segmented Cartesian-vector MultiAxis::MoveRelative step");
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                configureAxisMotionAttributes(index, "before segmented Cartesian-vector MultiAxis::MoveRelative step");
+            }
+
+            printAllAxisMotionStatus("All axes before segmented Cartesian-vector MoveRelative");
+
+            const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
+            std::array<double, AxisCount> startingCommandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                startingCommandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            std::cout << "Commanding MultiAxis::MoveRelative for segmented Cartesian-vector joint step.\n";
+            std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+
+            multiAxis_->MoveRelative(
+                relativePosition.data(),
+                velocity.data(),
+                acceleration.data(),
+                deceleration.data(),
+                jerk.data());
+
+            std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
+            printAllAxisMotionStatus("All axes immediately after segmented Cartesian-vector MoveRelative");
+
+            waitForAllAxisMotionStart(
+                "Segmented Cartesian-vector MultiAxis::MoveRelative",
+                startingCommandPositions);
+
+            for (int sample = 0; sample < 8; ++sample)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
+                printAllAxisProgressLine("Segmented Cartesian-vector live sample", sample + 1);
+            }
+
+            waitForMotionDone(MotionTimeoutMs);
+
+            printActualPositions("Actual positions after segmented Cartesian-vector MoveRelative step");
+            printAllAxisMotionStatus("All axes after segmented Cartesian-vector MotionDoneWait");
+        }
+    }
+    catch (...)
+    {
+        if (errorLimitsTemporarilyChanged)
+        {
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                std::cout << "Restored Axis " << (index + 1)
+                          << " ErrorLimitAction to "
+                          << actionName(originalErrorLimitActions[index])
+                          << " after exception.\n";
+            }
+        }
+
+        throw;
+    }
+
+    if (errorLimitsTemporarilyChanged)
+    {
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+            std::cout << "Restored Axis " << (index + 1)
+                      << " ErrorLimitAction to "
+                      << actionName(originalErrorLimitActions[index])
+                      << ".\n";
+        }
+    }
+
+    std::cout << "Segmented Cartesian-vector MultiAxis execution complete. Net commanded offsets are zero.\n";
+
+    printReturnToZeroReport("Return-to-zero check after segmented Cartesian-vector motion", true);
+
+    printActualPositions("Actual positions before Cartesian-vector shutdown");
+    printDiagnosticSnapshot("Before Cartesian-vector shutdown");
+
+    disableAmplifiers();
+
+    std::cout << "Guarded segmented Cartesian-vector motion complete.\n";
+}
+
+
 void Racer3BasicMotion::printMotionPlan() const
 {
+    if (CartesianVectorMotionEnabled)
+    {
+        std::cout << "\nGuarded Cartesian-vector IK motion plan\n";
+        std::cout << "Purpose: compute custom OpenRAVE IK candidate(s) for a requested Cartesian delta, splitting larger requests into guarded segments when needed.\n";
+        std::cout << "Default behavior without --confirm-motion: compute and print the accepted/rejected segmented plan only; no amp enable and no motion.\n";
+        std::cout << "With --confirm-motion: every segment must pass residual and command joint-delta gates before any motion is allowed.\n";
+        std::cout << "Motion execution path: Cartesian segment(s) -> joint-vector user units -> MultiAxis::MoveRelative sequence -> reverse sequence return -> return-to-zero check.\n";
+        std::cout << "Validation gates per segment: residual norm/max component <= 1e-4 and max command joint delta <= 30 degrees.\n";        printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
+        std::cout << "\n";
+        return;
+    }
+
+    if (KinematicsDryRunEnabled)
+    {
+        std::cout << "\nCustom Racer3 kinematics dry-run plan\n";
+        std::cout << "Purpose: begin the custom articulated kinematics layer using the old rapidrobot OpenRAVE Racer3 model.\n";
+        std::cout << "This mode connects to RMP and reads the current joints, but it does not enable amps or command motion.\n";
+        std::cout << "Geometry source: racer3.kinbody.xml joint anchors/axes plus racer3.robot.xml tool point translation 0 0 1.012.\n";
+        std::cout << "Current implementation: FK scaffold plus wide-J1 multi-seed numerical IK dry-run with residual/joint-delta gates. Motion execution is intentionally not enabled yet.\n";
+        printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
+        std::cout << "\n";
+        return;
+    }
+
     if (RobotPoseProbeEnabled)
     {
         std::cout << "\nRobot pose/FK API probe plan\n";
@@ -1901,7 +3928,8 @@ void Racer3BasicMotion::printMotionPlan() const
         std::cout << "  1. LinearModelBuilder(\"RSI_Racer3\") with matching Axis labels + X/Y/Z/Roll/Pitch/Yaw mappings\n";
         std::cout << "  2. LinearModelBuilder(\"RSI_XYZABC_Millimeters\") with the same mappings\n";
         std::cout << "Read-only calls tested:\n";
-        std::cout << "  JointsActualPositionsGet, JointsCommandPositionsGet, ActualPoseGet, CommandPoseGet, ActualPositionGet, CommandPositionGet, ForwardKinematics, InverseKinematics\n\n";
+        std::cout << "  JointsActualPositionsGet, JointsCommandPositionsGet, ActualPoseGet, CommandPoseGet, ActualPositionGet, CommandPositionGet, ForwardKinematics, InverseKinematics\n";
+        std::cout << "This numeric version prints actual values and synthetic FK outputs so RSI_Racer3 can be compared against RSI_XYZABC_Millimeters.\n\n";
         return;
     }
 

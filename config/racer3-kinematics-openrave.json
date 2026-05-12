@@ -1,0 +1,205 @@
+{
+  "name": "Racer3OpenRaveScaffold",
+  "status": "development_scaffold_not_validated_for_motion",
+  "source": {
+    "zip": "racer3-in-rapidrobot-non-dll-files.zip",
+    "robot_xml": "RapidRobot/RapidRobotTestDriver/Robots/robots/racer3.robot.xml",
+    "kinbody_xml": "RapidRobot/RapidRobotTestDriver/Robots/robots/racer3.kinbody.xml",
+    "notes": [
+      "Robot manipulator tool translation is 0 0 1.012.",
+      "Joint anchors/axes are expressed in the OpenRAVE base frame.",
+      "This file is a model-development source of truth; current C++ patch hardcodes the same values."
+    ]
+  },
+  "units": {
+    "length": "meters",
+    "angle": "radians"
+  },
+  "tool_point_at_zero_m": [
+    0.0,
+    0.0,
+    1.012
+  ],
+  "joints": [
+    {
+      "name": "Joint1",
+      "anchor_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "limits_deg_xml": [
+        -150,
+        150
+      ],
+      "limits_deg_test_driver": [
+        -150,
+        150
+      ]
+    },
+    {
+      "name": "Joint2",
+      "anchor_m": [
+        0.05,
+        0.0,
+        0.365
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits_deg_xml": [
+        -75,
+        115
+      ],
+      "limits_deg_test_driver": [
+        -95,
+        135
+      ]
+    },
+    {
+      "name": "Joint3",
+      "anchor_m": [
+        0.05,
+        0.0,
+        0.635
+      ],
+      "axis": [
+        0.0,
+        -1.0,
+        0.0
+      ],
+      "limits_deg_xml": [
+        -155,
+        90
+      ],
+      "limits_deg_test_driver": [
+        -155,
+        90
+      ]
+    },
+    {
+      "name": "Joint4",
+      "anchor_m": [
+        0.0,
+        0.0,
+        0.676
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "limits_deg_xml": [
+        -180,
+        180
+      ],
+      "limits_deg_test_driver": [
+        -200,
+        200
+      ]
+    },
+    {
+      "name": "Joint5",
+      "anchor_m": [
+        0.0,
+        0.0,
+        0.94094
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limits_deg_xml": [
+        -105,
+        105
+      ],
+      "limits_deg_test_driver": [
+        -125,
+        125
+      ]
+    },
+    {
+      "name": "Joint6",
+      "anchor_m": [
+        0.0,
+        0.0,
+        1.01194
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "limits_deg_xml": [
+        -720,
+        720
+      ],
+      "limits_deg_test_driver": [
+        -540,
+        540
+      ]
+    }
+  ],
+  "rapidrobot_absolute_single_turn_home_rad": [
+    1.6844493899891712e-06,
+    0.0,
+    -1.570796,
+    0.0,
+    1.570796,
+    0.0
+  ],
+  "test_driver": {
+    "drive_units": [
+      238312.7272,
+      233016.88888,
+      209715.2,
+      178257.92,
+      178257.92,
+      116508.4444
+    ],
+    "velocity_limits_deg_per_sec": [
+      440,
+      450,
+      500,
+      600,
+      600,
+      900
+    ],
+    "acceleration_limits_deg_per_sec2": [
+      1500,
+      1500,
+      1500,
+      1500,
+      1500,
+      1800
+    ]
+  },
+  "motor_specs_from_uploaded_pdfs": {
+    "axis_1_2": {
+      "model": "TSM3204 N76XX E201",
+      "length_mm": 127.8,
+      "static_torque_nm": 1.27,
+      "peak_torque_nm": 4.4
+    },
+    "axis_3": {
+      "model": "TSM3202 N76XX E202",
+      "length_mm": 105.8,
+      "static_torque_nm": 0.64,
+      "peak_torque_nm": 2.2
+    },
+    "axis_4_5_6": {
+      "model": "TSM3201 N76XX E201",
+      "length_mm": 82.1,
+      "static_torque_nm": 0.318,
+      "peak_torque_nm": 1.1
+    }
+  }
+}

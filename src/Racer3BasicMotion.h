@@ -23,6 +23,8 @@ struct Racer3RunOptions
     bool jointVectorMotion = false;
     bool robotModelProbe = false;
     bool robotPoseProbe = false;
+    bool kinematicsDryRun = false;
+    bool cartesianVectorMotion = false;
     bool motionConfirmed = false;
     bool diagnostics = false;
     double stepUserUnits = 0.05;
@@ -30,6 +32,7 @@ struct Racer3RunOptions
     double returnWarnToleranceUserUnits = 0.00025;
     double returnFailToleranceUserUnits = 0.00100;
     std::array<double, 6> jointVectorUserUnits{};
+    std::array<double, 6> cartesianVector{};
 };
 
 class Racer3BasicMotion
@@ -62,6 +65,8 @@ private:
     void runJointVectorMotion();
     void runRobotModelProbe();
     void runRobotPoseProbe();
+    void runKinematicsDryRun();
+    void runCartesianVectorMotion();
     void printMotionPlan() const;
     void printActualPositions(const char* label);
     void printDiagnosticSnapshot(const char* label, bool includeErrorLogs = true);
