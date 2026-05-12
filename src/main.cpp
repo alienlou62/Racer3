@@ -1,9 +1,13 @@
 #include "Racer3BasicMotion.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <rsi.h>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -11,7 +15,11 @@ namespace
 {
 constexpr double DefaultStepUserUnits = 0.05;
 constexpr double DefaultVelocityUserUnitsPerSecond = 0.05;
+constexpr double DefaultReturnWarnToleranceUserUnits = 0.00025;
+constexpr double DefaultReturnFailToleranceUserUnits = 0.00100;
 constexpr double MaxRecommendedStepUserUnits = 0.25;
+constexpr int AxisCount = 6;
+constexpr double MaxRecommendedJointVectorUserUnits = 0.25;
 
 void printUsage()
 {
@@ -22,17 +30,26 @@ void printUsage()
         << "  racer3-basic-motion --enable-only [--diagnostics]\n"
         << "  racer3-basic-motion --tiny-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
         << "  racer3-basic-motion --dual-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
-        << "  racer3-basic-motion --all-motion --confirm-motion [--step 0.01] [--velocity 0.02] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --all-motion --confirm-motion [--step 0.01] [--velocity 0.02] [--diagnostics]\n"
+        << "  racer3-basic-motion --joint-vector --confirm-motion --joints j1,j2,j3,j4,j5,j6 [--velocity 0.02] [--return-warn 0.00025] [--return-fail 0.001] [--diagnostics]\n"
+        << "  racer3-basic-motion --robot-model-probe [--diagnostics]\n"
+        << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
         << "  --tiny-motion      Enable all drives, isolate J6, and run a tiny J6-only move.\n"
         << "  --dual-motion      Enable all drives, remap MultiAxis to J5+J6, and move both together.\n"
         << "  --all-motion       Enable all drives, remap MultiAxis to J1-J6, and move all together.\n"
+        << "  --joint-vector     Enable all drives, remap MultiAxis to J1-J6, and move a custom joint vector.\n"
+        << "  --robot-model-probe Connect/load MultiAxis and probe the RSI_Racer3 Cartesian Robot model. No amp enable or motion.\n"
+        << "  --robot-pose-probe  Connect/load MultiAxis and probe read-only Robot pose/FK/IK APIs. No amp enable or motion.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
-        << "  --step <value>     Relative move in user units. Default 0.05.\n"
+        << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
+        << "  --joints <list>    Six comma-separated user-unit deltas for --joint-vector, e.g. 0,0,0,0,0.005,0.005.\n"
         << "  --velocity <value> Velocity in user-units/sec. Default 0.05.\n"
+        << "  --return-warn <value> Warn if final absolute actual position exceeds this user-unit tolerance. Default 0.00025.\n"
+        << "  --return-fail <value> Fail if final absolute actual position exceeds this user-unit tolerance. Default 0.001.\n"
         << "  --help             Show this help text.\n\n"
         << "Notes:\n"
         << "  1.0 user unit = one physical revolution on each configured axis.\n"
@@ -103,6 +120,88 @@ double getDoubleOption(
     return defaultValue;
 }
 
+std::string getStringOption(
+    const std::vector<std::string>& args,
+    const std::string& longName,
+    const std::string& defaultValue)
+{
+    const std::string equalsPrefix = longName + "=";
+
+    for (size_t index = 0; index < args.size(); ++index)
+    {
+        const std::string& arg = args[index];
+
+        if (startsWith(arg, equalsPrefix))
+        {
+            return arg.substr(equalsPrefix.size());
+        }
+
+        if (arg == longName)
+        {
+            if (index + 1 >= args.size())
+            {
+                throw std::runtime_error("Missing value after " + longName);
+            }
+            return args[index + 1];
+        }
+    }
+
+    return defaultValue;
+}
+
+std::array<double, AxisCount> parseJointVector(const std::string& text)
+{
+    std::array<double, AxisCount> values{};
+
+    std::stringstream stream(text);
+    std::string token;
+    int index = 0;
+
+    while (std::getline(stream, token, ','))
+    {
+        if (index >= AxisCount)
+        {
+            throw std::runtime_error("--joints must contain exactly six comma-separated values.");
+        }
+
+        values[index] = parseDoubleValue(token, "--joints");
+        ++index;
+    }
+
+    if (index != AxisCount)
+    {
+        throw std::runtime_error("--joints must contain exactly six comma-separated values.");
+    }
+
+    return values;
+}
+
+bool jointVectorHasMotion(const std::array<double, AxisCount>& values)
+{
+    for (double value : values)
+    {
+        if (std::fabs(value) > 1e-12)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+double maxAbsJointVector(const std::array<double, AxisCount>& values)
+{
+    double result = 0.0;
+
+    for (double value : values)
+    {
+        result = std::max(result, std::fabs(value));
+    }
+
+    return result;
+}
+
+
 void validateOptions(const Racer3RunOptions& options)
 {
     if (options.stepUserUnits <= 0.0)
@@ -115,11 +214,41 @@ void validateOptions(const Racer3RunOptions& options)
         throw std::runtime_error("--velocity must be greater than zero.");
     }
 
+    if (options.returnWarnToleranceUserUnits < 0.0)
+    {
+        throw std::runtime_error("--return-warn must be zero or greater.");
+    }
+
+    if (options.returnFailToleranceUserUnits <= 0.0)
+    {
+        throw std::runtime_error("--return-fail must be greater than zero.");
+    }
+
+    if (options.returnWarnToleranceUserUnits > options.returnFailToleranceUserUnits)
+    {
+        throw std::runtime_error("--return-warn must be less than or equal to --return-fail.");
+    }
+
     if (options.stepUserUnits > MaxRecommendedStepUserUnits && (options.tinyMotion || options.dualMotion || options.allMotion))
     {
         throw std::runtime_error(
             "Refusing --step greater than 0.25 user units for this starter demo. "
             "Use 0.05 or smaller for normal testing.");
+    }
+
+    if (options.jointVectorMotion)
+    {
+        if (!jointVectorHasMotion(options.jointVectorUserUnits))
+        {
+            throw std::runtime_error("--joints must contain at least one nonzero joint value for --joint-vector.");
+        }
+
+        if (maxAbsJointVector(options.jointVectorUserUnits) > MaxRecommendedJointVectorUserUnits)
+        {
+            throw std::runtime_error(
+                "Refusing a joint-vector element greater than 0.25 user units for this starter demo. "
+                "Use smaller values first.");
+        }
     }
 }
 }
@@ -141,11 +270,26 @@ int main(int argc, char* argv[])
         options.tinyMotion = hasArg(args, "--tiny-motion");
         options.dualMotion = hasArg(args, "--dual-motion");
         options.allMotion = hasArg(args, "--all-motion");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion);
+        options.jointVectorMotion = hasArg(args, "--joint-vector");
+        options.robotModelProbe = hasArg(args, "--robot-model-probe");
+        options.robotPoseProbe = hasArg(args, "--robot-pose-probe");
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
         options.velocityUserUnitsPerSecond = getDoubleOption(args, "--velocity", DefaultVelocityUserUnitsPerSecond);
+        options.returnWarnToleranceUserUnits = getDoubleOption(args, "--return-warn", DefaultReturnWarnToleranceUserUnits);
+        options.returnFailToleranceUserUnits = getDoubleOption(args, "--return-fail", DefaultReturnFailToleranceUserUnits);
+
+        const std::string jointsText = getStringOption(args, "--joints", "");
+        if (options.jointVectorMotion)
+        {
+            if (jointsText.empty())
+            {
+                throw std::runtime_error("--joint-vector requires --joints j1,j2,j3,j4,j5,j6.");
+            }
+            options.jointVectorUserUnits = parseJointVector(jointsText);
+        }
 
         if (hasArg(args, "--vel"))
         {
@@ -154,14 +298,20 @@ int main(int argc, char* argv[])
 
         validateOptions(options);
 
-        const int motionModeCount = (options.tinyMotion ? 1 : 0) + (options.dualMotion ? 1 : 0) + (options.allMotion ? 1 : 0);
+        const int motionModeCount =
+            (options.tinyMotion ? 1 : 0) +
+            (options.dualMotion ? 1 : 0) +
+            (options.allMotion ? 1 : 0) +
+            (options.jointVectorMotion ? 1 : 0) +
+            (options.robotModelProbe ? 1 : 0) +
+            (options.robotPoseProbe ? 1 : 0);
         if (motionModeCount > 1)
         {
-            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, or --all-motion.\n";
+            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, or --robot-pose-probe.\n";
             return 2;
         }
 
-        if ((options.tinyMotion || options.dualMotion || options.allMotion) && !options.motionConfirmed && !options.dryRun)
+        if ((options.tinyMotion || options.dualMotion || options.allMotion || options.jointVectorMotion) && !options.motionConfirmed && !options.dryRun)
         {
             std::cerr << "Refusing to run real motion without --confirm-motion.\n";
             std::cerr << "Use --dry-run first, then run the motion mode with --confirm-motion only when ready.\n";
@@ -192,12 +342,37 @@ int main(int argc, char* argv[])
         {
             std::cout << "Mode: ALL MOTION - synchronized Axis 1 through Axis 6 relative motion.\n";
         }
+        else if (options.jointVectorMotion)
+        {
+            std::cout << "Mode: JOINT VECTOR - custom synchronized Axis 1 through Axis 6 relative motion.\n";
+        }
+        else if (options.robotModelProbe)
+        {
+            std::cout << "Mode: ROBOT MODEL PROBE - no amp enable, no motion.\n";
+        }
+        else if (options.robotPoseProbe)
+        {
+            std::cout << "Mode: ROBOT POSE PROBE - no amp enable, no motion.\n";
+        }
 
         std::cout << "Motion step: " << options.stepUserUnits
                   << " user units = " << (options.stepUserUnits * 360.0) << " degrees.\n";
         std::cout << "Motion velocity: " << options.velocityUserUnitsPerSecond
                   << " user-units/sec = " << (options.velocityUserUnitsPerSecond * 360.0) << " deg/sec.\n";
+        if (options.jointVectorMotion)
+        {
+            std::cout << "Joint vector [J1..J6] user units:";
+            for (double value : options.jointVectorUserUnits)
+            {
+                std::cout << " " << value;
+            }
+            std::cout << "\n";
+        }
         std::cout << "Diagnostics: " << (options.diagnostics ? "FULL" : "COMPACT") << "\n";
+        std::cout << "Return warning tolerance: " << options.returnWarnToleranceUserUnits
+                  << " user units = " << (options.returnWarnToleranceUserUnits * 360.0) << " degrees.\n";
+        std::cout << "Return fail tolerance: " << options.returnFailToleranceUserUnits
+                  << " user units = " << (options.returnFailToleranceUserUnits * 360.0) << " degrees.\n";
         std::cout << "WARNING: Real modes may enable robot drives. Keep the robot area clear and E-stop ready.\n";
         std::cout << "Press Enter to continue or Ctrl+C to abort...\n";
         std::string ignored;

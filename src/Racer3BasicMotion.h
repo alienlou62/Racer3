@@ -20,10 +20,16 @@ struct Racer3RunOptions
     bool tinyMotion = false;
     bool dualMotion = false;
     bool allMotion = false;
+    bool jointVectorMotion = false;
+    bool robotModelProbe = false;
+    bool robotPoseProbe = false;
     bool motionConfirmed = false;
     bool diagnostics = false;
     double stepUserUnits = 0.05;
     double velocityUserUnitsPerSecond = 0.05;
+    double returnWarnToleranceUserUnits = 0.00025;
+    double returnFailToleranceUserUnits = 0.00100;
+    std::array<double, 6> jointVectorUserUnits{};
 };
 
 class Racer3BasicMotion
@@ -53,6 +59,9 @@ private:
     void runTinyMotion();
     void runDualAxisMotion();
     void runAllAxisMotion();
+    void runJointVectorMotion();
+    void runRobotModelProbe();
+    void runRobotPoseProbe();
     void printMotionPlan() const;
     void printActualPositions(const char* label);
     void printDiagnosticSnapshot(const char* label, bool includeErrorLogs = true);
@@ -62,6 +71,7 @@ private:
     void printAxis6MotionStatus(const char* label);
     void printAxis5And6MotionStatus(const char* label);
     void printAllAxisMotionStatus(const char* label);
+    bool printReturnToZeroReport(const char* label, bool throwOnFail);
     void printMotionProgressLine(const char* label, int sampleNumber);
     void printDualAxisProgressLine(const char* label, int sampleNumber);
     void printAllAxisProgressLine(const char* label, int sampleNumber);

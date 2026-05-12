@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -16,7 +16,13 @@ param(
 
     [double]$Velocity = 0.05,
 
-    [switch]$Diagnostics
+    [double]$ReturnWarn = 0.00025,
+
+    [double]$ReturnFail = 0.001,
+
+    [switch]$Diagnostics,
+
+    [string]$Joints = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +48,9 @@ Write-Host "Exe:       $ExePath"
 Write-Host "Mode:      $Mode"
 Write-Host "Step:      $Step user units"
 Write-Host "Velocity:  $Velocity user-units/sec"
+Write-Host "ReturnWarn: $ReturnWarn user units"
+Write-Host "ReturnFail: $ReturnFail user units"
+if ($Mode -eq "joint-vector") { Write-Host "Joints:    $Joints" }
 Write-Host "Diag:      $Diagnostics"
 Write-Host "Dry run:   $DryRun"
 
@@ -98,6 +107,18 @@ if ($Step -le 0) {
 
 if ($Velocity -le 0) {
     throw "-Velocity must be greater than zero."
+}
+
+if ($ReturnWarn -lt 0) {
+    throw "-ReturnWarn must be zero or greater."
+}
+
+if ($ReturnFail -le 0) {
+    throw "-ReturnFail must be greater than zero."
+}
+
+if ($ReturnWarn -gt $ReturnFail) {
+    throw "-ReturnWarn must be less than or equal to -ReturnFail."
 }
 
 switch ($Mode) {
@@ -157,12 +178,56 @@ switch ($Mode) {
             }
         }
     }
+    "robot-model-probe" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--robot-model-probe"
+        }
+        else {
+            $ExeArgs += "--robot-model-probe"
+        }
+    }
+    "robot-pose-probe" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--robot-pose-probe"
+        }
+        else {
+            $ExeArgs += "--robot-pose-probe"
+        }
+    }
+    "joint-vector" {
+        if ([string]::IsNullOrWhiteSpace($Joints)) {
+            throw 'joint-vector requires -Joints "j1,j2,j3,j4,j5,j6".'
+        }
+
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--joint-vector"
+        }
+        else {
+            $ExeArgs += "--joint-vector"
+            if ($ConfirmMotion) {
+                $ExeArgs += "--confirm-motion"
+            }
+            else {
+                throw "joint-vector requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            }
+        }
+
+        $ExeArgs += "--joints"
+        $ExeArgs += $Joints
+    }
 }
 
 $ExeArgs += "--step"
 $ExeArgs += ([string]$Step)
 $ExeArgs += "--velocity"
 $ExeArgs += ([string]$Velocity)
+$ExeArgs += "--return-warn"
+$ExeArgs += ([string]$ReturnWarn)
+$ExeArgs += "--return-fail"
+$ExeArgs += ([string]$ReturnFail)
 
 if ($Diagnostics) {
     $ExeArgs += "--diagnostics"

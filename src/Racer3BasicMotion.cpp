@@ -1,18 +1,23 @@
 #include "Racer3BasicMotion.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <iostream>
 #include <rsi.h>
+#include <cartesianrobot.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace RR = RSI::RapidCode;
+namespace RC = RSI::RapidCode::Cartesian;
 
 namespace
 {
@@ -70,6 +75,12 @@ static constexpr bool TemporarilyDisableAxis6ErrorLimitForTinyMotion = true;
 static bool DiagnosticsEnabled = false;
 static bool DualMotionEnabled = false;
 static bool AllMotionEnabled = false;
+static bool JointVectorMotionEnabled = false;
+static bool RobotModelProbeEnabled = false;
+static bool RobotPoseProbeEnabled = false;
+static double ReturnWarnToleranceUserUnits = 0.00025;
+static double ReturnFailToleranceUserUnits = 0.00100;
+static JointVector RequestedJointVector{};
 
 double toDegrees(double userUnits)
 {
@@ -108,6 +119,43 @@ JointVector makeAllAxesVector(double value)
     JointVector values{};
     values.fill(value);
     return values;
+}
+
+JointVector negateJointVector(const JointVector& values)
+{
+    JointVector result{};
+
+    for (size_t index = 0; index < result.size(); ++index)
+    {
+        result[index] = -values[index];
+    }
+
+    return result;
+}
+
+bool hasAnyNonZeroJoint(const JointVector& values)
+{
+    for (double value : values)
+    {
+        if (std::fabs(value) > 1e-12)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+double maxAbsJointValue(const JointVector& values)
+{
+    double result = 0.0;
+
+    for (double value : values)
+    {
+        result = std::max(result, std::fabs(value));
+    }
+
+    return result;
 }
 
 std::string hex64(uint64_t value)
@@ -236,6 +284,131 @@ void clearErrorLog(const char* label, RapidCodeObjectT* object)
         std::cout << label << " error log clear failed.\n";
     }
 }
+
+const char* const RobotProbeAxisLabels[Racer3BasicMotion::AxisCount] = {
+    "X-Axis",
+    "Y-Axis",
+    "Z-Axis",
+    "Roll-Axis",
+    "Pitch-Axis",
+    "Yaw-Axis"
+};
+
+void setRobotProbeAxisLabels(std::array<RR::Axis*, Racer3BasicMotion::AxisCount>& axes)
+{
+    std::cout << "Setting temporary Axis UserLabel values for Cartesian Robot validation:\n";
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (!axes[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        axes[index]->UserLabelSet(RobotProbeAxisLabels[index]);
+        std::cout << "  Axis " << (index + 1)
+                  << " UserLabelSet(\""
+                  << RobotProbeAxisLabels[index]
+                  << "\")\n";
+    }
+}
+
+template <size_t N>
+void setExpectedLabel(char (&destination)[N], const char* source)
+{
+    std::snprintf(destination, N, "%s", source);
+}
+
+void addSixAxisXyzAbcLinearJoints(RC::LinearModelBuilder& builder)
+{
+    const double scaling = 1.0;
+    const double offset = 0.0;
+
+    RC::LinearJointMapping x(0, RC::CartesianAxis::X);
+    setExpectedLabel(x.ExpectedLabel, RobotProbeAxisLabels[0]);
+    x.Scaling = scaling;
+    x.Offset = offset;
+    builder.JointAdd(x);
+
+    RC::LinearJointMapping y(1, RC::CartesianAxis::Y);
+    setExpectedLabel(y.ExpectedLabel, RobotProbeAxisLabels[1]);
+    y.Scaling = scaling;
+    y.Offset = offset;
+    builder.JointAdd(y);
+
+    RC::LinearJointMapping z(2, RC::CartesianAxis::Z);
+    setExpectedLabel(z.ExpectedLabel, RobotProbeAxisLabels[2]);
+    z.Scaling = scaling;
+    z.Offset = offset;
+    builder.JointAdd(z);
+
+    RC::LinearJointMapping roll(3, RC::CartesianAxis::Roll);
+    setExpectedLabel(roll.ExpectedLabel, RobotProbeAxisLabels[3]);
+    roll.Scaling = scaling;
+    roll.Offset = offset;
+    builder.JointAdd(roll);
+
+    RC::LinearJointMapping pitch(4, RC::CartesianAxis::Pitch);
+    setExpectedLabel(pitch.ExpectedLabel, RobotProbeAxisLabels[4]);
+    pitch.Scaling = scaling;
+    pitch.Offset = offset;
+    builder.JointAdd(pitch);
+
+    RC::LinearJointMapping yaw(5, RC::CartesianAxis::Yaw);
+    setExpectedLabel(yaw.ExpectedLabel, RobotProbeAxisLabels[5]);
+    yaw.Scaling = scaling;
+    yaw.Offset = offset;
+    builder.JointAdd(yaw);
+}
+
+void probeConfiguredLinearBuilder(
+    RR::MotionController* controller,
+    RR::MultiAxis* multiAxis,
+    const char* modelLabel,
+    const char* probeLabel)
+{
+    std::cout << "\n" << probeLabel << ": LinearModelBuilder(\""
+              << modelLabel
+              << "\") + X/Y/Z/Roll/Pitch/Yaw JointAdd mappings + RobotCreate(...)\n";
+
+    try
+    {
+        RC::LinearModelBuilder builder(modelLabel);
+        std::cout << "  LinearModelBuilder constructed.\n";
+
+        addSixAxisXyzAbcLinearJoints(builder);
+        std::cout << "  Added six JointAdd mappings with ExpectedLabel values matching Axis UserLabel values.\n";
+
+        const RC::KinematicModel& model = builder.ModelBuild();
+        (void)model;
+        std::cout << "  ModelBuild returned a KinematicModel reference.\n";
+
+        RC::Robot* robot = RC::Robot::RobotCreate(controller, multiAxis, &builder);
+        if (!robot)
+        {
+            std::cout << "  RobotCreate returned null.\n";
+            return;
+        }
+
+        std::cout << "  RobotCreate returned a non-null Robot pointer.\n";
+        printErrorLog("  Robot(configured builder)", robot);
+        RC::Robot::RobotDelete(controller, robot);
+        std::cout << "  RobotDelete completed.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  " << probeLabel << " RapidCode error: " << error.text << "\n";
+        std::cout << "  Function: " << error.functionName << "\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  " << probeLabel << " std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  " << probeLabel << " unknown exception.\n";
+    }
+}
 }
 
 Racer3BasicMotion::Racer3BasicMotion()
@@ -253,8 +426,29 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     DiagnosticsEnabled = options.diagnostics;
     DualMotionEnabled = options.dualMotion;
     AllMotionEnabled = options.allMotion;
+    JointVectorMotionEnabled = options.jointVectorMotion;
+    RobotModelProbeEnabled = options.robotModelProbe;
+    RobotPoseProbeEnabled = options.robotPoseProbe;
+    ReturnWarnToleranceUserUnits = options.returnWarnToleranceUserUnits;
+    ReturnFailToleranceUserUnits = options.returnFailToleranceUserUnits;
+    RequestedJointVector = options.jointVectorUserUnits;
 
-    if (options.stepUserUnits <= 0.0)
+    if (ReturnWarnToleranceUserUnits < 0.0)
+    {
+        throw std::runtime_error("--return-warn must be zero or greater.");
+    }
+
+    if (ReturnFailToleranceUserUnits <= 0.0)
+    {
+        throw std::runtime_error("--return-fail must be greater than zero.");
+    }
+
+    if (ReturnWarnToleranceUserUnits > ReturnFailToleranceUserUnits)
+    {
+        throw std::runtime_error("--return-warn must be less than or equal to --return-fail.");
+    }
+
+    if (!JointVectorMotionEnabled && options.stepUserUnits <= 0.0)
     {
         throw std::runtime_error("--step must be greater than zero.");
     }
@@ -267,6 +461,11 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     Axis6TestStepUserUnits = options.stepUserUnits;
     MotionVelocity = options.velocityUserUnitsPerSecond;
 
+    if (JointVectorMotionEnabled && !hasAnyNonZeroJoint(RequestedJointVector))
+    {
+        throw std::runtime_error("--joints must contain at least one nonzero joint value for --joint-vector.");
+    }
+
     printMotionPlan();
 
     if (options.dryRun)
@@ -278,6 +477,20 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     try
     {
         connectController();
+
+        if (options.robotModelProbe)
+        {
+            runRobotModelProbe();
+            safeShutdown();
+            return;
+        }
+
+        if (options.robotPoseProbe)
+        {
+            runRobotPoseProbe();
+            safeShutdown();
+            return;
+        }
 
         clearFaults();
 
@@ -304,6 +517,15 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         else if (options.allMotion)
         {
             runAllAxisMotion();
+        }
+        else if (options.jointVectorMotion)
+        {
+            runJointVectorMotion();
+        }
+
+        if (options.tinyMotion || options.dualMotion || options.allMotion || options.jointVectorMotion)
+        {
+            printReturnToZeroReport("Return-to-zero check after motion", true);
         }
 
         printActualPositions("Actual positions before shutdown");
@@ -436,7 +658,7 @@ void Racer3BasicMotion::configureAxes()
         std::cout << "Axis 5 / J5 HomeActionSet(RSIActionNONE) applied.\n";
     }
 
-    if (AllMotionEnabled)
+    if (AllMotionEnabled || JointVectorMotionEnabled || RobotPoseProbeEnabled)
     {
         configureAllAxesForAllMotion();
     }
@@ -1204,9 +1426,512 @@ void Racer3BasicMotion::runAllAxisMotion()
     std::cout << "Synchronized all-axis MultiAxis MoveRelative diagnostic complete. Net commanded offsets are zero.\n";
 }
 
+
+void Racer3BasicMotion::runJointVectorMotion()
+{
+    std::cout << "Starting custom joint-vector MultiAxis::MoveRelative diagnostic...\n";
+    std::cout << "All 6 axes were enabled through runtime-mapped MultiAxis 6 first.\n";
+    std::cout << "Before the joint-vector move, MultiAxis 6 is remapped to Axis 1 through Axis 6.\n";
+    std::cout << "The requested relative joint vector is commanded, then its negative is commanded to return to software zero.\n";
+    std::cout << "Max requested joint delta = "
+              << maxAbsJointValue(RequestedJointVector)
+              << " user units = "
+              << toDegrees(maxAbsJointValue(RequestedJointVector))
+              << " degrees.\n";
+    std::cout << "Velocity = "
+              << MotionVelocity
+              << " user-units/sec = "
+              << toDegrees(MotionVelocity)
+              << " deg/sec on each axis.\n";
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+    }
+
+    isolateAllAxesForAllMotion();
+
+    std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
+    bool errorLimitsTemporarilyChanged = false;
+
+    if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+    {
+        std::cout << "Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for this joint-vector motion test.\n";
+        std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            originalErrorLimitActions[index] = axes_[index]->ErrorLimitActionGet();
+            std::cout << "  Original Axis " << (index + 1)
+                      << " ErrorLimitAction: " << actionName(originalErrorLimitActions[index]) << "\n";
+            axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        }
+
+        errorLimitsTemporarilyChanged = true;
+    }
+
+    const std::array<JointVector, 2> relativePositions = {
+        RequestedJointVector,
+        negateJointVector(RequestedJointVector)
+    };
+
+    const JointVector velocity = makeAllAxesVector(MotionVelocity);
+    const JointVector acceleration = makeAllAxesVector(MotionAcceleration);
+    const JointVector deceleration = makeAllAxesVector(MotionDeceleration);
+    const JointVector jerk = makeAllAxesVector(MotionJerkPercent);
+
+    try
+    {
+        for (size_t stepIndex = 0; stepIndex < relativePositions.size(); ++stepIndex)
+        {
+            const JointVector& relativePosition = relativePositions[stepIndex];
+
+            std::cout << "\n=== Joint-vector MultiAxis::MoveRelative step "
+                      << (stepIndex + 1)
+                      << " / "
+                      << relativePositions.size()
+                      << " ===\n";
+
+            std::cout << "Relative position array [J1..J6] in user units: ";
+            printJointVector(relativePosition);
+            std::cout << "Relative position array [J1..J6] in approx degrees: ";
+            JointVector degrees{};
+            for (size_t axis = 0; axis < relativePosition.size(); ++axis)
+            {
+                degrees[axis] = toDegrees(relativePosition[axis]);
+            }
+            printJointVector(degrees);
+            std::cout << "Velocity array [J1..J6] in user-units/sec: ";
+            printJointVector(velocity);
+
+            clearErrorLog("MotionController", controller_);
+            clearErrorLog("MultiAxis 6", multiAxis_);
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+            }
+
+            configureMultiAxisMotionAttributes("before joint-vector MultiAxis::MoveRelative step");
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                configureAxisMotionAttributes(index, "before joint-vector MultiAxis::MoveRelative step");
+            }
+
+            printAllAxisMotionStatus("All axes before joint-vector MoveRelative");
+
+            const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
+            std::array<double, AxisCount> startingCommandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                startingCommandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            std::cout << "Commanding MultiAxis::MoveRelative for custom [Axis1..Axis6] joint vector.\n";
+            std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+
+            multiAxis_->MoveRelative(
+                relativePosition.data(),
+                velocity.data(),
+                acceleration.data(),
+                deceleration.data(),
+                jerk.data());
+
+            std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
+            printAllAxisMotionStatus("All axes immediately after joint-vector MoveRelative");
+
+            waitForAllAxisMotionStart(
+                "Joint-vector MultiAxis::MoveRelative",
+                startingCommandPositions);
+
+            for (int sample = 0; sample < 8; ++sample)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
+                printAllAxisProgressLine("Joint-vector live sample", sample + 1);
+            }
+
+            waitForMotionDone(MotionTimeoutMs);
+
+            printActualPositions("Actual positions after joint-vector MultiAxis::MoveRelative step");
+            printAllAxisMotionStatus("All axes after MotionDoneWait");
+        }
+    }
+    catch (...)
+    {
+        if (errorLimitsTemporarilyChanged)
+        {
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                std::cout << "Restored Axis " << (index + 1)
+                          << " ErrorLimitAction to " << actionName(originalErrorLimitActions[index]) << ".\n";
+            }
+        }
+
+        throw;
+    }
+
+    if (errorLimitsTemporarilyChanged)
+    {
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+            std::cout << "Restored Axis " << (index + 1)
+                      << " ErrorLimitAction to " << actionName(originalErrorLimitActions[index]) << ".\n";
+        }
+    }
+
+    std::cout << "Custom joint-vector MultiAxis MoveRelative diagnostic complete. Net commanded offsets are zero.\n";
+}
+
+
+
+
+template <typename Callable>
+void probeReadOnlyRobotCall(const char* label, Callable callable)
+{
+    try
+    {
+        auto result = callable();
+        (void)result;
+        std::cout << "  " << label << ": OK\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  " << label << ": RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  " << label << ": std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  " << label << ": unknown exception.\n";
+    }
+}
+
+void runReadOnlyRobotApiProbe(
+    RR::MotionController* controller,
+    RR::MultiAxis* multiAxis,
+    const char* modelLabel,
+    const char* probeLabel)
+{
+    std::cout << "\n" << probeLabel << ": read-only Robot API probe using LinearModelBuilder(\""
+              << modelLabel
+              << "\")\n";
+
+    RC::Robot* robot = nullptr;
+
+    try
+    {
+        RC::LinearModelBuilder builder(modelLabel);
+        addSixAxisXyzAbcLinearJoints(builder);
+        const RC::KinematicModel& model = builder.ModelBuild();
+        (void)model;
+
+        robot = RC::Robot::RobotCreate(controller, multiAxis, &builder);
+        if (!robot)
+        {
+            std::cout << "  RobotCreate returned null. Skipping read-only API calls.\n";
+            return;
+        }
+
+        std::cout << "  RobotCreate returned a non-null Robot pointer.\n";
+        printErrorLog("  Robot(read-only probe)", robot);
+
+        probeReadOnlyRobotCall("JointsActualPositionsGet", [&]() {
+            return robot->JointsActualPositionsGet();
+        });
+
+        probeReadOnlyRobotCall("JointsCommandPositionsGet", [&]() {
+            return robot->JointsCommandPositionsGet();
+        });
+
+        probeReadOnlyRobotCall("ActualPoseGet", [&]() {
+            return robot->ActualPoseGet();
+        });
+
+        probeReadOnlyRobotCall("CommandPoseGet", [&]() {
+            return robot->CommandPoseGet();
+        });
+
+        probeReadOnlyRobotCall("ActualPositionGet", [&]() {
+            return robot->ActualPositionGet();
+        });
+
+        probeReadOnlyRobotCall("CommandPositionGet", [&]() {
+            return robot->CommandPositionGet();
+        });
+
+        probeReadOnlyRobotCall("ForwardKinematics(JointsActualPositionsGet())", [&]() {
+            const auto joints = robot->JointsActualPositionsGet();
+            return robot->ForwardKinematics(joints);
+        });
+
+        probeReadOnlyRobotCall("ForwardKinematicsPosition(JointsActualPositionsGet())", [&]() {
+            const auto joints = robot->JointsActualPositionsGet();
+            return robot->ForwardKinematicsPosition(joints);
+        });
+
+        probeReadOnlyRobotCall("InverseKinematics(ActualPoseGet())", [&]() {
+            const auto pose = robot->ActualPoseGet();
+            return robot->InverseKinematics(pose);
+        });
+
+        probeReadOnlyRobotCall("InverseKinematics(ActualPositionGet())", [&]() {
+            const auto position = robot->ActualPositionGet();
+            return robot->InverseKinematics(position);
+        });
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  " << probeLabel << " setup RapidCode error: " << error.text << "\n";
+        std::cout << "  Function: " << error.functionName << "\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  " << probeLabel << " setup std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  " << probeLabel << " setup unknown exception.\n";
+    }
+
+    if (robot)
+    {
+        try
+        {
+            RC::Robot::RobotDelete(controller, robot);
+            std::cout << "  RobotDelete completed.\n";
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  RobotDelete RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
+        catch (...)
+        {
+            std::cout << "  RobotDelete unknown exception.\n";
+        }
+    }
+}
+
+
+
+void Racer3BasicMotion::runRobotPoseProbe()
+{
+    std::cout << "Starting no-motion Cartesian Robot pose/FK API probe.\n";
+    std::cout << "No amp enable and no motion commands will be sent in this mode.\n";
+    std::cout << "Faults are cleared so read-only pose/joint APIs can run from a non-error state.\n";
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    setRobotProbeAxisLabels(axes_);
+
+    std::cout << "Aborting and clearing faults through MultiAxis 6 for read-only pose API access...\n";
+    multiAxis_->Abort();
+    multiAxis_->ClearFaults();
+    std::this_thread::sleep_for(std::chrono::milliseconds(FaultClearSettleMs));
+
+    printMotionProgressLine("Robot pose probe pre-check", 0);
+
+    runReadOnlyRobotApiProbe(
+        controller_,
+        multiAxis_,
+        "RSI_Racer3",
+        "Pose Probe 1");
+
+    runReadOnlyRobotApiProbe(
+        controller_,
+        multiAxis_,
+        "RSI_XYZABC_Millimeters",
+        "Pose Probe 2");
+
+    std::cout << "\nController and MultiAxis error logs after robot pose/FK probe:\n";
+    printErrorLog("MotionController", controller_);
+    printErrorLog("MultiAxis 6", multiAxis_);
+
+    std::cout << "Robot pose/FK API probe complete.\n";
+    std::cout << "If both configured models return OK for the same read-only calls, the next step is to print numeric Pose and joint-vector values and compare RSI_Racer3 versus RSI_XYZABC_Millimeters behavior.\n";
+}
+
+
+void Racer3BasicMotion::runRobotModelProbe()
+{
+    std::cout << "Starting no-motion Cartesian Robot model probe.\n";
+    std::cout << "No amp enable, no fault clear, and no motion commands will be sent in this mode.\n";
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    std::cout << "MultiAxis 6 should contain Axis 1 through Axis 6 from configureAxes().\n";
+    printMotionProgressLine("Robot probe pre-check", 0);
+
+    setRobotProbeAxisLabels(axes_);
+
+    const char* const racer3Label = "RSI_Racer3";
+    const char* const xyzabcLabel = "RSI_XYZABC_Millimeters";
+
+    std::cout << "\nProbe 1: LinearModelBuilder(\"" << racer3Label << "\") with no JointAdd calls.\n";
+    std::cout << "This is expected to show whether the label alone configures a model.\n";
+    try
+    {
+        RC::LinearModelBuilder builder(racer3Label);
+
+        std::cout << "  LinearModelBuilder constructed.\n";
+        const RC::KinematicModel& model = builder.ModelBuild();
+        (void)model;
+        std::cout << "  ModelBuild returned a KinematicModel reference.\n";
+
+        RC::Robot* robot = RC::Robot::RobotCreate(controller_, multiAxis_, &builder);
+        if (!robot)
+        {
+            std::cout << "  RobotCreate returned null.\n";
+        }
+        else
+        {
+            std::cout << "  RobotCreate returned a non-null Robot pointer.\n";
+            printErrorLog("  Robot(unconfigured builder)", robot);
+            RC::Robot::RobotDelete(controller_, robot);
+            std::cout << "  RobotDelete completed for unconfigured builder Robot.\n";
+        }
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  Probe 1 RapidCode error: " << error.text << "\n";
+        std::cout << "  Function: " << error.functionName << "\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Probe 1 std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Probe 1 unknown exception.\n";
+    }
+
+    probeConfiguredLinearBuilder(
+        controller_,
+        multiAxis_,
+        racer3Label,
+        "Probe 2");
+
+    probeConfiguredLinearBuilder(
+        controller_,
+        multiAxis_,
+        xyzabcLabel,
+        "Probe 3");
+
+    std::cout << "\nProbe 4: RobotCreate(controller, multiAxis, \"" << racer3Label << "\") direct modelIdentifier path.\n";
+    try
+    {
+        RC::Robot* robot = RC::Robot::RobotCreate(controller_, multiAxis_, racer3Label);
+        if (!robot)
+        {
+            std::cout << "  RobotCreate returned null.\n";
+        }
+        else
+        {
+            std::cout << "  RobotCreate returned a non-null Robot pointer.\n";
+            printErrorLog("  Robot(modelIdentifier)", robot);
+            RC::Robot::RobotDelete(controller_, robot);
+            std::cout << "  RobotDelete completed for identifier-created Robot.\n";
+        }
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  Probe 4 RapidCode error: " << error.text << "\n";
+        std::cout << "  Function: " << error.functionName << "\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Probe 4 std::exception: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Probe 4 unknown exception.\n";
+    }
+
+    std::cout << "\nController and MultiAxis error logs after robot model probe:\n";
+    printErrorLog("MotionController", controller_);
+    printErrorLog("MultiAxis 6", multiAxis_);
+
+    std::cout << "Robot model probe complete. Review Robot error log counts above.\n";
+    std::cout << "Interpretation:\n";
+    std::cout << "  - Count=0 on Probe 2 means RSI_Racer3 can create a configured Robot when Axis labels and JointAdd mappings match.\n";
+    std::cout << "  - Count=0 on Probe 3 means the known generic XYZABC linear model path works.\n";
+    std::cout << "  - Even if Probe 2 succeeds, this does not prove true articulated Racer3 FK/IK. It may be a linear Cartesian mapping.\n";
+}
+
+
 void Racer3BasicMotion::printMotionPlan() const
 {
-    if (AllMotionEnabled)
+    if (RobotPoseProbeEnabled)
+    {
+        std::cout << "\nRobot pose/FK API probe plan\n";
+        std::cout << "Purpose: test read-only Cartesian Robot pose, joint, FK, and IK APIs.\n";
+        std::cout << "This mode connects to RMP, loads/maps MultiAxis 6, creates configured Robot objects, clears faults, but does not enable amps or command motion.\n";
+        std::cout << "Robots tested:\n";
+        std::cout << "  1. LinearModelBuilder(\"RSI_Racer3\") with matching Axis labels + X/Y/Z/Roll/Pitch/Yaw mappings\n";
+        std::cout << "  2. LinearModelBuilder(\"RSI_XYZABC_Millimeters\") with the same mappings\n";
+        std::cout << "Read-only calls tested:\n";
+        std::cout << "  JointsActualPositionsGet, JointsCommandPositionsGet, ActualPoseGet, CommandPoseGet, ActualPositionGet, CommandPositionGet, ForwardKinematics, InverseKinematics\n\n";
+        return;
+    }
+
+    if (RobotModelProbeEnabled)
+    {
+        std::cout << "\nRobot model probe plan\n";
+        std::cout << "Purpose: test RSI Cartesian Robot creation for the built-in Racer3 model.\n";
+        std::cout << "This mode connects to RMP and loads/maps MultiAxis 6, but does not clear faults, enable amps, or command motion.\n";
+        std::cout << "Probe candidates:\n";
+        std::cout << "  1. LinearModelBuilder(\"RSI_Racer3\") with no JointAdd calls, expected to show the unconfigured-model error.\n";
+        std::cout << "  2. LinearModelBuilder(\"RSI_Racer3\") with matching Axis UserLabel + X/Y/Z/Roll/Pitch/Yaw JointAdd mappings.\n";
+        std::cout << "  3. LinearModelBuilder(\"RSI_XYZABC_Millimeters\") with matching Axis UserLabel + the same mappings as a known linear baseline.\n";
+        std::cout << "  4. RobotCreate(controller, multiAxis, \"RSI_Racer3\") direct identifier probe.\n";
+        std::cout << "A successful configured-builder probe means the Robot layer can be created, but it may still be a linear XYZABC model rather than true articulated Racer3 FK/IK.\n\n";
+        return;
+    }
+
+    if (JointVectorMotionEnabled)
+    {
+        std::cout << "\nCustom joint-vector MultiAxis MoveRelative diagnostic motion plan\n";
+        std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
+        std::cout << "Enable path: LoadExistingMultiAxis(6), then AxisRemoveAll/AxisAdd, then enable all six drives.\n";
+        std::cout << "Joint-vector path: after all six drives are enabled, MultiAxis 6 is remapped to Axis 1 through Axis 6.\n";
+        std::cout << "Motion path: MultiAxis::MoveRelative arrays [J1..J6] using the requested custom relative vector.\n";
+        std::cout << "All six axes scaling: 1.0 user unit = 1 physical revolution on each axis.\n";
+        std::cout << "All six axes HomeAction are set to NONE in code.\n";
+        std::cout << "All six axes ErrorLimitAction are temporarily set to NONE only during joint-vector motion.\n";
+        std::cout << "The requested vector is commanded, then the negative vector is commanded to return to software zero.\n";
+    }
+    else if (AllMotionEnabled)
     {
         std::cout << "\nAll-axis synchronized MultiAxis MoveRelative diagnostic motion plan\n";
         std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
@@ -1244,15 +1969,42 @@ void Racer3BasicMotion::printMotionPlan() const
         std::cout << "Only J6 receives a motion command. Cleanup disables each axis individually.\n";
     }
     std::cout << "Diagnostics: " << (DiagnosticsEnabled ? "FULL (--diagnostics enabled)" : "COMPACT (use --diagnostics for full dumps)") << "\n";
-    std::cout << "Test step = "
-              << Axis6TestStepUserUnits
-              << " user units = "
-              << toDegrees(Axis6TestStepUserUnits)
-              << " degrees.\n";
+    if (JointVectorMotionEnabled)
+    {
+        std::cout << "Requested joint vector [J1..J6] in user units: ";
+        printJointVector(RequestedJointVector);
+        JointVector requestedDegrees{};
+        for (size_t axis = 0; axis < RequestedJointVector.size(); ++axis)
+        {
+            requestedDegrees[axis] = toDegrees(RequestedJointVector[axis]);
+        }
+        std::cout << "Requested joint vector [J1..J6] in approx degrees: ";
+        printJointVector(requestedDegrees);
+        std::cout << "Max absolute joint delta = "
+                  << maxAbsJointValue(RequestedJointVector)
+                  << " user units = "
+                  << toDegrees(maxAbsJointValue(RequestedJointVector))
+                  << " degrees.\n";
+    }
+    else
+    {
+        std::cout << "Test step = "
+                  << Axis6TestStepUserUnits
+                  << " user units = "
+                  << toDegrees(Axis6TestStepUserUnits)
+                  << " degrees.\n";
+    }
 
     std::array<JointVector, 2> plannedMoves{};
 
-    if (AllMotionEnabled)
+    if (JointVectorMotionEnabled)
+    {
+        plannedMoves = {
+            RequestedJointVector,
+            negateJointVector(RequestedJointVector)
+        };
+    }
+    else if (AllMotionEnabled)
     {
         plannedMoves = {
             makeAllAxesVector(Axis6TestStepUserUnits),
@@ -1572,6 +2324,110 @@ void Racer3BasicMotion::printAxis5And6MotionStatus(const char* label)
         std::cout << "Function: " << error.functionName << "\n";
     }
 }
+
+
+bool Racer3BasicMotion::printReturnToZeroReport(const char* label, bool throwOnFail)
+{
+    std::cout << "\n" << label << "\n";
+    std::cout << "Software-zero target is 0.0 user units on every axis.\n";
+    std::cout << "Warning tolerance: "
+              << ReturnWarnToleranceUserUnits
+              << " user units = "
+              << toDegrees(ReturnWarnToleranceUserUnits)
+              << " degrees.\n";
+    std::cout << "Fail tolerance:    "
+              << ReturnFailToleranceUserUnits
+              << " user units = "
+              << toDegrees(ReturnFailToleranceUserUnits)
+              << " degrees.\n";
+
+    bool anyWarning = false;
+    bool anyFail = false;
+
+    std::cout << std::fixed << std::setprecision(6);
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        RR::Axis* axis = axes_[index];
+
+        if (!axis)
+        {
+            std::cout << "  J" << (index + 1) << ": <null axis> FAIL\n";
+            anyFail = true;
+            continue;
+        }
+
+        try
+        {
+            const double commandPosition = axis->CommandPositionGet();
+            const double actualPosition = axis->ActualPositionGet();
+            const double commandError = commandPosition;
+            const double actualError = actualPosition;
+            const double absoluteActualError = std::fabs(actualError);
+
+            const char* status = "OK";
+            if (absoluteActualError > ReturnFailToleranceUserUnits)
+            {
+                status = "FAIL";
+                anyFail = true;
+            }
+            else if (absoluteActualError > ReturnWarnToleranceUserUnits)
+            {
+                status = "WARN";
+                anyWarning = true;
+            }
+
+            std::cout << "  J" << (index + 1)
+                      << " CmdPos=" << commandPosition
+                      << " ActPos=" << actualPosition
+                      << " CmdErr=" << commandError
+                      << " ActErr=" << actualError
+                      << " ActErrDeg=" << toDegrees(actualError)
+                      << " => " << status
+                      << "\n";
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  J" << (index + 1)
+                      << ": return-to-zero read threw RapidCode error: "
+                      << error.text
+                      << " ("
+                      << error.functionName
+                      << ") FAIL\n";
+            anyFail = true;
+        }
+        catch (...)
+        {
+            std::cout << "  J" << (index + 1)
+                      << ": return-to-zero read threw unknown exception. FAIL\n";
+            anyFail = true;
+        }
+    }
+
+    if (anyFail)
+    {
+        std::cout << "Return-to-zero result: FAIL. One or more axes are outside the fail tolerance.\n";
+
+        if (throwOnFail)
+        {
+            throw std::runtime_error("Return-to-zero check failed. Axis actual position is outside --return-fail tolerance.");
+        }
+
+        return false;
+    }
+
+    if (anyWarning)
+    {
+        std::cout << "Return-to-zero result: WARN. Motion completed, but one or more axes are outside the warning tolerance.\n";
+    }
+    else
+    {
+        std::cout << "Return-to-zero result: OK. All axes are within the warning tolerance.\n";
+    }
+
+    return true;
+}
+
 
 void Racer3BasicMotion::printMotionProgressLine(const char* label, int sampleNumber)
 {
