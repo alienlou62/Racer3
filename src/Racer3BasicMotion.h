@@ -18,6 +18,7 @@ struct Racer3RunOptions
     bool dryRun = false;
     bool enableOnly = false;
     bool tinyMotion = false;
+    bool dualMotion = false;
     bool motionConfirmed = false;
     bool diagnostics = false;
     double stepUserUnits = 0.05;
@@ -39,11 +40,14 @@ private:
     void configureAxes();
     void configureMultiAxisMotionAttributes(const char* context);
     void configureAxis6MotionAttributes(const char* context);
+    void configureAxis5MotionAttributes(const char* context);
     void isolateAxis6ForDirectMotion();
+    void isolateAxis5And6ForDualMotion();
     void clearFaults();
     void enableAmplifiers();
     void enableOnlyTest();
     void runTinyMotion();
+    void runDualAxisMotion();
     void printMotionPlan() const;
     void printActualPositions(const char* label);
     void printDiagnosticSnapshot(const char* label, bool includeErrorLogs = true);
@@ -51,9 +55,12 @@ private:
     void printMotionAttributeMasks(const char* label, RSI::RapidCode::RapidCodeMotion* motion);
     void printAllAxisBriefDiagnostics(const char* label);
     void printAxis6MotionStatus(const char* label);
+    void printAxis5And6MotionStatus(const char* label);
     void printMotionProgressLine(const char* label, int sampleNumber);
+    void printDualAxisProgressLine(const char* label, int sampleNumber);
     void waitForMotionStart(const char* label, double startingAxis6CommandPosition);
     void waitForAxis6MotionStart(const char* label, double startingAxis6CommandPosition);
+    void waitForDualAxisMotionStart(const char* label, double startingAxis5CommandPosition, double startingAxis6CommandPosition);
     void disableAmplifiers();
     void waitForMotionDone(int timeoutMilliseconds);
     void waitForAxis6MotionDone(int timeoutMilliseconds);

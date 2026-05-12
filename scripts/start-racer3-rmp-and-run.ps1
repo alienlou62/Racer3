@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -8,7 +8,13 @@ param(
 
     [switch]$SkipRsiconfig,
 
-    [switch]$ConfirmMotion
+    [switch]$ConfirmMotion,
+
+    [double]$Step = 0.05,
+
+    [double]$Velocity = 0.05,
+
+    [switch]$Diagnostics
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +38,9 @@ Write-Host "Repo root: $RepoRoot"
 Write-Host "Settings:  $SettingsPath"
 Write-Host "Exe:       $ExePath"
 Write-Host "Mode:      $Mode"
+Write-Host "Step:      $Step user units"
+Write-Host "Velocity:  $Velocity user-units/sec"
+Write-Host "Diag:      $Diagnostics"
 
 $env:PATH = "C:\RSI\11.0.0;$env:PATH"
 
@@ -80,6 +89,14 @@ Write-Step "Running racer3-basic-motion"
 
 $ExeArgs = @()
 
+if ($Step -le 0) {
+    throw "-Step must be greater than zero."
+}
+
+if ($Velocity -le 0) {
+    throw "-Velocity must be greater than zero."
+}
+
 switch ($Mode) {
     "dry-run" {
         $ExeArgs += "--dry-run"
@@ -96,7 +113,27 @@ switch ($Mode) {
             throw "tiny-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
         }
     }
+    "dual-motion" {
+        $ExeArgs += "--dual-motion"
+        if ($ConfirmMotion) {
+            $ExeArgs += "--confirm-motion"
+        }
+        else {
+            throw "dual-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+        }
+    }
 }
+
+$ExeArgs += "--step"
+$ExeArgs += ([string]$Step)
+$ExeArgs += "--velocity"
+$ExeArgs += ([string]$Velocity)
+
+if ($Diagnostics) {
+    $ExeArgs += "--diagnostics"
+}
+
+Write-Host "Exe args:  $($ExeArgs -join ' ')"
 
 Push-Location $RepoRoot
 & $ExePath @ExeArgs

@@ -20,18 +20,20 @@ void printUsage()
         << "Usage:\n"
         << "  racer3-basic-motion --dry-run [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
         << "  racer3-basic-motion --enable-only [--diagnostics]\n"
-        << "  racer3-basic-motion --tiny-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --tiny-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
+        << "  racer3-basic-motion --dual-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
         << "  --tiny-motion      Enable all drives, isolate J6, and run a tiny J6-only move.\n"
+        << "  --dual-motion      Enable all drives, remap MultiAxis to J5+J6, and move both together.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
-        << "  --step <value>     J6 relative move in user units. Default 0.05.\n"
-        << "  --velocity <value> J6 velocity in user-units/sec. Default 0.05.\n"
+        << "  --step <value>     Relative move in user units. Default 0.05.\n"
+        << "  --velocity <value> Velocity in user-units/sec. Default 0.05.\n"
         << "  --help             Show this help text.\n\n"
         << "Notes:\n"
-        << "  1.0 user unit = one physical J6 revolution.\n"
+        << "  1.0 user unit = one physical revolution on each configured axis.\n"
         << "  0.05 user units = 18 degrees.\n";
 }
 
@@ -111,7 +113,7 @@ void validateOptions(const Racer3RunOptions& options)
         throw std::runtime_error("--velocity must be greater than zero.");
     }
 
-    if (options.stepUserUnits > MaxRecommendedStepUserUnits && options.tinyMotion)
+    if (options.stepUserUnits > MaxRecommendedStepUserUnits && (options.tinyMotion || options.dualMotion))
     {
         throw std::runtime_error(
             "Refusing --step greater than 0.25 user units for this starter demo. "
@@ -135,7 +137,8 @@ int main(int argc, char* argv[])
         Racer3RunOptions options;
         options.dryRun = hasArg(args, "--dry-run");
         options.tinyMotion = hasArg(args, "--tiny-motion");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion);
+        options.dualMotion = hasArg(args, "--dual-motion");
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
@@ -148,10 +151,16 @@ int main(int argc, char* argv[])
 
         validateOptions(options);
 
-        if (options.tinyMotion && !options.motionConfirmed && !options.dryRun)
+        if (options.tinyMotion && options.dualMotion)
+        {
+            std::cerr << "Use only one motion mode: --tiny-motion or --dual-motion.\n";
+            return 2;
+        }
+
+        if ((options.tinyMotion || options.dualMotion) && !options.motionConfirmed && !options.dryRun)
         {
             std::cerr << "Refusing to run real motion without --confirm-motion.\n";
-            std::cerr << "Use --dry-run first, then run --tiny-motion --confirm-motion only when ready.\n";
+            std::cerr << "Use --dry-run first, then run the motion mode with --confirm-motion only when ready.\n";
             return 2;
         }
 
@@ -171,10 +180,14 @@ int main(int argc, char* argv[])
         {
             std::cout << "Mode: TINY MOTION - isolated Axis 6 / J6 relative motion.\n";
         }
+        else if (options.dualMotion)
+        {
+            std::cout << "Mode: DUAL MOTION - synchronized Axis 5 / J5 and Axis 6 / J6 relative motion.\n";
+        }
 
-        std::cout << "J6 step: " << options.stepUserUnits
+        std::cout << "Motion step: " << options.stepUserUnits
                   << " user units = " << (options.stepUserUnits * 360.0) << " degrees.\n";
-        std::cout << "J6 velocity: " << options.velocityUserUnitsPerSecond
+        std::cout << "Motion velocity: " << options.velocityUserUnitsPerSecond
                   << " user-units/sec = " << (options.velocityUserUnitsPerSecond * 360.0) << " deg/sec.\n";
         std::cout << "Diagnostics: " << (options.diagnostics ? "FULL" : "COMPACT") << "\n";
         std::cout << "WARNING: Real modes may enable robot drives. Keep the robot area clear and E-stop ready.\n";

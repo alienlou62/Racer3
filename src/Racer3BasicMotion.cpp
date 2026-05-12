@@ -19,13 +19,15 @@ namespace
 using JointVector = std::array<double, Racer3BasicMotion::AxisCount>;
 
 static constexpr int MultiAxisIndex = 6;
+static constexpr int Axis5Index = 4;
 static constexpr int Axis6Index = 5;
 
-// Axis 6 / J6 counts per physical joint revolution from your Racer3 sheet.
+// Axis 5 / J5 and Axis 6 / J6 counts per physical joint revolution from your Racer3 sheet.
+static constexpr double Axis5CountsPerRevolution = 67108864.0;
 static constexpr double Axis6CountsPerRevolution = 41943040.0;
 
-// J6-only test.
-// 1.0 user unit = one physical joint revolution.
+// J6-only and J5+J6 dual-axis tests.
+// 1.0 user unit = one physical joint revolution on each configured axis.
 // 0.05 user units = 18 degrees.
 static double Axis6TestStepUserUnits = 0.05;
 
@@ -56,6 +58,7 @@ static constexpr bool OverrideRestrictedStateForEnable = true;
 static constexpr bool TemporarilyDisableAxis6ErrorLimitForTinyMotion = true;
 
 static bool DiagnosticsEnabled = false;
+static bool DualMotionEnabled = false;
 
 double toDegrees(double userUnits)
 {
@@ -77,6 +80,14 @@ void printJointVector(const JointVector& values)
 JointVector makeAxis6OnlyVector(double axis6Value)
 {
     JointVector values{};
+    values[Axis6Index] = axis6Value;
+    return values;
+}
+
+JointVector makeAxis5And6Vector(double axis5Value, double axis6Value)
+{
+    JointVector values{};
+    values[Axis5Index] = axis5Value;
     values[Axis6Index] = axis6Value;
     return values;
 }
@@ -229,6 +240,7 @@ Racer3BasicMotion::~Racer3BasicMotion()
 void Racer3BasicMotion::run(const Racer3RunOptions& options)
 {
     DiagnosticsEnabled = options.diagnostics;
+    DualMotionEnabled = options.dualMotion;
 
     if (options.stepUserUnits <= 0.0)
     {
@@ -272,6 +284,10 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         else if (options.tinyMotion)
         {
             runTinyMotion();
+        }
+        else if (options.dualMotion)
+        {
+            runDualAxisMotion();
         }
 
         printActualPositions("Actual positions before shutdown");
@@ -381,6 +397,29 @@ void Racer3BasicMotion::configureAxes()
               << " user-units/sec = " << toDegrees(Axis6VelocityTolerance) << " deg/sec\n";
     std::cout << "  Settling time: " << Axis6SettlingTime << " seconds\n";
 
+
+    if (DualMotionEnabled)
+    {
+        std::cout << "Configuring Axis 5 / J5 for one-revolution user units for dual-axis mode...\n";
+
+        if (!axes_[Axis5Index])
+        {
+            throw std::runtime_error("Axis 5 / J5 is not initialized.");
+        }
+
+        axes_[Axis5Index]->UserUnitsSet(Axis5CountsPerRevolution);
+        axes_[Axis5Index]->PositionSet(0.0);
+        axes_[Axis5Index]->HomeActionSet(RR::RSIAction::RSIActionNONE);
+        axes_[Axis5Index]->PositionToleranceFineSet(Axis6FineTolerance);
+        axes_[Axis5Index]->PositionToleranceCoarseSet(Axis6CoarseTolerance);
+        axes_[Axis5Index]->VelocityToleranceSet(Axis6VelocityTolerance);
+        axes_[Axis5Index]->SettlingTimeSet(Axis6SettlingTime);
+
+        std::cout << "Axis 5 / J5 user units set: 1.0 user unit = 1 physical revolution.\n";
+        std::cout << "Axis 5 / J5 current position set to software zero.\n";
+        std::cout << "Axis 5 / J5 HomeActionSet(RSIActionNONE) applied.\n";
+    }
+
     printDiagnosticSnapshot("After configureAxes and runtime MultiAxis mapping");
 }
 
@@ -422,6 +461,23 @@ void Racer3BasicMotion::configureAxis6MotionAttributes(const char* context)
     axes_[Axis6Index]->FeedRateSet(1.0);
 
     printMotionAttributeMasks("Axis 6", axes_[Axis6Index]);
+}
+
+
+void Racer3BasicMotion::configureAxis5MotionAttributes(const char* context)
+{
+    if (!axes_[Axis5Index])
+    {
+        throw std::runtime_error("Axis 5 / J5 is not initialized.");
+    }
+
+    std::cout << "Resetting Axis 5 motion attributes (" << context << ")...\n";
+
+    axes_[Axis5Index]->MotionAttributeMaskDefaultSet();
+    axes_[Axis5Index]->MotionDelaySet(0.0);
+    axes_[Axis5Index]->FeedRateSet(1.0);
+
+    printMotionAttributeMasks("Axis 5", axes_[Axis5Index]);
 }
 
 void Racer3BasicMotion::isolateAxis6ForDirectMotion()
@@ -467,6 +523,56 @@ void Racer3BasicMotion::isolateAxis6ForDirectMotion()
 
     std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
     printDiagnosticSnapshot("After isolating Axis 6 for direct motion");
+}
+
+
+void Racer3BasicMotion::isolateAxis5And6ForDualMotion()
+{
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    if (!axes_[Axis5Index] || !axes_[Axis6Index])
+    {
+        throw std::runtime_error("Axis 5 / J5 or Axis 6 / J6 is not initialized.");
+    }
+
+    std::cout << "Isolating Axis 5 and Axis 6 for synchronized MultiAxis motion...\n";
+    std::cout << "All six drives have already been enabled; MultiAxis 6 will now contain only J5 and J6.\n";
+
+    multiAxis_->AxisRemoveAll();
+    multiAxis_->AxisAdd(axes_[Axis5Index]);
+    multiAxis_->AxisAdd(axes_[Axis6Index]);
+    multiAxis_->UserLabelSet("Racer3J5J6DualDemo");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
+
+    configureMultiAxisMotionAttributes("after remapping MultiAxis 6 to only Axis 5 and Axis 6");
+    configureAxis5MotionAttributes("after dual-axis MultiAxis remap");
+    configureAxis6MotionAttributes("after dual-axis MultiAxis remap");
+
+    std::cout << "Clearing Axis 5/6 faults and confirming MultiAxis 6 amp enable for dual motion...\n";
+    axes_[Axis5Index]->ClearFaults();
+    axes_[Axis6Index]->ClearFaults();
+    multiAxis_->ClearFaults();
+
+    const int result = multiAxis_->AmpEnableSet(
+        true,
+        AmpEnableTimeoutMs,
+        OverrideRestrictedStateForEnable);
+
+    if (!multiAxis_->AmpEnableGet() || !axes_[Axis5Index]->AmpEnableGet() || !axes_[Axis6Index]->AmpEnableGet())
+    {
+        throw std::runtime_error("Axis 5/6 MultiAxis AmpEnableSet failed or timed out after dual-axis isolation.");
+    }
+
+    std::cout << "Axis 5/6 MultiAxis amp enable confirmed after isolation. AmpEnableSet returned "
+              << result
+              << " ms.\n";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
+    printAxis5And6MotionStatus("Axis 5/6 status after dual-axis isolation");
 }
 
 void Racer3BasicMotion::clearFaults()
@@ -648,18 +754,186 @@ void Racer3BasicMotion::runTinyMotion()
     std::cout << "Axis 6 / J6 direct MoveRelative diagnostic complete. Net commanded Axis 6 offset is zero.\n";
 }
 
+
+void Racer3BasicMotion::runDualAxisMotion()
+{
+    std::cout << "Starting Axis 5 + Axis 6 synchronized MultiAxis::MoveRelative diagnostic...\n";
+    std::cout << "All 6 axes were enabled through runtime-mapped MultiAxis 6 first.\n";
+    std::cout << "Before the dual move, MultiAxis 6 is remapped to contain only Axis 5 / J5 and Axis 6 / J6.\n";
+    std::cout << "Both axes receive the same relative range and velocity so they complete at the same time.\n";
+    std::cout << "Step = "
+              << Axis6TestStepUserUnits
+              << " user units = "
+              << toDegrees(Axis6TestStepUserUnits)
+              << " degrees on each axis.\n";
+    std::cout << "Velocity = "
+              << MotionVelocity
+              << " user-units/sec = "
+              << toDegrees(MotionVelocity)
+              << " deg/sec on each axis.\n";
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    if (!axes_[Axis5Index] || !axes_[Axis6Index])
+    {
+        throw std::runtime_error("Axis 5 / J5 or Axis 6 / J6 is not initialized.");
+    }
+
+    isolateAxis5And6ForDualMotion();
+
+    const RR::RSIAction originalAxis5ErrorLimitAction = axes_[Axis5Index]->ErrorLimitActionGet();
+    const RR::RSIAction originalAxis6ErrorLimitAction = axes_[Axis6Index]->ErrorLimitActionGet();
+    bool errorLimitsTemporarilyChanged = false;
+
+    if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+    {
+        std::cout << "Temporarily setting Axis 5 and Axis 6 position ErrorLimitAction to RSIActionNONE for this dual-axis motion test.\n";
+        std::cout << "  Original Axis 5 ErrorLimitAction: " << actionName(originalAxis5ErrorLimitAction) << "\n";
+        std::cout << "  Original Axis 6 ErrorLimitAction: " << actionName(originalAxis6ErrorLimitAction) << "\n";
+        std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+        axes_[Axis5Index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        axes_[Axis6Index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        errorLimitsTemporarilyChanged = true;
+    }
+
+    // MultiAxis 6 currently contains exactly two axes, in this order:
+    //   array index 0 -> Axis 5 / J5
+    //   array index 1 -> Axis 6 / J6
+    const std::array<std::array<double, 2>, 2> relativePositions = {{
+        {{ Axis6TestStepUserUnits, Axis6TestStepUserUnits }},
+        {{ -Axis6TestStepUserUnits, -Axis6TestStepUserUnits }}
+    }};
+
+    const std::array<double, 2> velocity = {{ MotionVelocity, MotionVelocity }};
+    const std::array<double, 2> acceleration = {{ MotionAcceleration, MotionAcceleration }};
+    const std::array<double, 2> deceleration = {{ MotionDeceleration, MotionDeceleration }};
+    const std::array<double, 2> jerk = {{ MotionJerkPercent, MotionJerkPercent }};
+
+    try
+    {
+        for (size_t stepIndex = 0; stepIndex < relativePositions.size(); ++stepIndex)
+        {
+            const auto& relativePosition = relativePositions[stepIndex];
+
+            std::cout << "\n=== Axis 5 + Axis 6 MultiAxis::MoveRelative step "
+                      << (stepIndex + 1)
+                      << " / "
+                      << relativePositions.size()
+                      << " ===\n";
+
+            std::cout << "Relative position array [J5, J6]: "
+                      << relativePosition[0]
+                      << ", "
+                      << relativePosition[1]
+                      << " user units = "
+                      << toDegrees(relativePosition[0])
+                      << ", "
+                      << toDegrees(relativePosition[1])
+                      << " degrees.\n";
+            std::cout << "Velocity array [J5, J6]: "
+                      << velocity[0]
+                      << ", "
+                      << velocity[1]
+                      << " user-units/sec.\n";
+
+            clearErrorLog("MotionController", controller_);
+            clearErrorLog("MultiAxis 6", multiAxis_);
+            clearErrorLog("Axis 5", axes_[Axis5Index]);
+            clearErrorLog("Axis 6", axes_[Axis6Index]);
+
+            configureMultiAxisMotionAttributes("before dual Axis 5/6 MultiAxis::MoveRelative step");
+            configureAxis5MotionAttributes("before dual Axis 5/6 MultiAxis::MoveRelative step");
+            configureAxis6MotionAttributes("before dual Axis 5/6 MultiAxis::MoveRelative step");
+            printAxis5And6MotionStatus("Axis 5/6 before dual MoveRelative");
+
+            const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
+            const double startingAxis5CommandPosition = axes_[Axis5Index]->CommandPositionGet();
+            const double startingAxis6CommandPosition = axes_[Axis6Index]->CommandPositionGet();
+
+            std::cout << "Commanding MultiAxis::MoveRelative for [Axis5, Axis6].\n";
+            std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+
+            multiAxis_->MoveRelative(
+                relativePosition.data(),
+                velocity.data(),
+                acceleration.data(),
+                deceleration.data(),
+                jerk.data());
+
+            std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
+            printAxis5And6MotionStatus("Axis 5/6 immediately after dual MoveRelative");
+
+            waitForDualAxisMotionStart(
+                "Axis 5/6 MultiAxis::MoveRelative",
+                startingAxis5CommandPosition,
+                startingAxis6CommandPosition);
+
+            for (int sample = 0; sample < 8; ++sample)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
+                printDualAxisProgressLine("Dual live sample", sample + 1);
+            }
+
+            waitForMotionDone(MotionTimeoutMs);
+
+            printActualPositions("Actual positions after dual Axis 5/6 MultiAxis::MoveRelative step");
+            printAxis5And6MotionStatus("Axis 5/6 after MotionDoneWait");
+        }
+    }
+    catch (...)
+    {
+        if (errorLimitsTemporarilyChanged)
+        {
+            axes_[Axis5Index]->ErrorLimitActionSet(originalAxis5ErrorLimitAction);
+            axes_[Axis6Index]->ErrorLimitActionSet(originalAxis6ErrorLimitAction);
+            std::cout << "Restored Axis 5 ErrorLimitAction to " << actionName(originalAxis5ErrorLimitAction) << ".\n";
+            std::cout << "Restored Axis 6 ErrorLimitAction to " << actionName(originalAxis6ErrorLimitAction) << ".\n";
+        }
+
+        throw;
+    }
+
+    if (errorLimitsTemporarilyChanged)
+    {
+        axes_[Axis5Index]->ErrorLimitActionSet(originalAxis5ErrorLimitAction);
+        axes_[Axis6Index]->ErrorLimitActionSet(originalAxis6ErrorLimitAction);
+        std::cout << "Restored Axis 5 ErrorLimitAction to " << actionName(originalAxis5ErrorLimitAction) << ".\n";
+        std::cout << "Restored Axis 6 ErrorLimitAction to " << actionName(originalAxis6ErrorLimitAction) << ".\n";
+    }
+
+    std::cout << "Axis 5 + Axis 6 synchronized MultiAxis MoveRelative diagnostic complete. Net commanded offsets are zero.\n";
+}
+
 void Racer3BasicMotion::printMotionPlan() const
 {
-    std::cout << "\nAxis 6 / J6 direct MoveRelative diagnostic motion plan\n";
-    std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
-    std::cout << "Enable path: LoadExistingMultiAxis(6), then AxisRemoveAll/AxisAdd, then enable all six drives.\n";
-    std::cout << "Isolation path: after all six drives are enabled, MultiAxis 6 is unmapped with AxisRemoveAll.\n";
-    std::cout << "Motion path: clear/enable Axis 6 directly, then Axis 6::MoveRelative(relativePosition, vel, accel, decel, jerkPct).\n";
-    std::cout << "Reason: current logs show axes 1-5 stopped by Home / Capture Status Limit, which stops six-axis synchronized MultiAxis motion.\n";
-    std::cout << "Axis 6 scaling: 1.0 user unit = 1 physical revolution.\n";
-    std::cout << "Axis 6 HomeAction is set to NONE in code.\n";
-    std::cout << "Axis 6 ErrorLimitAction is temporarily set to NONE only during tiny-motion.\n";
-    std::cout << "Only J6 receives a motion command. Cleanup disables each axis individually.\n";
+    if (DualMotionEnabled)
+    {
+        std::cout << "\nAxis 5 + Axis 6 synchronized MultiAxis MoveRelative diagnostic motion plan\n";
+        std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
+        std::cout << "Enable path: LoadExistingMultiAxis(6), then AxisRemoveAll/AxisAdd, then enable all six drives.\n";
+        std::cout << "Dual-axis isolation path: after all six drives are enabled, MultiAxis 6 is remapped to only Axis 5 and Axis 6.\n";
+        std::cout << "Motion path: MultiAxis::MoveRelative arrays [J5, J6] with the same relative range and velocity.\n";
+        std::cout << "Axis 5 and Axis 6 scaling: 1.0 user unit = 1 physical revolution on each axis.\n";
+        std::cout << "Axis 5 and Axis 6 HomeAction are set to NONE in code.\n";
+        std::cout << "Axis 5 and Axis 6 ErrorLimitAction are temporarily set to NONE only during dual-motion.\n";
+        std::cout << "Only J5 and J6 receive motion commands. Cleanup disables each axis individually.\n";
+    }
+    else
+    {
+        std::cout << "\nAxis 6 / J6 direct MoveRelative diagnostic motion plan\n";
+        std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
+        std::cout << "Enable path: LoadExistingMultiAxis(6), then AxisRemoveAll/AxisAdd, then enable all six drives.\n";
+        std::cout << "Isolation path: after all six drives are enabled, MultiAxis 6 is unmapped with AxisRemoveAll.\n";
+        std::cout << "Motion path: clear/enable Axis 6 directly, then Axis 6::MoveRelative(relativePosition, vel, accel, decel, jerkPct).\n";
+        std::cout << "Reason: current logs show axes 1-5 stopped by Home / Capture Status Limit, which stops six-axis synchronized MultiAxis motion.\n";
+        std::cout << "Axis 6 scaling: 1.0 user unit = 1 physical revolution.\n";
+        std::cout << "Axis 6 HomeAction is set to NONE in code.\n";
+        std::cout << "Axis 6 ErrorLimitAction is temporarily set to NONE only during tiny-motion.\n";
+        std::cout << "Only J6 receives a motion command. Cleanup disables each axis individually.\n";
+    }
     std::cout << "Diagnostics: " << (DiagnosticsEnabled ? "FULL (--diagnostics enabled)" : "COMPACT (use --diagnostics for full dumps)") << "\n";
     std::cout << "Test step = "
               << Axis6TestStepUserUnits
@@ -667,10 +941,15 @@ void Racer3BasicMotion::printMotionPlan() const
               << toDegrees(Axis6TestStepUserUnits)
               << " degrees.\n";
 
-    const std::array<JointVector, 2> plannedMoves = {
-        makeAxis6OnlyVector(Axis6TestStepUserUnits),
-        makeAxis6OnlyVector(-Axis6TestStepUserUnits)
-    };
+    const std::array<JointVector, 2> plannedMoves = DualMotionEnabled
+        ? std::array<JointVector, 2>{
+            makeAxis5And6Vector(Axis6TestStepUserUnits, Axis6TestStepUserUnits),
+            makeAxis5And6Vector(-Axis6TestStepUserUnits, -Axis6TestStepUserUnits)
+        }
+        : std::array<JointVector, 2>{
+            makeAxis6OnlyVector(Axis6TestStepUserUnits),
+            makeAxis6OnlyVector(-Axis6TestStepUserUnits)
+        };
 
     JointVector netOffset{};
 
@@ -733,7 +1012,14 @@ void Racer3BasicMotion::printDiagnosticSnapshot(const char* label, bool includeE
     if (!DiagnosticsEnabled)
     {
         std::cout << "\n--- " << label << " (compact; use --diagnostics for full dump) ---\n";
-        printMotionProgressLine(label, 0);
+        if (DualMotionEnabled && axes_[Axis5Index] && axes_[Axis6Index])
+        {
+            printDualAxisProgressLine(label, 0);
+        }
+        else
+        {
+            printMotionProgressLine(label, 0);
+        }
         std::cout << "--- end compact snapshot ---\n";
         return;
     }
@@ -931,6 +1217,35 @@ void Racer3BasicMotion::printAxis6MotionStatus(const char* label)
     }
 }
 
+
+void Racer3BasicMotion::printAxis5And6MotionStatus(const char* label)
+{
+    if (!axes_[Axis5Index] || !axes_[Axis6Index])
+    {
+        std::cout << label << ": Axis 5 or Axis 6 is not initialized.\n";
+        return;
+    }
+
+    try
+    {
+        std::cout << label
+                  << " | J5 CmdPos=" << std::fixed << std::setprecision(6) << axes_[Axis5Index]->CommandPositionGet()
+                  << " ActPos=" << axes_[Axis5Index]->ActualPositionGet()
+                  << " CmdVel=" << axes_[Axis5Index]->CommandVelocityGet()
+                  << " ActVel=" << axes_[Axis5Index]->ActualVelocityGet()
+                  << " | J6 CmdPos=" << axes_[Axis6Index]->CommandPositionGet()
+                  << " ActPos=" << axes_[Axis6Index]->ActualPositionGet()
+                  << " CmdVel=" << axes_[Axis6Index]->CommandVelocityGet()
+                  << " ActVel=" << axes_[Axis6Index]->ActualVelocityGet()
+                  << '\n';
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << label << " Axis 5/6 numeric status threw RapidCode error: " << error.text << "\n";
+        std::cout << "Function: " << error.functionName << "\n";
+    }
+}
+
 void Racer3BasicMotion::printMotionProgressLine(const char* label, int sampleNumber)
 {
     if (!multiAxis_ || !axes_[Axis6Index])
@@ -955,6 +1270,47 @@ void Racer3BasicMotion::printMotionProgressLine(const char* label, int sampleNum
                   << ", Exec=" << axes_[Axis6Index]->MotionIdExecutingGet()
                   << ", Done=" << boolText(axes_[Axis6Index]->MotionDoneGet())
                   << ", CmdPos=" << std::fixed << std::setprecision(6) << axes_[Axis6Index]->CommandPositionGet()
+                  << ", CmdVel=" << axes_[Axis6Index]->CommandVelocityGet()
+                  << ", ActPos=" << axes_[Axis6Index]->ActualPositionGet()
+                  << ", ActVel=" << axes_[Axis6Index]->ActualVelocityGet()
+                  << ")\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << label << " sample " << sampleNumber
+                  << " threw RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+}
+
+
+void Racer3BasicMotion::printDualAxisProgressLine(const char* label, int sampleNumber)
+{
+    if (!multiAxis_ || !axes_[Axis5Index] || !axes_[Axis6Index])
+    {
+        std::cout << label << " sample " << sampleNumber << ": motion objects are not initialized.\n";
+        return;
+    }
+
+    try
+    {
+        const RR::RSIState multiState = multiAxis_->StateGet();
+        const RR::RSIState axis5State = axes_[Axis5Index]->StateGet();
+        const RR::RSIState axis6State = axes_[Axis6Index]->StateGet();
+
+        std::cout << label
+                  << " sample " << sampleNumber
+                  << " | MultiAxis(State=" << stateName(multiState)
+                  << ", MotionId=" << multiAxis_->MotionIdGet()
+                  << ", Exec=" << multiAxis_->MotionIdExecutingGet()
+                  << ", Done=" << boolText(multiAxis_->MotionDoneGet())
+                  << ") J5(State=" << stateName(axis5State)
+                  << ", CmdPos=" << std::fixed << std::setprecision(6) << axes_[Axis5Index]->CommandPositionGet()
+                  << ", CmdVel=" << axes_[Axis5Index]->CommandVelocityGet()
+                  << ", ActPos=" << axes_[Axis5Index]->ActualPositionGet()
+                  << ", ActVel=" << axes_[Axis5Index]->ActualVelocityGet()
+                  << ") J6(State=" << stateName(axis6State)
+                  << ", CmdPos=" << axes_[Axis6Index]->CommandPositionGet()
                   << ", CmdVel=" << axes_[Axis6Index]->CommandVelocityGet()
                   << ", ActPos=" << axes_[Axis6Index]->ActualPositionGet()
                   << ", ActVel=" << axes_[Axis6Index]->ActualVelocityGet()
@@ -1089,6 +1445,86 @@ void Racer3BasicMotion::waitForAxis6MotionStart(const char* label, double starti
 
     throw std::runtime_error(
         "Axis 6 command was accepted, but command position/velocity and motion state did not change.");
+}
+
+
+void Racer3BasicMotion::waitForDualAxisMotionStart(
+    const char* label,
+    double startingAxis5CommandPosition,
+    double startingAxis6CommandPosition)
+{
+    if (!multiAxis_ || !axes_[Axis5Index] || !axes_[Axis6Index])
+    {
+        throw std::runtime_error("Dual-axis motion objects are not initialized.");
+    }
+
+    std::cout << "Watching for " << label << " to generate a synchronized Axis 5/6 trajectory...\n";
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(MotionStartTimeoutMs);
+    int sampleNumber = 0;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(MotionStartSampleMs));
+        ++sampleNumber;
+
+        printDualAxisProgressLine("Dual start-watch", sampleNumber);
+
+        const RR::RSIState multiState = multiAxis_->StateGet();
+        const RR::RSIState axis5State = axes_[Axis5Index]->StateGet();
+        const RR::RSIState axis6State = axes_[Axis6Index]->StateGet();
+        const double axis5CommandPosition = axes_[Axis5Index]->CommandPositionGet();
+        const double axis6CommandPosition = axes_[Axis6Index]->CommandPositionGet();
+        const double axis5CommandVelocity = axes_[Axis5Index]->CommandVelocityGet();
+        const double axis6CommandVelocity = axes_[Axis6Index]->CommandVelocityGet();
+
+        const bool stateMoving =
+            multiState == RR::RSIState::RSIStateMOVING ||
+            axis5State == RR::RSIState::RSIStateMOVING ||
+            axis6State == RR::RSIState::RSIStateMOVING;
+        const bool axis5CommandPositionChanged =
+            std::fabs(axis5CommandPosition - startingAxis5CommandPosition) > 1e-7;
+        const bool axis6CommandPositionChanged =
+            std::fabs(axis6CommandPosition - startingAxis6CommandPosition) > 1e-7;
+        const bool axis5CommandVelocityNonZero = std::fabs(axis5CommandVelocity) > 1e-9;
+        const bool axis6CommandVelocityNonZero = std::fabs(axis6CommandVelocity) > 1e-9;
+
+        if (stateMoving ||
+            axis5CommandPositionChanged ||
+            axis6CommandPositionChanged ||
+            axis5CommandVelocityNonZero ||
+            axis6CommandVelocityNonZero)
+        {
+            std::cout << label << " started: "
+                      << "stateMoving=" << boolText(stateMoving)
+                      << ", axis5CommandPositionChanged=" << boolText(axis5CommandPositionChanged)
+                      << ", axis6CommandPositionChanged=" << boolText(axis6CommandPositionChanged)
+                      << ", axis5CommandVelocityNonZero=" << boolText(axis5CommandVelocityNonZero)
+                      << ", axis6CommandVelocityNonZero=" << boolText(axis6CommandVelocityNonZero)
+                      << ".\n";
+            return;
+        }
+    }
+
+    printDiagnosticSnapshot("Dual-axis command accepted but no synchronized trajectory appeared");
+
+    try
+    {
+        std::cout << "Aborting dual-axis accepted-but-not-started command before error exit...\n";
+        multiAxis_->Abort();
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "Dual-axis abort after non-started command threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << ")\n";
+    }
+
+    throw std::runtime_error(
+        "Dual-axis command was accepted, but Axis 5/6 command position/velocity and motion state did not change.");
 }
 
 void Racer3BasicMotion::disableAmplifiers()
