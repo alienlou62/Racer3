@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -9,6 +9,8 @@ param(
     [switch]$SkipRsiconfig,
 
     [switch]$ConfirmMotion,
+
+    [switch]$DryRun,
 
     [double]$Step = 0.05,
 
@@ -41,6 +43,7 @@ Write-Host "Mode:      $Mode"
 Write-Host "Step:      $Step user units"
 Write-Host "Velocity:  $Velocity user-units/sec"
 Write-Host "Diag:      $Diagnostics"
+Write-Host "Dry run:   $DryRun"
 
 $env:PATH = "C:\RSI\11.0.0;$env:PATH"
 
@@ -102,24 +105,56 @@ switch ($Mode) {
         $ExeArgs += "--dry-run"
     }
     "enable-only" {
-        $ExeArgs += "--enable-only"
-    }
-    "tiny-motion" {
-        $ExeArgs += "--tiny-motion"
-        if ($ConfirmMotion) {
-            $ExeArgs += "--confirm-motion"
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
         }
         else {
-            throw "tiny-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            $ExeArgs += "--enable-only"
+        }
+    }
+    "tiny-motion" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--tiny-motion"
+        }
+        else {
+            $ExeArgs += "--tiny-motion"
+            if ($ConfirmMotion) {
+                $ExeArgs += "--confirm-motion"
+            }
+            else {
+                throw "tiny-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            }
         }
     }
     "dual-motion" {
-        $ExeArgs += "--dual-motion"
-        if ($ConfirmMotion) {
-            $ExeArgs += "--confirm-motion"
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--dual-motion"
         }
         else {
-            throw "dual-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            $ExeArgs += "--dual-motion"
+            if ($ConfirmMotion) {
+                $ExeArgs += "--confirm-motion"
+            }
+            else {
+                throw "dual-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            }
+        }
+    }
+    "all-motion" {
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+            $ExeArgs += "--all-motion"
+        }
+        else {
+            $ExeArgs += "--all-motion"
+            if ($ConfirmMotion) {
+                $ExeArgs += "--confirm-motion"
+            }
+            else {
+                throw "all-motion requires -ConfirmMotion. Keep the robot area clear and E-stop ready."
+            }
         }
     }
 }

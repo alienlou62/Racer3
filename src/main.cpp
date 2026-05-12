@@ -21,12 +21,14 @@ void printUsage()
         << "  racer3-basic-motion --dry-run [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
         << "  racer3-basic-motion --enable-only [--diagnostics]\n"
         << "  racer3-basic-motion --tiny-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
-        << "  racer3-basic-motion --dual-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --dual-motion --confirm-motion [--step 0.05] [--velocity 0.05] [--diagnostics]\n"
+        << "  racer3-basic-motion --all-motion --confirm-motion [--step 0.01] [--velocity 0.02] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
         << "  --tiny-motion      Enable all drives, isolate J6, and run a tiny J6-only move.\n"
         << "  --dual-motion      Enable all drives, remap MultiAxis to J5+J6, and move both together.\n"
+        << "  --all-motion       Enable all drives, remap MultiAxis to J1-J6, and move all together.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
         << "  --step <value>     Relative move in user units. Default 0.05.\n"
@@ -113,7 +115,7 @@ void validateOptions(const Racer3RunOptions& options)
         throw std::runtime_error("--velocity must be greater than zero.");
     }
 
-    if (options.stepUserUnits > MaxRecommendedStepUserUnits && (options.tinyMotion || options.dualMotion))
+    if (options.stepUserUnits > MaxRecommendedStepUserUnits && (options.tinyMotion || options.dualMotion || options.allMotion))
     {
         throw std::runtime_error(
             "Refusing --step greater than 0.25 user units for this starter demo. "
@@ -138,7 +140,8 @@ int main(int argc, char* argv[])
         options.dryRun = hasArg(args, "--dry-run");
         options.tinyMotion = hasArg(args, "--tiny-motion");
         options.dualMotion = hasArg(args, "--dual-motion");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion);
+        options.allMotion = hasArg(args, "--all-motion");
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
@@ -151,13 +154,14 @@ int main(int argc, char* argv[])
 
         validateOptions(options);
 
-        if (options.tinyMotion && options.dualMotion)
+        const int motionModeCount = (options.tinyMotion ? 1 : 0) + (options.dualMotion ? 1 : 0) + (options.allMotion ? 1 : 0);
+        if (motionModeCount > 1)
         {
-            std::cerr << "Use only one motion mode: --tiny-motion or --dual-motion.\n";
+            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, or --all-motion.\n";
             return 2;
         }
 
-        if ((options.tinyMotion || options.dualMotion) && !options.motionConfirmed && !options.dryRun)
+        if ((options.tinyMotion || options.dualMotion || options.allMotion) && !options.motionConfirmed && !options.dryRun)
         {
             std::cerr << "Refusing to run real motion without --confirm-motion.\n";
             std::cerr << "Use --dry-run first, then run the motion mode with --confirm-motion only when ready.\n";
@@ -183,6 +187,10 @@ int main(int argc, char* argv[])
         else if (options.dualMotion)
         {
             std::cout << "Mode: DUAL MOTION - synchronized Axis 5 / J5 and Axis 6 / J6 relative motion.\n";
+        }
+        else if (options.allMotion)
+        {
+            std::cout << "Mode: ALL MOTION - synchronized Axis 1 through Axis 6 relative motion.\n";
         }
 
         std::cout << "Motion step: " << options.stepUserUnits

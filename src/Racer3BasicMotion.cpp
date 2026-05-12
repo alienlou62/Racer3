@@ -22,7 +22,17 @@ static constexpr int MultiAxisIndex = 6;
 static constexpr int Axis5Index = 4;
 static constexpr int Axis6Index = 5;
 
-// Axis 5 / J5 and Axis 6 / J6 counts per physical joint revolution from your Racer3 sheet.
+// Racer3 counts per physical joint revolution from your sheet.
+// One RMP user unit = one full physical joint revolution for each axis.
+const JointVector Racer3CountsPerRevolution = {
+    83886080.0,  // Axis 1 / J1
+    83886080.0,  // Axis 2 / J2
+    67108864.0,  // Axis 3 / J3
+    67108864.0,  // Axis 4 / J4
+    67108864.0,  // Axis 5 / J5
+    41943040.0   // Axis 6 / J6
+};
+
 static constexpr double Axis5CountsPerRevolution = 67108864.0;
 static constexpr double Axis6CountsPerRevolution = 41943040.0;
 
@@ -59,6 +69,7 @@ static constexpr bool TemporarilyDisableAxis6ErrorLimitForTinyMotion = true;
 
 static bool DiagnosticsEnabled = false;
 static bool DualMotionEnabled = false;
+static bool AllMotionEnabled = false;
 
 double toDegrees(double userUnits)
 {
@@ -241,6 +252,7 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
 {
     DiagnosticsEnabled = options.diagnostics;
     DualMotionEnabled = options.dualMotion;
+    AllMotionEnabled = options.allMotion;
 
     if (options.stepUserUnits <= 0.0)
     {
@@ -288,6 +300,10 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         else if (options.dualMotion)
         {
             runDualAxisMotion();
+        }
+        else if (options.allMotion)
+        {
+            runAllAxisMotion();
         }
 
         printActualPositions("Actual positions before shutdown");
@@ -420,6 +436,11 @@ void Racer3BasicMotion::configureAxes()
         std::cout << "Axis 5 / J5 HomeActionSet(RSIActionNONE) applied.\n";
     }
 
+    if (AllMotionEnabled)
+    {
+        configureAllAxesForAllMotion();
+    }
+
     printDiagnosticSnapshot("After configureAxes and runtime MultiAxis mapping");
 }
 
@@ -478,6 +499,51 @@ void Racer3BasicMotion::configureAxis5MotionAttributes(const char* context)
     axes_[Axis5Index]->FeedRateSet(1.0);
 
     printMotionAttributeMasks("Axis 5", axes_[Axis5Index]);
+}
+
+
+void Racer3BasicMotion::configureAxisMotionAttributes(int axisIndex, const char* context)
+{
+    if (axisIndex < 0 || axisIndex >= AxisCount || !axes_[axisIndex])
+    {
+        throw std::runtime_error("Axis is not initialized for configureAxisMotionAttributes.");
+    }
+
+    std::cout << "Resetting Axis " << (axisIndex + 1) << " motion attributes (" << context << ")...\n";
+
+    axes_[axisIndex]->MotionAttributeMaskDefaultSet();
+    axes_[axisIndex]->MotionDelaySet(0.0);
+    axes_[axisIndex]->FeedRateSet(1.0);
+
+    printMotionAttributeMasks(("Axis " + std::to_string(axisIndex + 1)).c_str(), axes_[axisIndex]);
+}
+
+void Racer3BasicMotion::configureAllAxesForAllMotion()
+{
+    std::cout << "Configuring all six axes for one-revolution user units for all-axis mode...\n";
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        axes_[index]->UserUnitsSet(Racer3CountsPerRevolution[index]);
+        axes_[index]->PositionSet(0.0);
+        axes_[index]->HomeActionSet(RR::RSIAction::RSIActionNONE);
+        axes_[index]->PositionToleranceFineSet(Axis6FineTolerance);
+        axes_[index]->PositionToleranceCoarseSet(Axis6CoarseTolerance);
+        axes_[index]->VelocityToleranceSet(Axis6VelocityTolerance);
+        axes_[index]->SettlingTimeSet(Axis6SettlingTime);
+
+        std::cout << "  Axis " << (index + 1)
+                  << " counts/user-unit=" << std::fixed << std::setprecision(0)
+                  << Racer3CountsPerRevolution[index]
+                  << ", HomeAction=NONE, software zero set.\n";
+    }
+
+    std::cout << std::fixed << std::setprecision(6);
 }
 
 void Racer3BasicMotion::isolateAxis6ForDirectMotion()
@@ -573,6 +639,76 @@ void Racer3BasicMotion::isolateAxis5And6ForDualMotion()
 
     std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
     printAxis5And6MotionStatus("Axis 5/6 status after dual-axis isolation");
+}
+
+
+void Racer3BasicMotion::isolateAllAxesForAllMotion()
+{
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    std::cout << "Preparing MultiAxis 6 for synchronized all-axis motion...\n";
+    std::cout << "All six drives have already been enabled; MultiAxis 6 will now contain Axis 1 through Axis 6.\n";
+
+    multiAxis_->AxisRemoveAll();
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        multiAxis_->AxisAdd(axes_[index]);
+        std::cout << "  Added Axis " << (index + 1) << " to all-axis MultiAxis group.\n";
+    }
+
+    multiAxis_->UserLabelSet("Racer3AllAxisDemo");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
+
+    configureMultiAxisMotionAttributes("after remapping MultiAxis 6 to all six axes");
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        configureAxisMotionAttributes(index, "after all-axis MultiAxis remap");
+    }
+
+    std::cout << "Clearing all axis faults and confirming MultiAxis 6 amp enable for all-axis motion...\n";
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        axes_[index]->ClearFaults();
+    }
+
+    multiAxis_->ClearFaults();
+
+    const int result = multiAxis_->AmpEnableSet(
+        true,
+        AmpEnableTimeoutMs,
+        OverrideRestrictedStateForEnable);
+
+    if (!multiAxis_->AmpEnableGet())
+    {
+        throw std::runtime_error("All-axis MultiAxis AmpEnableSet failed or timed out after all-axis isolation.");
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index]->AmpEnableGet())
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " amp enable failed after all-axis isolation.");
+        }
+    }
+
+    std::cout << "All-axis MultiAxis amp enable confirmed after isolation. AmpEnableSet returned "
+              << result
+              << " ms.\n";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
+    printAllAxisMotionStatus("All-axis status after all-axis isolation");
 }
 
 void Racer3BasicMotion::clearFaults()
@@ -907,9 +1043,182 @@ void Racer3BasicMotion::runDualAxisMotion()
     std::cout << "Axis 5 + Axis 6 synchronized MultiAxis MoveRelative diagnostic complete. Net commanded offsets are zero.\n";
 }
 
+
+void Racer3BasicMotion::runAllAxisMotion()
+{
+    std::cout << "Starting synchronized all-axis MultiAxis::MoveRelative diagnostic...\n";
+    std::cout << "All 6 axes were enabled through runtime-mapped MultiAxis 6 first.\n";
+    std::cout << "Before the all-axis move, MultiAxis 6 is remapped to contain Axis 1 through Axis 6.\n";
+    std::cout << "All axes receive the same relative range and velocity so they complete at the same time.\n";
+    std::cout << "Step = "
+              << Axis6TestStepUserUnits
+              << " user units = "
+              << toDegrees(Axis6TestStepUserUnits)
+              << " degrees on each axis.\n";
+    std::cout << "Velocity = "
+              << MotionVelocity
+              << " user-units/sec = "
+              << toDegrees(MotionVelocity)
+              << " deg/sec on each axis.\n";
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+    }
+
+    isolateAllAxesForAllMotion();
+
+    std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
+    bool errorLimitsTemporarilyChanged = false;
+
+    if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+    {
+        std::cout << "Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for this all-axis motion test.\n";
+        std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            originalErrorLimitActions[index] = axes_[index]->ErrorLimitActionGet();
+            std::cout << "  Original Axis " << (index + 1)
+                      << " ErrorLimitAction: " << actionName(originalErrorLimitActions[index]) << "\n";
+            axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        }
+
+        errorLimitsTemporarilyChanged = true;
+    }
+
+    const std::array<JointVector, 2> relativePositions = {
+        makeAllAxesVector(Axis6TestStepUserUnits),
+        makeAllAxesVector(-Axis6TestStepUserUnits)
+    };
+
+    const JointVector velocity = makeAllAxesVector(MotionVelocity);
+    const JointVector acceleration = makeAllAxesVector(MotionAcceleration);
+    const JointVector deceleration = makeAllAxesVector(MotionDeceleration);
+    const JointVector jerk = makeAllAxesVector(MotionJerkPercent);
+
+    try
+    {
+        for (size_t stepIndex = 0; stepIndex < relativePositions.size(); ++stepIndex)
+        {
+            const JointVector& relativePosition = relativePositions[stepIndex];
+
+            std::cout << "\n=== All-axis MultiAxis::MoveRelative step "
+                      << (stepIndex + 1)
+                      << " / "
+                      << relativePositions.size()
+                      << " ===\n";
+
+            std::cout << "Relative position array [J1..J6] in user units: ";
+            printJointVector(relativePosition);
+            std::cout << "Velocity array [J1..J6] in user-units/sec: ";
+            printJointVector(velocity);
+
+            clearErrorLog("MotionController", controller_);
+            clearErrorLog("MultiAxis 6", multiAxis_);
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+            }
+
+            configureMultiAxisMotionAttributes("before all-axis MultiAxis::MoveRelative step");
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                configureAxisMotionAttributes(index, "before all-axis MultiAxis::MoveRelative step");
+            }
+
+            printAllAxisMotionStatus("All axes before all-axis MoveRelative");
+
+            const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
+            std::array<double, AxisCount> startingCommandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                startingCommandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            std::cout << "Commanding MultiAxis::MoveRelative for [Axis1..Axis6].\n";
+            std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+
+            multiAxis_->MoveRelative(
+                relativePosition.data(),
+                velocity.data(),
+                acceleration.data(),
+                deceleration.data(),
+                jerk.data());
+
+            std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
+            printAllAxisMotionStatus("All axes immediately after all-axis MoveRelative");
+
+            waitForAllAxisMotionStart(
+                "All-axis MultiAxis::MoveRelative",
+                startingCommandPositions);
+
+            for (int sample = 0; sample < 8; ++sample)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
+                printAllAxisProgressLine("All-axis live sample", sample + 1);
+            }
+
+            waitForMotionDone(MotionTimeoutMs);
+
+            printActualPositions("Actual positions after all-axis MultiAxis::MoveRelative step");
+            printAllAxisMotionStatus("All axes after MotionDoneWait");
+        }
+    }
+    catch (...)
+    {
+        if (errorLimitsTemporarilyChanged)
+        {
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                std::cout << "Restored Axis " << (index + 1)
+                          << " ErrorLimitAction to " << actionName(originalErrorLimitActions[index]) << ".\n";
+            }
+        }
+
+        throw;
+    }
+
+    if (errorLimitsTemporarilyChanged)
+    {
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+            std::cout << "Restored Axis " << (index + 1)
+                      << " ErrorLimitAction to " << actionName(originalErrorLimitActions[index]) << ".\n";
+        }
+    }
+
+    std::cout << "Synchronized all-axis MultiAxis MoveRelative diagnostic complete. Net commanded offsets are zero.\n";
+}
+
 void Racer3BasicMotion::printMotionPlan() const
 {
-    if (DualMotionEnabled)
+    if (AllMotionEnabled)
+    {
+        std::cout << "\nAll-axis synchronized MultiAxis MoveRelative diagnostic motion plan\n";
+        std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
+        std::cout << "Enable path: LoadExistingMultiAxis(6), then AxisRemoveAll/AxisAdd, then enable all six drives.\n";
+        std::cout << "All-axis path: after all six drives are enabled, MultiAxis 6 is remapped to Axis 1 through Axis 6.\n";
+        std::cout << "Motion path: MultiAxis::MoveRelative arrays [J1..J6] with the same relative range and velocity.\n";
+        std::cout << "All six axes scaling: 1.0 user unit = 1 physical revolution on each axis.\n";
+        std::cout << "All six axes HomeAction are set to NONE in code.\n";
+        std::cout << "All six axes ErrorLimitAction are temporarily set to NONE only during all-motion.\n";
+        std::cout << "All six axes receive synchronized motion commands. Cleanup disables each axis individually.\n";
+    }
+    else if (DualMotionEnabled)
     {
         std::cout << "\nAxis 5 + Axis 6 synchronized MultiAxis MoveRelative diagnostic motion plan\n";
         std::cout << "Startup path: scripts/start-racer3-rmp-and-run.ps1 runs rsiconfig first.\n";
@@ -941,15 +1250,29 @@ void Racer3BasicMotion::printMotionPlan() const
               << toDegrees(Axis6TestStepUserUnits)
               << " degrees.\n";
 
-    const std::array<JointVector, 2> plannedMoves = DualMotionEnabled
-        ? std::array<JointVector, 2>{
+    std::array<JointVector, 2> plannedMoves{};
+
+    if (AllMotionEnabled)
+    {
+        plannedMoves = {
+            makeAllAxesVector(Axis6TestStepUserUnits),
+            makeAllAxesVector(-Axis6TestStepUserUnits)
+        };
+    }
+    else if (DualMotionEnabled)
+    {
+        plannedMoves = {
             makeAxis5And6Vector(Axis6TestStepUserUnits, Axis6TestStepUserUnits),
             makeAxis5And6Vector(-Axis6TestStepUserUnits, -Axis6TestStepUserUnits)
-        }
-        : std::array<JointVector, 2>{
+        };
+    }
+    else
+    {
+        plannedMoves = {
             makeAxis6OnlyVector(Axis6TestStepUserUnits),
             makeAxis6OnlyVector(-Axis6TestStepUserUnits)
         };
+    }
 
     JointVector netOffset{};
 
@@ -1012,7 +1335,11 @@ void Racer3BasicMotion::printDiagnosticSnapshot(const char* label, bool includeE
     if (!DiagnosticsEnabled)
     {
         std::cout << "\n--- " << label << " (compact; use --diagnostics for full dump) ---\n";
-        if (DualMotionEnabled && axes_[Axis5Index] && axes_[Axis6Index])
+        if (AllMotionEnabled)
+        {
+            printAllAxisProgressLine(label, 0);
+        }
+        else if (DualMotionEnabled && axes_[Axis5Index] && axes_[Axis6Index])
         {
             printDualAxisProgressLine(label, 0);
         }
@@ -1324,6 +1651,86 @@ void Racer3BasicMotion::printDualAxisProgressLine(const char* label, int sampleN
     }
 }
 
+
+void Racer3BasicMotion::printAllAxisMotionStatus(const char* label)
+{
+    std::cout << label << "\n";
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            std::cout << "  J" << (index + 1) << ": <null>\n";
+            continue;
+        }
+
+        try
+        {
+            std::cout << "  J" << (index + 1)
+                      << " CmdPos=" << std::fixed << std::setprecision(6) << axes_[index]->CommandPositionGet()
+                      << " ActPos=" << axes_[index]->ActualPositionGet()
+                      << " CmdVel=" << axes_[index]->CommandVelocityGet()
+                      << " ActVel=" << axes_[index]->ActualVelocityGet()
+                      << " State=" << stateName(axes_[index]->StateGet())
+                      << " Done=" << boolText(axes_[index]->MotionDoneGet())
+                      << "\n";
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  J" << (index + 1)
+                      << " status threw RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
+    }
+}
+
+void Racer3BasicMotion::printAllAxisProgressLine(const char* label, int sampleNumber)
+{
+    if (!multiAxis_)
+    {
+        std::cout << label << " sample " << sampleNumber << ": MultiAxis object is not initialized.\n";
+        return;
+    }
+
+    try
+    {
+        const RR::RSIState multiState = multiAxis_->StateGet();
+
+        std::cout << label
+                  << " sample " << sampleNumber
+                  << " | MultiAxis(State=" << stateName(multiState)
+                  << ", MotionId=" << multiAxis_->MotionIdGet()
+                  << ", Exec=" << multiAxis_->MotionIdExecutingGet()
+                  << ", Done=" << boolText(multiAxis_->MotionDoneGet())
+                  << ")";
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            if (!axes_[index])
+            {
+                std::cout << " J" << (index + 1) << "(<null>)";
+                continue;
+            }
+
+            std::cout << " J" << (index + 1)
+                      << "(State=" << stateName(axes_[index]->StateGet())
+                      << ", CmdPos=" << std::fixed << std::setprecision(6) << axes_[index]->CommandPositionGet()
+                      << ", CmdVel=" << axes_[index]->CommandVelocityGet()
+                      << ", ActPos=" << axes_[index]->ActualPositionGet()
+                      << ", ActVel=" << axes_[index]->ActualVelocityGet()
+                      << ")";
+        }
+
+        std::cout << "\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << label << " sample " << sampleNumber
+                  << " threw RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+}
+
 void Racer3BasicMotion::waitForMotionStart(const char* label, double startingAxis6CommandPosition)
 {
     if (!multiAxis_ || !axes_[Axis6Index])
@@ -1525,6 +1932,86 @@ void Racer3BasicMotion::waitForDualAxisMotionStart(
 
     throw std::runtime_error(
         "Dual-axis command was accepted, but Axis 5/6 command position/velocity and motion state did not change.");
+}
+
+
+void Racer3BasicMotion::waitForAllAxisMotionStart(
+    const char* label,
+    const std::array<double, AxisCount>& startingCommandPositions)
+{
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("All-axis motion objects are not initialized.");
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+    }
+
+    std::cout << "Watching for " << label << " to generate a synchronized all-axis trajectory...\n";
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(MotionStartTimeoutMs);
+    int sampleNumber = 0;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(MotionStartSampleMs));
+        ++sampleNumber;
+
+        printAllAxisProgressLine("All-axis start-watch", sampleNumber);
+
+        const RR::RSIState multiState = multiAxis_->StateGet();
+        bool stateMoving = multiState == RR::RSIState::RSIStateMOVING;
+        bool anyCommandPositionChanged = false;
+        bool anyCommandVelocityNonZero = false;
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            const RR::RSIState axisState = axes_[index]->StateGet();
+            const double commandPosition = axes_[index]->CommandPositionGet();
+            const double commandVelocity = axes_[index]->CommandVelocityGet();
+
+            stateMoving = stateMoving || axisState == RR::RSIState::RSIStateMOVING;
+            anyCommandPositionChanged = anyCommandPositionChanged ||
+                std::fabs(commandPosition - startingCommandPositions[index]) > 1e-7;
+            anyCommandVelocityNonZero = anyCommandVelocityNonZero ||
+                std::fabs(commandVelocity) > 1e-9;
+        }
+
+        if (stateMoving || anyCommandPositionChanged || anyCommandVelocityNonZero)
+        {
+            std::cout << label << " started: "
+                      << "stateMoving=" << boolText(stateMoving)
+                      << ", anyCommandPositionChanged=" << boolText(anyCommandPositionChanged)
+                      << ", anyCommandVelocityNonZero=" << boolText(anyCommandVelocityNonZero)
+                      << ".\n";
+            return;
+        }
+    }
+
+    printDiagnosticSnapshot("All-axis command accepted but no synchronized trajectory appeared");
+
+    try
+    {
+        std::cout << "Aborting all-axis accepted-but-not-started command before error exit...\n";
+        multiAxis_->Abort();
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "All-axis abort after non-started command threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << ")\n";
+    }
+
+    throw std::runtime_error(
+        "All-axis command was accepted, but command position/velocity and motion state did not change.");
 }
 
 void Racer3BasicMotion::disableAmplifiers()
