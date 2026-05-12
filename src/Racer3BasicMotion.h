@@ -19,6 +19,9 @@ struct Racer3RunOptions
     bool enableOnly = false;
     bool tinyMotion = false;
     bool motionConfirmed = false;
+    bool diagnostics = false;
+    double stepUserUnits = 0.05;
+    double velocityUserUnitsPerSecond = 0.05;
 };
 
 class Racer3BasicMotion

@@ -27,12 +27,12 @@ static constexpr double Axis6CountsPerRevolution = 41943040.0;
 // J6-only test.
 // 1.0 user unit = one physical joint revolution.
 // 0.05 user units = 18 degrees.
-static constexpr double Axis6TestStepUserUnits = 0.05;
+static double Axis6TestStepUserUnits = 0.05;
 
 // Direct J6 MoveRelative values. The working hardware sequence enables all six
 // drives through MultiAxis 6, removes the MultiAxis mapping, then commands only
 // Axis 6 with Axis::MoveRelative(relativePosition, vel, accel, decel, jerkPct).
-static constexpr double MotionVelocity = 0.05;
+static double MotionVelocity = 0.05;
 static constexpr double MotionAcceleration = 1.0;
 static constexpr double MotionDeceleration = 1.0;
 static constexpr double MotionJerkPercent = 5.0;
@@ -54,6 +54,8 @@ static constexpr int MotionStartSampleMs = 50;
 
 static constexpr bool OverrideRestrictedStateForEnable = true;
 static constexpr bool TemporarilyDisableAxis6ErrorLimitForTinyMotion = true;
+
+static bool DiagnosticsEnabled = false;
 
 double toDegrees(double userUnits)
 {
@@ -226,6 +228,21 @@ Racer3BasicMotion::~Racer3BasicMotion()
 
 void Racer3BasicMotion::run(const Racer3RunOptions& options)
 {
+    DiagnosticsEnabled = options.diagnostics;
+
+    if (options.stepUserUnits <= 0.0)
+    {
+        throw std::runtime_error("--step must be greater than zero.");
+    }
+
+    if (options.velocityUserUnitsPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--velocity must be greater than zero.");
+    }
+
+    Axis6TestStepUserUnits = options.stepUserUnits;
+    MotionVelocity = options.velocityUserUnitsPerSecond;
+
     printMotionPlan();
 
     if (options.dryRun)
@@ -643,6 +660,7 @@ void Racer3BasicMotion::printMotionPlan() const
     std::cout << "Axis 6 HomeAction is set to NONE in code.\n";
     std::cout << "Axis 6 ErrorLimitAction is temporarily set to NONE only during tiny-motion.\n";
     std::cout << "Only J6 receives a motion command. Cleanup disables each axis individually.\n";
+    std::cout << "Diagnostics: " << (DiagnosticsEnabled ? "FULL (--diagnostics enabled)" : "COMPACT (use --diagnostics for full dumps)") << "\n";
     std::cout << "Test step = "
               << Axis6TestStepUserUnits
               << " user units = "
@@ -712,6 +730,14 @@ void Racer3BasicMotion::printActualPositions(const char* label)
 
 void Racer3BasicMotion::printDiagnosticSnapshot(const char* label, bool includeErrorLogs)
 {
+    if (!DiagnosticsEnabled)
+    {
+        std::cout << "\n--- " << label << " (compact; use --diagnostics for full dump) ---\n";
+        printMotionProgressLine(label, 0);
+        std::cout << "--- end compact snapshot ---\n";
+        return;
+    }
+
     std::cout << "\n--- " << label << " ---\n";
 
     printMotionObjectDiagnostics("MultiAxis 6", multiAxis_);
