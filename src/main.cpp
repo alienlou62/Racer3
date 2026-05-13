@@ -35,7 +35,7 @@ void printUsage()
         << "  racer3-basic-motion --robot-model-probe [--diagnostics]\n"
         << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n"
         << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
-        << "  racer3-basic-motion --cartesian-vector [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --cartesian-vector [--position-only] [--compact-motion] [--trajectory-motion] [--endpoint-only] [--segment-goal] [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -47,6 +47,12 @@ void printUsage()
         << "  --robot-pose-probe  Connect/load MultiAxis and probe read-only Robot pose/FK/IK APIs. No amp enable or motion.\n"
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
+        << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
+        << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
+        << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
+        << "  --trajectory-motion Experimental: stream validated segment endpoints with MultiAxis::MovePVT.\n"
+        << "  --endpoint-only  Experimental: solve one final XYZ target and run smooth joint-space PVT. Not a straight Cartesian TCP path.\n"
+        << "  --segment-goal  Experimental: use segmented IK only to find final goal, then run smooth joint-space PVT.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
         << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
@@ -290,6 +296,12 @@ int main(int argc, char* argv[])
         options.robotPoseProbe = hasArg(args, "--robot-pose-probe");
         options.kinematicsDryRun = hasArg(args, "--kinematics-dry-run");
         options.cartesianVectorMotion = hasArg(args, "--cartesian-vector");
+        options.positionOnlyIk = hasArg(args, "--position-only");
+        options.compactMotion = hasArg(args, "--compact-motion");
+        options.appendMotion = hasArg(args, "--append-motion");
+        options.trajectoryMotion = hasArg(args, "--trajectory-motion");
+        options.endpointOnlyMotion = hasArg(args, "--endpoint-only");
+        options.segmentGoalMotion = hasArg(args, "--segment-goal");
         options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.cartesianVectorMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
@@ -417,6 +429,16 @@ int main(int argc, char* argv[])
                 std::cout << " " << value;
             }
             std::cout << "\n";
+        }
+
+        if (options.cartesianVectorMotion)
+        {
+            std::cout << "Position-only IK: " << (options.positionOnlyIk ? "ON" : "OFF") << "\n";
+            std::cout << "Compact segmented motion: " << (options.compactMotion ? "ON" : "OFF") << "\n";
+            std::cout << "Append queued motion: " << (options.appendMotion ? "ON" : "OFF") << "\n";
+            std::cout << "PVT trajectory motion: " << (options.trajectoryMotion ? "ON" : "OFF") << "\n";
+            std::cout << "Endpoint-only point motion: " << (options.endpointOnlyMotion ? "ON" : "OFF") << "\n";
+            std::cout << "Segment-goal smooth motion: " << (options.segmentGoalMotion ? "ON" : "OFF") << "\n";
         }
         std::cout << "Diagnostics: " << (options.diagnostics ? "FULL" : "COMPACT") << "\n";
         std::cout << "Return warning tolerance: " << options.returnWarnToleranceUserUnits

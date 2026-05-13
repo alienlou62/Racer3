@@ -12,6 +12,18 @@ param(
 
     [switch]$DryRun,
 
+    [switch]$PositionOnly,
+
+    [switch]$CompactMotion,
+
+    [switch]$AppendMotion,
+
+    [switch]$TrajectoryMotion,
+
+    [switch]$EndpointOnly,
+
+    [switch]$SegmentGoal,
+
     [double]$Step = 0.05,
 
     [double]$Velocity = 0.05,
@@ -54,6 +66,12 @@ Write-Host "ReturnWarn: $ReturnWarn user units"
 Write-Host "ReturnFail: $ReturnFail user units"
 if ($Mode -eq "joint-vector") { Write-Host "Joints:    $Joints" }
 if ($Mode -eq "kinematics-dry-run" -or $Mode -eq "cartesian-vector") { Write-Host "Cartesian: $Cartesian" }
+if ($Mode -eq "cartesian-vector") { Write-Host "PositionOnly: $PositionOnly" }
+if ($Mode -eq "cartesian-vector") { Write-Host "CompactMotion: $CompactMotion" }
+if ($Mode -eq "cartesian-vector") { Write-Host "AppendMotion: $AppendMotion" }
+if ($Mode -eq "cartesian-vector") { Write-Host "TrajectoryMotion: $TrajectoryMotion" }
+if ($Mode -eq "cartesian-vector") { Write-Host "EndpointOnly: $EndpointOnly" }
+if ($Mode -eq "cartesian-vector") { Write-Host "SegmentGoal: $SegmentGoal" }
 Write-Host "Diag:      $Diagnostics"
 Write-Host "Dry run:   $DryRun"
 
@@ -215,6 +233,12 @@ switch ($Mode) {
             $ExeArgs += "--dry-run"
         }
         $ExeArgs += "--cartesian-vector"
+        if ($PositionOnly) { $ExeArgs += "--position-only" }
+        if ($CompactMotion) { $ExeArgs += "--compact-motion" }
+        if ($AppendMotion) { $ExeArgs += "--append-motion" }
+        if ($TrajectoryMotion) { $ExeArgs += "--trajectory-motion" }
+        if ($EndpointOnly) { $ExeArgs += "--endpoint-only" }
+        if ($SegmentGoal) { $ExeArgs += "--segment-goal" }
         $ExeArgs += "--cartesian"
         $ExeArgs += $Cartesian
         if ($ConfirmMotion) { $ExeArgs += "--confirm-motion" }

@@ -25,6 +25,12 @@ struct Racer3RunOptions
     bool robotPoseProbe = false;
     bool kinematicsDryRun = false;
     bool cartesianVectorMotion = false;
+    bool positionOnlyIk = false;
+    bool compactMotion = false;
+    bool appendMotion = false;
+    bool trajectoryMotion = false;
+    bool endpointOnlyMotion = false;
+    bool segmentGoalMotion = false;
     bool motionConfirmed = false;
     bool diagnostics = false;
     double stepUserUnits = 0.05;

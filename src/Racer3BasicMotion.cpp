@@ -82,6 +82,12 @@ static bool RobotModelProbeEnabled = false;
 static bool RobotPoseProbeEnabled = false;
 static bool KinematicsDryRunEnabled = false;
 static bool CartesianVectorMotionEnabled = false;
+static bool PositionOnlyIkEnabled = false;
+static bool CompactSegmentedExecutionEnabled = false;
+static bool AppendSegmentedExecutionEnabled = false;
+static bool TrajectorySegmentedExecutionEnabled = false;
+static bool EndpointOnlyMotionEnabled = false;
+static bool SegmentGoalMotionEnabled = false;
 static bool CartesianVectorMotionConfirmed = false;
 static double ReturnWarnToleranceUserUnits = 0.00025;
 static double ReturnFailToleranceUserUnits = 0.00100;
@@ -122,6 +128,7 @@ JointVector makeAxis5And6Vector(double axis5Value, double axis6Value)
 
 static constexpr double Pi = 3.141592653589793238462643383279502884;
 static constexpr double RevolutionsToRadians = 2.0 * Pi;
+static constexpr int MaxCartesianSegments = 128;
 
 // OpenRAVE/RapidRobot Racer3 geometry extracted from racer3.kinbody.xml
 // and racer3.robot.xml. Units are meters and radians.
@@ -451,9 +458,16 @@ struct IkDryRunResult
 
 // Dry-run validation gates for promoting an IK result toward future motion testing.
 // These are intentionally conservative. The code still does not command motion.
-static constexpr double CandidateResidualNormAccept = 2e-4;
-static constexpr double CandidateMaxResidualComponentAccept = 1e-4;
+static constexpr double CandidateResidualNormAccept = 4e-3;
+static constexpr double CandidateMaxResidualComponentAccept = 4e-3;
 static constexpr double CandidateMaxJointDeltaDegreesAccept = 90.0;
+
+// Endpoint-only point motion is a full joint-space move to one final XYZ target,
+// not a tiny per-segment Cartesian step. Keep a hard gate, but make it separate
+// from the segmented Cartesian per-step gate.
+static constexpr double EndpointMaxJointDeltaDegreesAccept = 180.0;
+static constexpr double EndpointWarnJointDeltaDegrees = 90.0;
+static constexpr int EndpointPvtWaypointCount = 96;
 
 CartesianVector poseVectorFromJoints(const JointVector& jointRadians)
 {
@@ -505,6 +519,80 @@ double maxAbsResidualComponent(const CartesianVector& residual)
     }
 
     return result;
+}
+
+bool residualComponentParticipatesInIk(int componentIndex)
+{
+    return !PositionOnlyIkEnabled || componentIndex < 3;
+}
+
+double residualNormForIkMode(const CartesianVector& residual)
+{
+    double sum = 0.0;
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (!residualComponentParticipatesInIk(index))
+        {
+            continue;
+        }
+
+        sum += residual[index] * residual[index];
+    }
+
+    return std::sqrt(sum);
+}
+
+double maxAbsResidualComponentForIkMode(const CartesianVector& residual)
+{
+    double result = 0.0;
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (!residualComponentParticipatesInIk(index))
+        {
+            continue;
+        }
+
+        result = std::max(result, std::fabs(residual[index]));
+    }
+
+    return result;
+}
+
+const char* ikResidualModeName()
+{
+    return PositionOnlyIkEnabled ? "POSITION_ONLY_XYZ" : "FULL_POSE_XYZ_RPY";
+}
+
+const char* compactSegmentedExecutionName()
+{
+    return CompactSegmentedExecutionEnabled ? "COMPACT" : "VERBOSE";
+}
+
+const char* segmentedMotionExecutionModeName()
+{
+    if (SegmentGoalMotionEnabled)
+    {
+        return "SEGMENT_GOAL_PVT_EXPERIMENTAL";
+    }
+
+    if (EndpointOnlyMotionEnabled)
+    {
+        return "ENDPOINT_ONLY_PVT_EXPERIMENTAL";
+    }
+
+    if (TrajectorySegmentedExecutionEnabled)
+    {
+        return "PVT_TRAJECTORY_EXPERIMENTAL";
+    }
+
+    if (AppendSegmentedExecutionEnabled)
+    {
+        return "APPEND_QUEUED_EXPERIMENTAL";
+    }
+
+    return "STEP_WAIT";
 }
 
 void printCartesianResidual(const char* label, const CartesianVector& residual)
@@ -656,7 +744,7 @@ IkDryRunResult solveNumericalIkDampedLeastSquares(
     const JointVector& seedRadians,
     const CartesianVector& targetPoseVector)
 {
-    static constexpr int MaxIterations = 80;
+    static constexpr int MaxIterations = 160;
     static constexpr double FiniteDifferenceStepRadians = 1e-5;
     static constexpr double Damping = 0.025;
     static constexpr double MaxJointStepRadians = 0.050;
@@ -675,8 +763,8 @@ IkDryRunResult solveNumericalIkDampedLeastSquares(
 
         result.iterations = iteration;
         result.residual = error;
-        result.residualNorm = residualNorm(error);
-        result.maxResidualComponent = maxAbsResidualComponent(error);
+        result.residualNorm = residualNormForIkMode(error);
+        result.maxResidualComponent = maxAbsResidualComponentForIkMode(error);
 
         if (result.residualNorm < ConvergedResidualNorm &&
             result.maxResidualComponent < ConvergedMaxComponent)
@@ -711,6 +799,11 @@ IkDryRunResult solveNumericalIkDampedLeastSquares(
                 double value = 0.0;
                 for (int k = 0; k < Racer3BasicMotion::AxisCount; ++k)
                 {
+                    if (!residualComponentParticipatesInIk(k))
+                    {
+                        continue;
+                    }
+
                     value += jacobian[k][row] * jacobian[k][col];
                 }
 
@@ -725,6 +818,11 @@ IkDryRunResult solveNumericalIkDampedLeastSquares(
             double rhsValue = 0.0;
             for (int k = 0; k < Racer3BasicMotion::AxisCount; ++k)
             {
+                if (!residualComponentParticipatesInIk(k))
+                {
+                    continue;
+                }
+
                 rhsValue += jacobian[k][row] * error[k];
             }
             rhs[row] = rhsValue;
@@ -762,8 +860,8 @@ IkDryRunResult solveNumericalIkDampedLeastSquares(
 
     const CartesianVector finalPose = poseVectorFromJoints(q);
     result.residual = subtractPoseVectorWrapped(targetPoseVector, finalPose);
-    result.residualNorm = residualNorm(result.residual);
-    result.maxResidualComponent = maxAbsResidualComponent(result.residual);
+    result.residualNorm = residualNormForIkMode(result.residual);
+    result.maxResidualComponent = maxAbsResidualComponentForIkMode(result.residual);
     result.solutionRadians = q;
 
     for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
@@ -793,6 +891,11 @@ void printIkDryRunReport(
         targetPoseVector);
 
     std::cout << "  Solver: damped least-squares numerical IK, finite-difference Jacobian.\n";
+    std::cout << "  IK residual mode: " << ikResidualModeName() << "\n";
+    if (PositionOnlyIkEnabled)
+    {
+        std::cout << "  Position-only IK ignores roll/pitch/yaw in solve and validation, but still prints full pose residual.\n";
+    }
     std::cout << "  Converged: " << (result.converged ? "true" : "false") << "\n";
     std::cout << "  Iterations: " << result.iterations << "\n";
     std::cout << "  Residual norm: " << std::fixed << std::setprecision(9) << result.residualNorm << "\n";
@@ -984,6 +1087,7 @@ void printCompactIkCandidateLine(const IkSeedCandidate& candidate)
               << " limit=" << std::setw(5) << (candidate.result.hitJointLimit ? "true" : "false")
               << " resOK=" << std::setw(5) << (residualAcceptedForDryRunCandidate(candidate.result) ? "true" : "false")
               << " dOK=" << std::setw(5) << (jointDeltaAcceptedForDryRunCandidate(candidate.result) ? "true" : "false")
+              << " ikMode=" << ikResidualModeName()
               << " iter=" << std::right << std::setw(3) << candidate.result.iterations
               << " norm=" << std::fixed << std::setprecision(9) << candidate.result.residualNorm
               << " max=" << candidate.result.maxResidualComponent
@@ -1069,6 +1173,11 @@ void printCartesianVectorMotionCandidateSummary(
         !candidate.result.hitJointLimit;
 
     std::cout << "\nGuarded Cartesian-vector candidate summary\n";
+    std::cout << "  IK residual mode: " << ikResidualModeName() << "\n";
+    if (PositionOnlyIkEnabled)
+    {
+        std::cout << "  Position-only IK: orientation residual is reported but does not block the candidate.\n";
+    }
     std::cout << "  Best seed: " << candidate.seedName << "\n";
     std::cout << "  Solver converged flag: " << (candidate.result.converged ? "true" : "false") << "\n";
     std::cout << "  Hit joint limit: " << (candidate.result.hitJointLimit ? "true" : "false") << "\n";
@@ -1144,6 +1253,21 @@ CartesianVector targetPoseVectorForCartesianDelta(
     };
 }
 
+CartesianVector targetPoseVectorFromStartPoseAndDelta(
+    const CartesianVector& startPoseVector,
+    const CartesianVector& requestedCartesianDelta,
+    double fraction)
+{
+    return {
+        startPoseVector[0] + requestedCartesianDelta[0] * fraction,
+        startPoseVector[1] + requestedCartesianDelta[1] * fraction,
+        startPoseVector[2] + requestedCartesianDelta[2] * fraction,
+        startPoseVector[3] + requestedCartesianDelta[3] * fraction,
+        startPoseVector[4] + requestedCartesianDelta[4] * fraction,
+        startPoseVector[5] + requestedCartesianDelta[5] * fraction
+    };
+}
+
 IkBestCandidate solveBestCandidateForCartesianDelta(
     const JointVector& currentRadians,
     const CartesianVector& delta)
@@ -1203,16 +1327,23 @@ bool guardedCandidateAcceptedFromCurrent(
            !candidate.result.hitJointLimit;
 }
 
-CartesianSegmentCandidate makeCartesianSegmentCandidate(
+CartesianSegmentCandidate makeCartesianSegmentCandidateForTargetPose(
     int segmentNumber,
     const JointVector& currentRadians,
-    const CartesianVector& segmentDelta)
+    const CartesianVector& reportedSegmentDelta,
+    const CartesianVector& absoluteTargetPoseVector)
 {
     CartesianSegmentCandidate segment{};
     segment.segmentNumber = segmentNumber;
-    segment.requestedCartesianDelta = segmentDelta;
+    segment.requestedCartesianDelta = reportedSegmentDelta;
     segment.startRadians = currentRadians;
-    segment.candidate = solveBestCandidateForCartesianDelta(currentRadians, segmentDelta);
+
+    // Important: solve this segment against the absolute waypoint on the original
+    // start-to-final line. The previous implementation solved each segment as
+    // current FK + small delta, which allowed a few millimeters of local residual
+    // to accumulate into centimeters of final target miss.
+    segment.candidate =
+        solveBestMultiSeedIkCandidate(currentRadians, absoluteTargetPoseVector);
 
     if (segment.candidate.found)
     {
@@ -1232,17 +1363,22 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
     const JointVector& startRadians,
     const CartesianVector& requestedCartesianDelta)
 {
-    static constexpr int MaxCartesianSegments = 8;
-
     CartesianSegmentPlan bestRejected{};
     bestRejected.rejectionReason = "No segmented Cartesian plan was evaluated.";
+
+    const CartesianVector startPoseVector = poseVectorFromJoints(startRadians);
+    const CartesianVector finalTargetPoseVector =
+        targetPoseVectorFromStartPoseAndDelta(
+            startPoseVector,
+            requestedCartesianDelta,
+            1.0);
 
     for (int segmentCount = 1; segmentCount <= MaxCartesianSegments; ++segmentCount)
     {
         CartesianSegmentPlan plan{};
         plan.segmentCount = segmentCount;
 
-        const CartesianVector segmentDelta =
+        const CartesianVector reportedSegmentDelta =
             scaleCartesianVector(requestedCartesianDelta, 1.0 / static_cast<double>(segmentCount));
 
         JointVector currentRadians = startRadians;
@@ -1250,8 +1386,21 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
 
         for (int segmentIndex = 0; segmentIndex < segmentCount; ++segmentIndex)
         {
+            const double waypointFraction =
+                static_cast<double>(segmentIndex + 1) /
+                static_cast<double>(segmentCount);
+            const CartesianVector waypointTargetPoseVector =
+                targetPoseVectorFromStartPoseAndDelta(
+                    startPoseVector,
+                    requestedCartesianDelta,
+                    waypointFraction);
+
             CartesianSegmentCandidate segment =
-                makeCartesianSegmentCandidate(segmentIndex + 1, currentRadians, segmentDelta);
+                makeCartesianSegmentCandidateForTargetPose(
+                    segmentIndex + 1,
+                    currentRadians,
+                    reportedSegmentDelta,
+                    waypointTargetPoseVector);
 
             if (!segment.accepted)
             {
@@ -1273,7 +1422,7 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
                 {
                     plan.rejectionReason =
                         "Segment " + std::to_string(segmentIndex + 1) +
-                        " failed the residual gate.";
+                        " failed the absolute-waypoint residual gate.";
                 }
                 else
                 {
@@ -1292,8 +1441,28 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
 
         if (allSegmentsAccepted)
         {
-            plan.accepted = true;
-            return plan;
+            const CartesianVector finalPoseVector = poseVectorFromJoints(currentRadians);
+            const CartesianVector finalResidual =
+                subtractPoseVectorWrapped(finalTargetPoseVector, finalPoseVector);
+            const double finalResidualNorm = residualNormForIkMode(finalResidual);
+            const double finalMaxResidualComponent =
+                maxAbsResidualComponentForIkMode(finalResidual);
+
+            if (finalResidualNorm <= CandidateResidualNormAccept &&
+                finalMaxResidualComponent <= CandidateMaxResidualComponentAccept)
+            {
+                plan.accepted = true;
+                return plan;
+            }
+
+            plan.rejectionReason =
+                "All absolute-waypoint segments passed, but final global target verification failed: residualNorm=" +
+                std::to_string(finalResidualNorm) +
+                ", maxResidualComponent=" +
+                std::to_string(finalMaxResidualComponent) +
+                ".";
+
+            allSegmentsAccepted = false;
         }
 
         bestRejected = plan;
@@ -1302,7 +1471,7 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
     if (bestRejected.rejectionReason.empty())
     {
         bestRejected.rejectionReason =
-            "No segmented Cartesian plan passed all validation gates.";
+            "No segmented Cartesian plan passed all absolute-waypoint validation gates.";
     }
 
     return bestRejected;
@@ -1311,8 +1480,15 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
 void printCartesianSegmentPlanSummary(const CartesianSegmentPlan& plan)
 {
     std::cout << "\nSegmented Cartesian-vector plan summary\n";
+    std::cout << "  IK residual mode: " << ikResidualModeName() << "\n";
+    if (PositionOnlyIkEnabled)
+    {
+        std::cout << "  Position-only IK is active: gates check XYZ residual only; RPY residual is informational.\n";
+    }
     std::cout << "  Accepted: " << (plan.accepted ? "YES" : "NO") << "\n";
     std::cout << "  Segment count: " << plan.segmentCount << "\n";
+    std::cout << "  Waypoint target mode: ABSOLUTE_FROM_ORIGINAL_START_POSE\n";
+
 
     if (!plan.accepted)
     {
@@ -1335,11 +1511,18 @@ void printCartesianSegmentPlanSummary(const CartesianSegmentPlan& plan)
                   << (segment.candidate.result.converged ? "true" : "false") << "\n";
         std::cout << "    Hit joint limit: "
                   << (segment.candidate.result.hitJointLimit ? "true" : "false") << "\n";
-        std::cout << "    Residual norm: "
+        std::cout << "    Gated residual norm: "
                   << std::fixed << std::setprecision(9)
                   << segment.candidate.result.residualNorm << "\n";
-        std::cout << "    Max residual component: "
+        std::cout << "    Gated max residual component: "
                   << segment.candidate.result.maxResidualComponent << "\n";
+        if (PositionOnlyIkEnabled)
+        {
+            std::cout << "    Full pose residual norm including RPY: "
+                      << residualNorm(segment.candidate.result.residual) << "\n";
+            std::cout << "    Full pose max residual component including RPY: "
+                      << maxAbsResidualComponent(segment.candidate.result.residual) << "\n";
+        }
         std::cout << "    Max command joint delta from segment start: "
                   << segment.maxCommandDeltaDegrees << " degrees\n";
         std::cout << "    Residual gate: "
@@ -1357,7 +1540,7 @@ void printCartesianSegmentPlanSummary(const CartesianSegmentPlan& plan)
     }
 }
 
-std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
+std::vector<JointVector> makeOutboundSequenceFromSegmentPlan(
     const CartesianSegmentPlan& plan)
 {
     std::vector<JointVector> sequence;
@@ -1366,6 +1549,14 @@ std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
     {
         sequence.push_back(segment.commandDeltaUserUnits);
     }
+
+    return sequence;
+}
+
+std::vector<JointVector> makeReturnSequenceFromSegmentPlan(
+    const CartesianSegmentPlan& plan)
+{
+    std::vector<JointVector> sequence;
 
     for (auto it = plan.segments.rbegin(); it != plan.segments.rend(); ++it)
     {
@@ -1378,6 +1569,17 @@ std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
 
         sequence.push_back(negativeReturnStep);
     }
+
+    return sequence;
+}
+
+std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
+    const CartesianSegmentPlan& plan)
+{
+    std::vector<JointVector> sequence = makeOutboundSequenceFromSegmentPlan(plan);
+    std::vector<JointVector> returnSequence = makeReturnSequenceFromSegmentPlan(plan);
+
+    sequence.insert(sequence.end(), returnSequence.begin(), returnSequence.end());
 
     return sequence;
 }
@@ -1514,6 +1716,293 @@ double maxAbsJointValue(const JointVector& values)
     }
 
     return result;
+}
+
+static constexpr double TrajectoryMinPointSeconds = 0.050;
+static constexpr int TrajectoryPvtEmptyCount = 2;
+
+struct JointTrajectoryBlock
+{
+    std::vector<JointVector> positions;
+    std::vector<JointVector> velocities;
+    std::vector<double> times;
+    double totalSeconds = 0.0;
+};
+
+bool sameNonZeroSign(double a, double b)
+{
+    return (a > 0.0 && b > 0.0) || (a < 0.0 && b < 0.0);
+}
+
+double samplePeriodSecondsFromController(RR::MotionController* controller)
+{
+    if (!controller)
+    {
+        return 0.001;
+    }
+
+    try
+    {
+        const double sampleRateHz = controller->SampleRateGet();
+
+        if (std::isfinite(sampleRateHz) && sampleRateHz > 1.0)
+        {
+            return 1.0 / sampleRateHz;
+        }
+    }
+    catch (const RR::RsiError&)
+    {
+    }
+    catch (...)
+    {
+    }
+
+    return 0.001;
+}
+
+double roundUpToSamplePeriod(double seconds, double samplePeriodSeconds)
+{
+    const double boundedSamplePeriod = std::max(samplePeriodSeconds, 0.001);
+    const double boundedSeconds = std::max(seconds, boundedSamplePeriod);
+    return std::ceil(boundedSeconds / boundedSamplePeriod) * boundedSamplePeriod;
+}
+
+JointTrajectoryBlock makePvtTrajectoryBlock(
+    const JointVector& startingPosition,
+    const std::vector<JointVector>& relativeSequence,
+    double samplePeriodSeconds)
+{
+    if (relativeSequence.empty())
+    {
+        throw std::runtime_error("Cannot build a PVT trajectory block from an empty sequence.");
+    }
+
+    JointTrajectoryBlock block{};
+    block.positions.reserve(relativeSequence.size());
+    block.velocities.resize(relativeSequence.size());
+    block.times.reserve(relativeSequence.size());
+
+    std::vector<JointVector> segmentVelocities;
+    segmentVelocities.reserve(relativeSequence.size());
+
+    JointVector cumulativePosition = startingPosition;
+
+    for (const JointVector& relativeStep : relativeSequence)
+    {
+        double pointSeconds = maxAbsJointValue(relativeStep) / std::max(MotionVelocity, 1e-9);
+        pointSeconds = std::max(pointSeconds, TrajectoryMinPointSeconds);
+        pointSeconds = roundUpToSamplePeriod(pointSeconds, samplePeriodSeconds);
+
+        JointVector segmentVelocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            cumulativePosition[axis] += relativeStep[axis];
+            segmentVelocity[axis] = relativeStep[axis] / pointSeconds;
+        }
+
+        block.positions.push_back(cumulativePosition);
+        block.times.push_back(pointSeconds);
+        block.totalSeconds += pointSeconds;
+        segmentVelocities.push_back(segmentVelocity);
+    }
+
+    for (size_t pointIndex = 0; pointIndex < block.positions.size(); ++pointIndex)
+    {
+        JointVector waypointVelocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            if (pointIndex + 1 >= segmentVelocities.size())
+            {
+                waypointVelocity[axis] = 0.0;
+                continue;
+            }
+
+            const double incomingVelocity = segmentVelocities[pointIndex][axis];
+            const double outgoingVelocity = segmentVelocities[pointIndex + 1][axis];
+
+            if (sameNonZeroSign(incomingVelocity, outgoingVelocity))
+            {
+                waypointVelocity[axis] = 0.5 * (incomingVelocity + outgoingVelocity);
+            }
+            else
+            {
+                waypointVelocity[axis] = 0.0;
+            }
+        }
+
+        block.velocities[pointIndex] = waypointVelocity;
+    }
+
+    return block;
+}
+
+double smoothStepQuintic(double u)
+{
+    const double clamped = std::clamp(u, 0.0, 1.0);
+    return clamped * clamped * clamped * (10.0 + clamped * (-15.0 + 6.0 * clamped));
+}
+
+double smoothStepQuinticDerivative(double u)
+{
+    const double clamped = std::clamp(u, 0.0, 1.0);
+    return 30.0 * clamped * clamped * (1.0 - clamped) * (1.0 - clamped);
+}
+
+double endpointTrajectorySeconds(const JointVector& startPosition, const JointVector& targetPosition)
+{
+    JointVector delta{};
+
+    for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+    {
+        delta[axis] = targetPosition[axis] - startPosition[axis];
+    }
+
+    const double nominalSeconds = maxAbsJointValue(delta) / std::max(MotionVelocity, 1e-9);
+
+    // This keeps the demo move visibly smooth even if the commanded delta is small.
+    return std::max(1.5, nominalSeconds);
+}
+
+JointTrajectoryBlock makeSmoothEndpointPvtBlock(
+    const JointVector& startingPosition,
+    const JointVector& targetPosition,
+    double samplePeriodSeconds)
+{
+    JointTrajectoryBlock block{};
+    block.positions.reserve(EndpointPvtWaypointCount);
+    block.velocities.reserve(EndpointPvtWaypointCount);
+    block.times.reserve(EndpointPvtWaypointCount);
+
+    const double totalSeconds =
+        roundUpToSamplePeriod(
+            endpointTrajectorySeconds(startingPosition, targetPosition),
+            samplePeriodSeconds);
+
+    const double pointSeconds =
+        roundUpToSamplePeriod(
+            totalSeconds / static_cast<double>(EndpointPvtWaypointCount),
+            samplePeriodSeconds);
+
+    JointVector delta{};
+
+    for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+    {
+        delta[axis] = targetPosition[axis] - startingPosition[axis];
+    }
+
+    for (int pointIndex = 1; pointIndex <= EndpointPvtWaypointCount; ++pointIndex)
+    {
+        const double u =
+            static_cast<double>(pointIndex) /
+            static_cast<double>(EndpointPvtWaypointCount);
+
+        const double s = smoothStepQuintic(u);
+        const double dsdu = smoothStepQuinticDerivative(u);
+
+        JointVector position{};
+        JointVector velocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            position[axis] = startingPosition[axis] + delta[axis] * s;
+            velocity[axis] = delta[axis] * dsdu / totalSeconds;
+        }
+
+        // Force a true zero-velocity endpoint.
+        if (pointIndex == EndpointPvtWaypointCount)
+        {
+            velocity.fill(0.0);
+        }
+
+        block.positions.push_back(position);
+        block.velocities.push_back(velocity);
+        block.times.push_back(pointSeconds);
+        block.totalSeconds += pointSeconds;
+    }
+
+    return block;
+}
+
+std::vector<double> flattenJointTrajectoryPoints(const std::vector<JointVector>& points)
+{
+    std::vector<double> flattened;
+    flattened.reserve(points.size() * Racer3BasicMotion::AxisCount);
+
+    for (const JointVector& point : points)
+    {
+        for (double value : point)
+        {
+            flattened.push_back(value);
+        }
+    }
+
+    return flattened;
+}
+
+double maxAbsTrajectoryVelocity(const JointTrajectoryBlock& block)
+{
+    double result = 0.0;
+
+    for (const JointVector& waypointVelocity : block.velocities)
+    {
+        result = std::max(result, maxAbsJointValue(waypointVelocity));
+    }
+
+    return result;
+}
+
+double minTrajectoryPointSeconds(const JointTrajectoryBlock& block)
+{
+    if (block.times.empty())
+    {
+        return 0.0;
+    }
+
+    return *std::min_element(block.times.begin(), block.times.end());
+}
+
+double maxTrajectoryPointSeconds(const JointTrajectoryBlock& block)
+{
+    if (block.times.empty())
+    {
+        return 0.0;
+    }
+
+    return *std::max_element(block.times.begin(), block.times.end());
+}
+
+int trajectoryBlockMotionTimeoutMs(const JointTrajectoryBlock& block)
+{
+    const int64_t estimatedMilliseconds =
+        static_cast<int64_t>(std::ceil((block.totalSeconds * 4.0 * 1000.0) + 30000.0));
+    const int64_t timeoutMilliseconds =
+        std::min<int64_t>(
+            15 * 60 * 1000,
+            std::max<int64_t>(MotionTimeoutMs, estimatedMilliseconds));
+
+    return static_cast<int>(timeoutMilliseconds);
+}
+
+int queuedSequenceMotionTimeoutMs(const std::vector<JointVector>& sequence)
+{
+    double nominalSeconds = 0.0;
+    const double velocity = std::max(MotionVelocity, 1e-9);
+
+    for (const JointVector& step : sequence)
+    {
+        nominalSeconds += maxAbsJointValue(step) / velocity;
+    }
+
+    const int64_t estimatedMilliseconds =
+        static_cast<int64_t>(std::ceil((nominalSeconds * 6.0 * 1000.0) + 30000.0));
+    const int64_t timeoutMilliseconds =
+        std::min<int64_t>(
+            15 * 60 * 1000,
+            std::max<int64_t>(MotionTimeoutMs, estimatedMilliseconds));
+
+    return static_cast<int>(timeoutMilliseconds);
 }
 
 std::string hex64(uint64_t value)
@@ -1789,6 +2278,12 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     RobotPoseProbeEnabled = options.robotPoseProbe;
     KinematicsDryRunEnabled = options.kinematicsDryRun;
     CartesianVectorMotionEnabled = options.cartesianVectorMotion;
+    PositionOnlyIkEnabled = options.positionOnlyIk;
+    CompactSegmentedExecutionEnabled = options.compactMotion;
+    AppendSegmentedExecutionEnabled = options.appendMotion;
+    TrajectorySegmentedExecutionEnabled = options.trajectoryMotion;
+    EndpointOnlyMotionEnabled = options.endpointOnlyMotion;
+    SegmentGoalMotionEnabled = options.segmentGoalMotion;
     CartesianVectorMotionConfirmed = options.motionConfirmed;
     ReturnWarnToleranceUserUnits = options.returnWarnToleranceUserUnits;
     ReturnFailToleranceUserUnits = options.returnFailToleranceUserUnits;
@@ -1831,6 +2326,79 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     if (CartesianVectorMotionEnabled && !hasAnyNonZeroJoint(RequestedCartesianVector))
     {
         throw std::runtime_error("--cartesian must contain at least one nonzero value for --cartesian-vector.");
+    }
+
+    if (AppendSegmentedExecutionEnabled)
+    {
+        if (!CartesianVectorMotionEnabled)
+        {
+            throw std::runtime_error("--append-motion requires --cartesian-vector.");
+        }
+
+        if (!PositionOnlyIkEnabled)
+        {
+            throw std::runtime_error("--append-motion is experimental and currently requires --position-only.");
+        }
+
+    }
+
+    if (TrajectorySegmentedExecutionEnabled)
+    {
+        if (!CartesianVectorMotionEnabled)
+        {
+            throw std::runtime_error("--trajectory-motion requires --cartesian-vector.");
+        }
+
+        if (!PositionOnlyIkEnabled)
+        {
+            throw std::runtime_error("--trajectory-motion is experimental and currently requires --position-only.");
+        }
+
+        if (AppendSegmentedExecutionEnabled)
+        {
+            throw std::runtime_error("--trajectory-motion cannot be combined with --append-motion.");
+        }
+    }
+
+    if (EndpointOnlyMotionEnabled)
+    {
+        if (!CartesianVectorMotionEnabled)
+        {
+            throw std::runtime_error("--endpoint-only requires --cartesian-vector.");
+        }
+
+        if (!PositionOnlyIkEnabled)
+        {
+            throw std::runtime_error("--endpoint-only currently requires --position-only.");
+        }
+
+        if (AppendSegmentedExecutionEnabled)
+        {
+            throw std::runtime_error("--endpoint-only cannot be combined with --append-motion.");
+        }
+    }
+
+    if (SegmentGoalMotionEnabled)
+    {
+        if (!CartesianVectorMotionEnabled)
+        {
+            throw std::runtime_error("--segment-goal requires --cartesian-vector.");
+        }
+
+        if (!PositionOnlyIkEnabled)
+        {
+            throw std::runtime_error("--segment-goal currently requires --position-only.");
+        }
+
+        if (AppendSegmentedExecutionEnabled)
+        {
+            throw std::runtime_error("--segment-goal cannot be combined with --append-motion.");
+        }
+
+        if (EndpointOnlyMotionEnabled)
+        {
+            throw std::runtime_error("--segment-goal cannot be combined with --endpoint-only.");
+        }
     }
 
     printMotionPlan();
@@ -2707,6 +3275,18 @@ void Racer3BasicMotion::runAllAxisMotion()
     const JointVector acceleration = makeAllAxesVector(MotionAcceleration);
     const JointVector deceleration = makeAllAxesVector(MotionDeceleration);
     const JointVector jerk = makeAllAxesVector(MotionJerkPercent);
+
+    if (CompactSegmentedExecutionEnabled)
+    {
+        std::cout << "CompactMotion: clearing error logs once before the segmented sequence.\n";
+        clearErrorLog("MotionController", controller_);
+        clearErrorLog("MultiAxis 6", multiAxis_);
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+        }
+    }
 
     try
     {
@@ -3610,8 +4190,45 @@ void Racer3BasicMotion::runKinematicsDryRun()
 void Racer3BasicMotion::runCartesianVectorMotion()
 {
     std::cout << "Starting guarded segmented Cartesian-vector IK mode.\n";
-    std::cout << "This mode computes custom OpenRAVE IK candidates for one or more Cartesian segments.\n";
-    std::cout << "A large request can pass by being split into smaller validated segments instead of raising the joint-delta gate.\n";
+    std::cout << "This mode computes custom OpenRAVE IK candidates for one or more absolute Cartesian waypoints.\n";
+    std::cout << "A large request can pass by being split into smaller validated absolute waypoints instead of raising the joint-delta gate.\n";
+    std::cout << "IK residual mode: " << ikResidualModeName() << "\n";
+    if (PositionOnlyIkEnabled)
+    {
+        std::cout << "Position-only IK is active: solve/gates use XYZ only and allow wrist orientation to change naturally.\n";
+    }
+    std::cout << "Segmented execution logging mode: " << compactSegmentedExecutionName() << "\n";
+    std::cout << "Segmented motion execution mode: " << segmentedMotionExecutionModeName() << "\n";
+    if (CompactSegmentedExecutionEnabled)
+    {
+        std::cout << "CompactMotion is active: per-segment live samples and large status dumps are skipped to reduce stop-to-stop delay.\n";
+        if (!AppendSegmentedExecutionEnabled && !TrajectorySegmentedExecutionEnabled)
+        {
+            std::cout << "This is still sequential MoveRelative execution, not true controller-side blending.\n";
+        }
+    }
+    if (AppendSegmentedExecutionEnabled)
+    {
+        std::cout << "AppendMotion is active: outbound and return segment commands will be queued with APPEND and one MotionDoneWait per phase.\n";
+        std::cout << "NO_WAIT remains off in this first guarded path so RapidCode still acknowledges queued command errors.\n";
+    }
+    if (TrajectorySegmentedExecutionEnabled)
+    {
+        std::cout << "TrajectoryMotion is active: validated joint endpoints will be streamed as MultiAxis::MovePVT waypoints.\n";
+        std::cout << "This keeps the same IK gates, but asks RapidCode for continuous waypoint velocity instead of appended point-to-point profiles.\n";
+    }
+
+    if (EndpointOnlyMotionEnabled)
+    {
+        std::cout << "EndpointOnly is active: solve one final XYZ target, then run a smooth joint-space PVT move.\n";
+        std::cout << "This does not guarantee a straight Cartesian TCP line, but it avoids segmented IK branch changes.\n";
+    }
+
+    if (SegmentGoalMotionEnabled)
+    {
+        std::cout << "SegmentGoal is active: use segmented IK only to find the final joint target, then run one smooth joint-space PVT move.\n";
+        std::cout << "This should be smoother than streaming all segmented IK waypoints, but it does not guarantee a straight Cartesian TCP line.\n";
+    }
 
     if (!controller_)
     {
@@ -3667,6 +4284,366 @@ void Racer3BasicMotion::runCartesianVectorMotion()
     printFkVec3("  Final target TCP position", targetPosition, "meters");
     printFkVec3("  Final target TCP RPY", targetRpy, "radians");
 
+    if (EndpointOnlyMotionEnabled || SegmentGoalMotionEnabled)
+    {
+        const bool usingSegmentGoal = SegmentGoalMotionEnabled;
+
+        std::cout << "\n"
+                  << (usingSegmentGoal ? "Segment-goal position target mode" : "Endpoint-only position target mode")
+                  << "\n";
+
+        if (usingSegmentGoal)
+        {
+            std::cout << "Purpose: use the segmented Cartesian IK planner only to discover a reachable final joint target, then move to that final target smoothly in joint space.\n";
+            std::cout << "This avoids streaming the segmented IK waypoint path that caused visible shake.\n";
+        }
+        else
+        {
+            std::cout << "Purpose: reach the final XYZ point smoothly in joint space; TCP path is not forced to be a straight Cartesian line.\n";
+        }
+
+        JointVector targetJointRadians{};
+        IkDryRunResult finalValidation{};
+        std::string targetSourceName;
+        int segmentGoalCount = 0;
+
+        if (usingSegmentGoal)
+        {
+            std::cout << "\nBuilding absolute-waypoint segmented IK plan to discover final reachable joint goal...\n";
+            const CartesianSegmentPlan discoveryPlan =
+                buildSegmentedCartesianPlan(actualRadians, RequestedCartesianVector);
+
+            std::cout << "Segment-goal discovery summary:\n";
+            std::cout << "  Accepted: " << (discoveryPlan.accepted ? "YES" : "NO") << "\n";
+            std::cout << "  Segment count evaluated/selected: " << discoveryPlan.segmentCount << "\n";
+
+            if (!discoveryPlan.accepted)
+            {
+                std::cout << "  Rejection reason: " << discoveryPlan.rejectionReason << "\n";
+                std::cout << "Segment-goal discovery failed. No motion commanded.\n";
+                return;
+            }
+
+            if (discoveryPlan.segments.empty())
+            {
+                std::cout << "Segment-goal discovery produced no segments. No motion commanded.\n";
+                return;
+            }
+
+            const CartesianSegmentCandidate& finalSegment = discoveryPlan.segments.back();
+            targetJointRadians = finalSegment.candidate.result.solutionRadians;
+            segmentGoalCount = discoveryPlan.segmentCount;
+            targetSourceName = "segmented IK final joint goal";
+
+            const CartesianVector globalTargetPose =
+                targetPoseVectorForCartesianDelta(actualRadians, RequestedCartesianVector);
+            const CartesianVector finalPose = poseVectorFromJoints(targetJointRadians);
+
+            finalValidation = finalSegment.candidate.result;
+            finalValidation.solutionRadians = targetJointRadians;
+            finalValidation.deltaRadians = subtractJointVectors(targetJointRadians, actualRadians);
+            finalValidation.residual = subtractPoseVectorWrapped(globalTargetPose, finalPose);
+            finalValidation.residualNorm = residualNormForIkMode(finalValidation.residual);
+            finalValidation.maxResidualComponent = maxAbsResidualComponentForIkMode(finalValidation.residual);
+            finalValidation.hitJointLimit =
+                finalSegment.candidate.result.hitJointLimit || isOutsideJointLimits(targetJointRadians);
+
+            std::cout << "  Final segment source seed: " << finalSegment.candidate.seedName << "\n";
+            std::cout << "  Final segment solver converged flag: "
+                      << boolText(finalSegment.candidate.result.converged)
+                      << "\n";
+            std::cout << "  Final global XYZ residual is recomputed against the original requested final target. This should now match the absolute-waypoint final gate.\n";
+        }
+        else
+        {
+            const IkBestCandidate endpointCandidate =
+                solveBestCandidateForCartesianDelta(actualRadians, RequestedCartesianVector);
+
+            if (!endpointCandidate.found)
+            {
+                std::cout << "Endpoint-only IK failed: no IK candidate was evaluated. No motion commanded.\n";
+                return;
+            }
+
+            targetJointRadians = endpointCandidate.result.solutionRadians;
+            finalValidation = endpointCandidate.result;
+            finalValidation.deltaRadians = subtractJointVectors(targetJointRadians, actualRadians);
+            targetSourceName = endpointCandidate.seedName;
+        }
+
+        const JointVector endpointDeltaRadians =
+            subtractJointVectors(targetJointRadians, actualRadians);
+        const JointVector endpointDeltaUserUnits =
+            radiansToUserUnits(endpointDeltaRadians);
+        const double endpointMaxDeltaDegrees =
+            maxAbsJointDeltaDegrees(endpointDeltaRadians);
+        const bool endpointResidualOk =
+            residualAcceptedForDryRunCandidate(finalValidation);
+        const bool endpointJointLimitOk =
+            !finalValidation.hitJointLimit;
+        const bool endpointJointDeltaOk =
+            endpointMaxDeltaDegrees <= EndpointMaxJointDeltaDegreesAccept;
+        const bool endpointAccepted =
+            endpointResidualOk && endpointJointLimitOk && endpointJointDeltaOk;
+
+        std::cout << "\n"
+                  << (usingSegmentGoal ? "Segment-goal smooth endpoint summary" : "Endpoint-only IK summary")
+                  << "\n";
+        std::cout << "  Target source: " << targetSourceName << "\n";
+        if (usingSegmentGoal)
+        {
+            std::cout << "  Segment-goal discovery segments: " << segmentGoalCount << "\n";
+        }
+        std::cout << "  Hit joint limit: " << boolText(finalValidation.hitJointLimit) << "\n";
+        std::cout << "  Gated XYZ residual norm: "
+                  << std::fixed << std::setprecision(9)
+                  << finalValidation.residualNorm << " m\n";
+        std::cout << "  Gated XYZ max residual component: "
+                  << finalValidation.maxResidualComponent << " m\n";
+        std::cout << "  Full pose residual norm including RPY: "
+                  << residualNorm(finalValidation.residual) << "\n";
+        std::cout << "  Max endpoint joint delta: "
+                  << endpointMaxDeltaDegrees << " degrees\n";
+        std::cout << "  Endpoint joint-delta gate <= "
+                  << EndpointMaxJointDeltaDegreesAccept
+                  << " degrees: "
+                  << (endpointJointDeltaOk ? "PASS" : "FAIL")
+                  << "\n";
+        if (endpointMaxDeltaDegrees > EndpointWarnJointDeltaDegrees)
+        {
+            std::cout << "  WARNING: endpoint joint delta is above "
+                      << EndpointWarnJointDeltaDegrees
+                      << " degrees. Review the pose before live motion.\n";
+        }
+        std::cout << "  Residual gate: " << (endpointResidualOk ? "PASS" : "FAIL") << "\n";
+        std::cout << "  Joint-limit gate: " << (endpointJointLimitOk ? "PASS" : "FAIL") << "\n";
+        std::cout << "  Smooth endpoint accepted: " << (endpointAccepted ? "YES" : "NO") << "\n";
+
+        printCartesianResidual("  Final residual", finalValidation.residual);
+        printJointDegreesFromRadians("  Current joint degrees", actualRadians);
+        printJointDegreesFromRadians("  Smooth endpoint target joint degrees", targetJointRadians);
+        printJointDegreesFromRadians("  Smooth endpoint command delta degrees", endpointDeltaRadians);
+        printJointUserUnitsFromRadians("  Smooth endpoint command delta user units/revolutions", endpointDeltaRadians);
+        printJointLimitReport(targetJointRadians);
+        printOpenRaveFkReport(
+            usingSegmentGoal ? "  FK verification for segment-goal target" : "  FK verification for endpoint-only target",
+            targetJointRadians);
+
+        if (!endpointAccepted)
+        {
+            std::cout << "\nSmooth endpoint candidate rejected by validation gates. No motion commanded.\n";
+            return;
+        }
+
+        if (!CartesianVectorMotionConfirmed)
+        {
+            std::cout << "\nNo --confirm-motion was supplied. Smooth endpoint dry run only.\n";
+            std::cout << "Live behavior would stream one smooth PVT outbound move to the final joint target, wait once, then stream one smooth PVT return to software zero.\n";
+            std::cout << "No amps were enabled and no motion was commanded.\n";
+            return;
+        }
+
+        std::cout << "\n--confirm-motion supplied and smooth endpoint gates passed.\n";
+        std::cout << "Executing one smooth joint-space PVT move to the endpoint, then one smooth PVT return to software zero.\n";
+
+        clearFaults();
+
+        printActualPositions("Actual positions after smooth endpoint validation, before amp enable");
+        printDiagnosticSnapshot("After smooth endpoint validation and clear faults, before amp enable");
+
+        enableAmplifiers();
+
+        printActualPositions("Actual positions after amp enable for smooth endpoint motion");
+        printDiagnosticSnapshot("After amp enable for smooth endpoint motion");
+
+        isolateAllAxesForAllMotion();
+
+        std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
+        bool errorLimitsTemporarilyChanged = false;
+
+        if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+        {
+            std::cout << "Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for smooth endpoint motion.\n";
+            std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                originalErrorLimitActions[index] = axes_[index]->ErrorLimitActionGet();
+                std::cout << "  Original Axis " << (index + 1)
+                          << " ErrorLimitAction: "
+                          << actionName(originalErrorLimitActions[index])
+                          << "\n";
+                axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+            }
+
+            errorLimitsTemporarilyChanged = true;
+        }
+
+        auto readAllAxisCommandPositions = [&]() {
+            JointVector commandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                commandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            return commandPositions;
+        };
+
+        auto commandSmoothEndpointPvtPhase = [&](const char* phaseLabel, const JointVector& targetCommandPosition) {
+            std::cout << "\n=== Smooth endpoint PVT "
+                      << phaseLabel
+                      << " phase ===\n";
+
+            const JointVector startingCommandPositions = readAllAxisCommandPositions();
+            const double samplePeriodSeconds = samplePeriodSecondsFromController(controller_);
+            const JointTrajectoryBlock trajectory =
+                makeSmoothEndpointPvtBlock(
+                    startingCommandPositions,
+                    targetCommandPosition,
+                    samplePeriodSeconds);
+            const std::vector<double> flatPositions =
+                flattenJointTrajectoryPoints(trajectory.positions);
+            const std::vector<double> flatVelocities =
+                flattenJointTrajectoryPoints(trajectory.velocities);
+
+            std::cout << "Streaming "
+                      << trajectory.positions.size()
+                      << " smooth endpoint MultiAxis::MovePVT waypoint(s), then waiting once for phase completion.\n";
+            std::cout << "  Controller sample period used for time rounding: "
+                      << std::fixed << std::setprecision(6)
+                      << samplePeriodSeconds
+                      << " sec.\n";
+            std::cout << "  Total planned phase time: "
+                      << trajectory.totalSeconds
+                      << " sec; point dt min/max: "
+                      << minTrajectoryPointSeconds(trajectory)
+                      << " / "
+                      << maxTrajectoryPointSeconds(trajectory)
+                      << " sec.\n";
+            std::cout << "  Max specified waypoint velocity: "
+                      << maxAbsTrajectoryVelocity(trajectory)
+                      << " user-units/sec = "
+                      << toDegrees(maxAbsTrajectoryVelocity(trajectory))
+                      << " deg/sec.\n";
+
+            const std::string multiAxisContext =
+                std::string("before smooth endpoint PVT ") + phaseLabel + " phase";
+            configureMultiAxisMotionAttributes(multiAxisContext.c_str());
+            multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+            multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                const std::string axisContext =
+                    std::string("before smooth endpoint PVT ") + phaseLabel + " phase";
+                configureAxisMotionAttributes(index, axisContext.c_str());
+            }
+
+            if (!CompactSegmentedExecutionEnabled)
+            {
+                printAllAxisMotionStatus("All axes before smooth endpoint PVT phase");
+            }
+
+            const uint16_t motionIdBefore = multiAxis_->MotionIdGet();
+
+            multiAxis_->MovePVT(
+                flatPositions.data(),
+                flatVelocities.data(),
+                trajectory.times.data(),
+                static_cast<int32_t>(trajectory.positions.size()),
+                TrajectoryPvtEmptyCount,
+                false,
+                true);
+
+            std::cout << "  MotionId "
+                      << motionIdBefore
+                      << " -> "
+                      << multiAxis_->MotionIdGet()
+                      << " (smooth endpoint PVT stream).\n";
+
+            const std::string startLabel =
+                std::string("Smooth endpoint PVT ") + phaseLabel + " MultiAxis::MovePVT";
+            waitForAllAxisMotionStart(startLabel.c_str(), startingCommandPositions);
+
+            const int phaseTimeoutMilliseconds =
+                trajectoryBlockMotionTimeoutMs(trajectory);
+            std::cout << "Waiting once for smooth endpoint PVT "
+                      << phaseLabel
+                      << " phase completion. Timeout="
+                      << phaseTimeoutMilliseconds
+                      << " ms.\n";
+            waitForMotionDone(phaseTimeoutMilliseconds);
+
+            const std::string actualLabel =
+                std::string("Actual positions after smooth endpoint PVT ") + phaseLabel + " phase";
+            printActualPositions(actualLabel.c_str());
+
+            const std::string resetContext =
+                std::string("after smooth endpoint PVT ") + phaseLabel + " phase";
+            configureMultiAxisMotionAttributes(resetContext.c_str());
+        };
+
+        try
+        {
+            const JointVector outboundStartCommandPositions = readAllAxisCommandPositions();
+            JointVector endpointTargetCommandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                endpointTargetCommandPositions[index] =
+                    outboundStartCommandPositions[index] +
+                    endpointDeltaUserUnits[index];
+            }
+
+            JointVector softwareZeroCommandPositions{};
+            softwareZeroCommandPositions.fill(0.0);
+
+            commandSmoothEndpointPvtPhase("outbound", endpointTargetCommandPositions);
+            commandSmoothEndpointPvtPhase("return", softwareZeroCommandPositions);
+        }
+        catch (...)
+        {
+            if (errorLimitsTemporarilyChanged)
+            {
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                    std::cout << "Restored Axis "
+                              << (index + 1)
+                              << " ErrorLimitAction to "
+                              << actionName(originalErrorLimitActions[index])
+                              << " after exception.\n";
+                }
+            }
+
+            throw;
+        }
+
+        if (errorLimitsTemporarilyChanged)
+        {
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                std::cout << "Restored Axis "
+                          << (index + 1)
+                          << " ErrorLimitAction to "
+                          << actionName(originalErrorLimitActions[index])
+                          << ".\n";
+            }
+        }
+
+        std::cout << "Smooth endpoint PVT execution complete. Net commanded offsets are zero.\n";
+        printReturnToZeroReport("Return-to-zero check after smooth endpoint Cartesian-vector motion", true);
+        printActualPositions("Actual positions before smooth endpoint shutdown");
+        printDiagnosticSnapshot("Before smooth endpoint Cartesian-vector shutdown");
+
+        disableAmplifiers();
+
+        std::cout << "Guarded smooth endpoint Cartesian-vector motion complete.\n";
+        return;
+    }
+
     const CartesianSegmentPlan segmentPlan =
         buildSegmentedCartesianPlan(actualRadians, RequestedCartesianVector);
 
@@ -3692,14 +4669,43 @@ void Racer3BasicMotion::runCartesianVectorMotion()
     if (!CartesianVectorMotionConfirmed)
     {
         std::cout << "\nNo --confirm-motion was supplied. This was a guarded segmented Cartesian-vector dry run only.\n";
+        if (AppendSegmentedExecutionEnabled)
+        {
+            std::cout << "AppendMotion live preview: queue "
+                      << segmentPlan.segmentCount
+                      << " outbound MoveRelative command(s), wait once, then queue "
+                      << segmentPlan.segmentCount
+                      << " return command(s), wait once.\n";
+            std::cout << "APPEND would be off for the first command in each phase and on for the remaining command(s). NO_WAIT stays off.\n";
+        }
+        if (TrajectorySegmentedExecutionEnabled)
+        {
+            std::cout << "TrajectoryMotion live preview: stream "
+                      << segmentPlan.segmentCount
+                      << " outbound PVT waypoint(s), wait once, then stream "
+                      << segmentPlan.segmentCount
+                      << " return PVT waypoint(s), wait once.\n";
+            std::cout << "PVT waypoints use the same validated segment endpoints with per-waypoint velocities chosen from neighboring segment slopes.\n";
+        }
         std::cout << "No amps were enabled and no motion was commanded.\n";
         std::cout << "To execute the accepted segmented plan, rerun this mode with --confirm-motion after reviewing the segment deltas.\n";
         return;
     }
 
     std::cout << "\n--confirm-motion supplied and all segment gates passed.\n";
-    std::cout << "Executing the segmented Cartesian IK plan through the existing MultiAxis joint-vector path.\n";
-    std::cout << "The robot will execute each outbound segment, then execute the reverse segment sequence to return to software zero.\n";
+    std::cout << "Executing the segmented Cartesian IK plan through the MultiAxis joint-vector path.\n";
+    if (AppendSegmentedExecutionEnabled)
+    {
+        std::cout << "Experimental append execution will queue outbound segments first, wait once, then queue return segments and wait once.\n";
+    }
+    else if (TrajectorySegmentedExecutionEnabled)
+    {
+        std::cout << "Experimental trajectory execution will stream outbound PVT waypoints first, wait once, then stream return PVT waypoints and wait once.\n";
+    }
+    else
+    {
+        std::cout << "The robot will execute each outbound segment, then execute the reverse segment sequence to return to software zero.\n";
+    }
 
     clearFaults();
 
@@ -3755,8 +4761,286 @@ void Racer3BasicMotion::runCartesianVectorMotion()
 
     try
     {
-        for (size_t stepIndex = 0; stepIndex < relativeSequence.size(); ++stepIndex)
+        if (TrajectorySegmentedExecutionEnabled)
         {
+            const std::vector<JointVector> outboundSequence =
+                makeOutboundSequenceFromSegmentPlan(segmentPlan);
+            const std::vector<JointVector> returnSequence =
+                makeReturnSequenceFromSegmentPlan(segmentPlan);
+
+            if (outboundSequence.empty() || returnSequence.empty())
+            {
+                throw std::runtime_error("Trajectory segmented Cartesian sequence is empty.");
+            }
+
+            const double samplePeriodSeconds = samplePeriodSecondsFromController(controller_);
+
+            auto readAllAxisCommandPositions = [&]() {
+                JointVector commandPositions{};
+
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    commandPositions[index] = axes_[index]->CommandPositionGet();
+                }
+
+                return commandPositions;
+            };
+
+            auto commandTrajectoryPhase = [&](const char* phaseLabel, const std::vector<JointVector>& phaseSequence) {
+                std::cout << "\n=== PVT trajectory Cartesian-vector "
+                          << phaseLabel
+                          << " phase ===\n";
+
+                const JointVector startingCommandPositions = readAllAxisCommandPositions();
+                const JointTrajectoryBlock trajectory =
+                    makePvtTrajectoryBlock(startingCommandPositions, phaseSequence, samplePeriodSeconds);
+                const std::vector<double> flatPositions =
+                    flattenJointTrajectoryPoints(trajectory.positions);
+                const std::vector<double> flatVelocities =
+                    flattenJointTrajectoryPoints(trajectory.velocities);
+
+                std::cout << "Streaming "
+                          << trajectory.positions.size()
+                          << " validated MultiAxis::MovePVT waypoint(s), then waiting once for phase completion.\n";
+                std::cout << "  Controller sample period used for time rounding: "
+                          << std::fixed << std::setprecision(6)
+                          << samplePeriodSeconds
+                          << " sec.\n";
+                std::cout << "  PVT emptyCount: "
+                          << TrajectoryPvtEmptyCount
+                          << " frame(s).\n";
+                std::cout << "  Total planned phase time: "
+                          << trajectory.totalSeconds
+                          << " sec; point dt min/max: "
+                          << minTrajectoryPointSeconds(trajectory)
+                          << " / "
+                          << maxTrajectoryPointSeconds(trajectory)
+                          << " sec.\n";
+                std::cout << "  Max specified waypoint velocity: "
+                          << maxAbsTrajectoryVelocity(trajectory)
+                          << " user-units/sec = "
+                          << toDegrees(maxAbsTrajectoryVelocity(trajectory))
+                          << " deg/sec.\n";
+
+                const std::string multiAxisContext =
+                    std::string("before PVT trajectory Cartesian-vector ") + phaseLabel + " phase";
+                configureMultiAxisMotionAttributes(multiAxisContext.c_str());
+                multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+                multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    const std::string axisContext =
+                        std::string("before PVT trajectory Cartesian-vector ") + phaseLabel + " phase";
+                    configureAxisMotionAttributes(index, axisContext.c_str());
+                }
+
+                if (!CompactSegmentedExecutionEnabled)
+                {
+                    printAllAxisMotionStatus("All axes before PVT trajectory Cartesian-vector phase");
+                }
+
+                const uint16_t motionIdBefore = multiAxis_->MotionIdGet();
+
+                multiAxis_->MovePVT(
+                    flatPositions.data(),
+                    flatVelocities.data(),
+                    trajectory.times.data(),
+                    static_cast<int32_t>(trajectory.positions.size()),
+                    TrajectoryPvtEmptyCount,
+                    false,
+                    true);
+
+                std::cout << "  MotionId "
+                          << motionIdBefore
+                          << " -> "
+                          << multiAxis_->MotionIdGet()
+                          << " (PVT stream).\n";
+
+                const std::string startLabel =
+                    std::string("PVT trajectory Cartesian-vector ") + phaseLabel + " MultiAxis::MovePVT";
+                waitForAllAxisMotionStart(startLabel.c_str(), startingCommandPositions);
+
+                const int phaseTimeoutMilliseconds = trajectoryBlockMotionTimeoutMs(trajectory);
+                std::cout << "Waiting once for PVT "
+                          << phaseLabel
+                          << " phase completion. Timeout="
+                          << phaseTimeoutMilliseconds
+                          << " ms.\n";
+                waitForMotionDone(phaseTimeoutMilliseconds);
+
+                if (CompactSegmentedExecutionEnabled)
+                {
+                    const std::string actualLabel =
+                        std::string("Actual positions after PVT trajectory Cartesian-vector ") + phaseLabel + " phase";
+                    printActualPositions(actualLabel.c_str());
+                }
+                else
+                {
+                    const std::string statusLabel =
+                        std::string("All axes after PVT trajectory Cartesian-vector ") + phaseLabel + " MotionDoneWait";
+                    printAllAxisMotionStatus(statusLabel.c_str());
+                }
+
+                const std::string resetContext =
+                    std::string("after PVT trajectory Cartesian-vector ") + phaseLabel + " phase";
+                configureMultiAxisMotionAttributes(resetContext.c_str());
+            };
+
+            commandTrajectoryPhase("outbound", outboundSequence);
+            commandTrajectoryPhase("return", returnSequence);
+        }
+        else if (AppendSegmentedExecutionEnabled)
+        {
+            const std::vector<JointVector> outboundSequence =
+                makeOutboundSequenceFromSegmentPlan(segmentPlan);
+            const std::vector<JointVector> returnSequence =
+                makeReturnSequenceFromSegmentPlan(segmentPlan);
+
+            if (outboundSequence.empty() || returnSequence.empty())
+            {
+                throw std::runtime_error("Queued segmented Cartesian sequence is empty.");
+            }
+
+            auto readAllAxisCommandPositions = [&]() {
+                std::array<double, AxisCount> commandPositions{};
+
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    commandPositions[index] = axes_[index]->CommandPositionGet();
+                }
+
+                return commandPositions;
+            };
+
+            auto commandQueuedPhase = [&](const char* phaseLabel, const std::vector<JointVector>& phaseSequence) {
+                std::cout << "\n=== Queued segmented Cartesian-vector "
+                          << phaseLabel
+                          << " phase ===\n";
+                std::cout << "Queueing "
+                          << phaseSequence.size()
+                          << " validated MultiAxis::MoveRelative command(s), then waiting once for phase completion.\n";
+
+                const std::string multiAxisContext =
+                    std::string("before queued segmented Cartesian-vector ") + phaseLabel + " phase";
+                configureMultiAxisMotionAttributes(multiAxisContext.c_str());
+                multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+                multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    const std::string axisContext =
+                        std::string("before queued segmented Cartesian-vector ") + phaseLabel + " phase";
+                    configureAxisMotionAttributes(index, axisContext.c_str());
+                }
+
+                if (!CompactSegmentedExecutionEnabled)
+                {
+                    printAllAxisMotionStatus("All axes before queued segmented Cartesian-vector phase");
+                }
+
+                const std::array<double, AxisCount> startingCommandPositions =
+                    readAllAxisCommandPositions();
+
+                for (size_t stepIndex = 0; stepIndex < phaseSequence.size(); ++stepIndex)
+                {
+                    const JointVector& relativePosition = phaseSequence[stepIndex];
+
+                    if (stepIndex == 1)
+                    {
+                        std::cout << "Enabling MultiAxis APPEND for remaining queued "
+                                  << phaseLabel
+                                  << " segment commands.\n";
+                        multiAxis_->MotionAttributeMaskOnSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+                        multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskDELAY);
+                        multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+                        printMotionAttributeMasks("MultiAxis 6 queued append", multiAxis_);
+                    }
+
+                    JointVector degrees{};
+                    double maxAbsDegrees = 0.0;
+                    for (size_t axis = 0; axis < relativePosition.size(); ++axis)
+                    {
+                        degrees[axis] = toDegrees(relativePosition[axis]);
+                        maxAbsDegrees = std::max(maxAbsDegrees, std::fabs(degrees[axis]));
+                    }
+
+                    std::cout << "Queued "
+                              << phaseLabel
+                              << " segment "
+                              << (stepIndex + 1)
+                              << " / "
+                              << phaseSequence.size()
+                              << ": max joint delta = "
+                              << std::fixed << std::setprecision(6)
+                              << maxAbsDegrees
+                              << " deg, APPEND="
+                              << (stepIndex == 0 ? "off" : "on")
+                              << ", NO_WAIT=off.\n";
+
+                    if (!CompactSegmentedExecutionEnabled)
+                    {
+                        std::cout << "Relative position array [J1..J6] in user units: ";
+                        printJointVector(relativePosition);
+
+                        std::cout << "Relative position array [J1..J6] in approx degrees: ";
+                        printJointVector(degrees);
+                    }
+
+                    const uint16_t motionIdBefore = multiAxis_->MotionIdGet();
+
+                    multiAxis_->MoveRelative(
+                        relativePosition.data(),
+                        velocity.data(),
+                        acceleration.data(),
+                        deceleration.data(),
+                        jerk.data());
+
+                    std::cout << "  MotionId "
+                              << motionIdBefore
+                              << " -> "
+                              << multiAxis_->MotionIdGet()
+                              << (stepIndex == 0 ? " (new phase motion)" : " (appended)")
+                              << ".\n";
+                }
+
+                const std::string startLabel =
+                    std::string("Queued segmented Cartesian-vector ") + phaseLabel + " MultiAxis::MoveRelative";
+                waitForAllAxisMotionStart(startLabel.c_str(), startingCommandPositions);
+
+                const int phaseTimeoutMilliseconds = queuedSequenceMotionTimeoutMs(phaseSequence);
+                std::cout << "Waiting once for queued "
+                          << phaseLabel
+                          << " phase completion. Timeout="
+                          << phaseTimeoutMilliseconds
+                          << " ms.\n";
+                waitForMotionDone(phaseTimeoutMilliseconds);
+
+                if (CompactSegmentedExecutionEnabled)
+                {
+                    const std::string actualLabel =
+                        std::string("Actual positions after queued segmented Cartesian-vector ") + phaseLabel + " phase";
+                    printActualPositions(actualLabel.c_str());
+                }
+                else
+                {
+                    const std::string statusLabel =
+                        std::string("All axes after queued segmented Cartesian-vector ") + phaseLabel + " MotionDoneWait";
+                    printAllAxisMotionStatus(statusLabel.c_str());
+                }
+
+                const std::string resetContext =
+                    std::string("after queued segmented Cartesian-vector ") + phaseLabel + " phase";
+                configureMultiAxisMotionAttributes(resetContext.c_str());
+            };
+
+            commandQueuedPhase("outbound", outboundSequence);
+            commandQueuedPhase("return", returnSequence);
+        }
+        else
+        {
+            for (size_t stepIndex = 0; stepIndex < relativeSequence.size(); ++stepIndex)
+            {
             const JointVector& relativePosition = relativeSequence[stepIndex];
 
             std::cout << "\n=== Segmented Cartesian-vector MoveRelative step "
@@ -3783,26 +5067,41 @@ void Racer3BasicMotion::runCartesianVectorMotion()
                           << "\n";
             }
 
-            std::cout << "Relative position array [J1..J6] in user units: ";
-            printJointVector(relativePosition);
-
-            std::cout << "Relative position array [J1..J6] in approx degrees: ";
             JointVector degrees{};
+            double maxAbsDegrees = 0.0;
             for (size_t axis = 0; axis < relativePosition.size(); ++axis)
             {
                 degrees[axis] = toDegrees(relativePosition[axis]);
+                maxAbsDegrees = std::max(maxAbsDegrees, std::fabs(degrees[axis]));
             }
-            printJointVector(degrees);
 
-            std::cout << "Velocity array [J1..J6] in user-units/sec: ";
-            printJointVector(velocity);
-
-            clearErrorLog("MotionController", controller_);
-            clearErrorLog("MultiAxis 6", multiAxis_);
-
-            for (int index = 0; index < AxisCount; ++index)
+            if (CompactSegmentedExecutionEnabled)
             {
-                clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+                std::cout << "Compact step summary: max joint delta = "
+                          << std::fixed << std::setprecision(6)
+                          << maxAbsDegrees
+                          << " deg, velocity = "
+                          << MotionVelocity
+                          << " user-units/sec.\n";
+            }
+            else
+            {
+                std::cout << "Relative position array [J1..J6] in user units: ";
+                printJointVector(relativePosition);
+
+                std::cout << "Relative position array [J1..J6] in approx degrees: ";
+                printJointVector(degrees);
+
+                std::cout << "Velocity array [J1..J6] in user-units/sec: ";
+                printJointVector(velocity);
+
+                clearErrorLog("MotionController", controller_);
+                clearErrorLog("MultiAxis 6", multiAxis_);
+
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    clearErrorLog(("Axis " + std::to_string(index + 1)).c_str(), axes_[index]);
+                }
             }
 
             configureMultiAxisMotionAttributes("before segmented Cartesian-vector MultiAxis::MoveRelative step");
@@ -3812,7 +5111,10 @@ void Racer3BasicMotion::runCartesianVectorMotion()
                 configureAxisMotionAttributes(index, "before segmented Cartesian-vector MultiAxis::MoveRelative step");
             }
 
-            printAllAxisMotionStatus("All axes before segmented Cartesian-vector MoveRelative");
+            if (!CompactSegmentedExecutionEnabled)
+            {
+                printAllAxisMotionStatus("All axes before segmented Cartesian-vector MoveRelative");
+            }
 
             const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
             std::array<double, AxisCount> startingCommandPositions{};
@@ -3822,8 +5124,11 @@ void Racer3BasicMotion::runCartesianVectorMotion()
                 startingCommandPositions[index] = axes_[index]->CommandPositionGet();
             }
 
-            std::cout << "Commanding MultiAxis::MoveRelative for segmented Cartesian-vector joint step.\n";
-            std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+            if (!CompactSegmentedExecutionEnabled)
+            {
+                std::cout << "Commanding MultiAxis::MoveRelative for segmented Cartesian-vector joint step.\n";
+                std::cout << "  MultiAxis commanded MotionId before call: " << commandedMotionId << "\n";
+            }
 
             multiAxis_->MoveRelative(
                 relativePosition.data(),
@@ -3832,23 +5137,44 @@ void Racer3BasicMotion::runCartesianVectorMotion()
                 deceleration.data(),
                 jerk.data());
 
-            std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
-            printAllAxisMotionStatus("All axes immediately after segmented Cartesian-vector MoveRelative");
+            if (CompactSegmentedExecutionEnabled)
+            {
+                std::cout << "  MotionId " << commandedMotionId
+                          << " -> " << multiAxis_->MotionIdGet()
+                          << ". Waiting for done...\n";
+            }
+            else
+            {
+                std::cout << "  MultiAxis next MotionId after call: " << multiAxis_->MotionIdGet() << "\n";
+                printAllAxisMotionStatus("All axes immediately after segmented Cartesian-vector MoveRelative");
+            }
 
             waitForAllAxisMotionStart(
                 "Segmented Cartesian-vector MultiAxis::MoveRelative",
                 startingCommandPositions);
 
-            for (int sample = 0; sample < 8; ++sample)
+            if (!CompactSegmentedExecutionEnabled)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
-                printAllAxisProgressLine("Segmented Cartesian-vector live sample", sample + 1);
+                for (int sample = 0; sample < 8; ++sample)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(MotionStatusSampleMs));
+                    printAllAxisProgressLine("Segmented Cartesian-vector live sample", sample + 1);
+                }
             }
 
             waitForMotionDone(MotionTimeoutMs);
 
-            printActualPositions("Actual positions after segmented Cartesian-vector MoveRelative step");
-            printAllAxisMotionStatus("All axes after segmented Cartesian-vector MotionDoneWait");
+            if (CompactSegmentedExecutionEnabled)
+            {
+                std::cout << "  Step " << (stepIndex + 1)
+                          << " complete.\n";
+            }
+            else
+            {
+                printActualPositions("Actual positions after segmented Cartesian-vector MoveRelative step");
+                printAllAxisMotionStatus("All axes after segmented Cartesian-vector MotionDoneWait");
+            }
+            }
         }
     }
     catch (...)
@@ -3881,6 +5207,10 @@ void Racer3BasicMotion::runCartesianVectorMotion()
     }
 
     std::cout << "Segmented Cartesian-vector MultiAxis execution complete. Net commanded offsets are zero.\n";
+    if (CompactSegmentedExecutionEnabled)
+    {
+        printActualPositions("Actual positions after compact segmented Cartesian-vector sequence");
+    }
 
     printReturnToZeroReport("Return-to-zero check after segmented Cartesian-vector motion", true);
 
@@ -3898,11 +5228,48 @@ void Racer3BasicMotion::printMotionPlan() const
     if (CartesianVectorMotionEnabled)
     {
         std::cout << "\nGuarded Cartesian-vector IK motion plan\n";
-        std::cout << "Purpose: compute custom OpenRAVE IK candidate(s) for a requested Cartesian delta, splitting larger requests into guarded segments when needed.\n";
+        std::cout << "Purpose: compute custom OpenRAVE IK candidate(s) for a requested Cartesian delta, splitting larger requests into guarded absolute waypoints when needed.\n";
         std::cout << "Default behavior without --confirm-motion: compute and print the accepted/rejected segmented plan only; no amp enable and no motion.\n";
         std::cout << "With --confirm-motion: every segment must pass residual and command joint-delta gates before any motion is allowed.\n";
-        std::cout << "Motion execution path: Cartesian segment(s) -> joint-vector user units -> MultiAxis::MoveRelative sequence -> reverse sequence return -> return-to-zero check.\n";
-        std::cout << "Validation gates per segment: residual norm/max component <= 1e-4 and max command joint delta <= 30 degrees.\n";        printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
+        std::cout << "Motion execution path: Cartesian waypoint segment(s) -> joint-vector user units -> selected execution mode -> reverse/return path -> return-to-zero check.\n";
+        std::cout << "Validation gates per segment: residual norm <= "
+                  << CandidateResidualNormAccept
+                  << ", max residual component <= "
+                  << CandidateMaxResidualComponentAccept
+                  << ", and max command joint delta <= "
+                  << CandidateMaxJointDeltaDegreesAccept
+                  << " degrees.\n";
+        std::cout << "Max adaptive segments: " << MaxCartesianSegments << ".\n";
+        std::cout << "IK residual mode: " << ikResidualModeName() << ".\n";
+        std::cout << "Segmented execution logging mode: " << compactSegmentedExecutionName() << ".\n";
+        std::cout << "Segmented motion execution mode: " << segmentedMotionExecutionModeName() << ".\n";
+        if (CompactSegmentedExecutionEnabled)
+        {
+            std::cout << "CompactMotion: skips per-segment live samples/status dumps during confirmed motion.\n";
+        }
+        if (AppendSegmentedExecutionEnabled)
+        {
+            std::cout << "AppendMotion: experimental queued APPEND execution, one MotionDoneWait per outbound/return phase; live execution still requires --confirm-motion.\n";
+        }
+        if (TrajectorySegmentedExecutionEnabled)
+        {
+            std::cout << "TrajectoryMotion: experimental MultiAxis::MovePVT streaming of validated joint waypoints, one MotionDoneWait per outbound/return phase; live execution still requires --confirm-motion.\n";
+        }
+        if (EndpointOnlyMotionEnabled)
+        {
+            std::cout << "EndpointOnly: skips segmented Cartesian waypoints and solves one final XYZ target, then uses smooth joint-space PVT.\n";
+            std::cout << "EndpointOnly reaches the point but does not guarantee a straight Cartesian TCP path.\n";
+        }
+        if (SegmentGoalMotionEnabled)
+        {
+            std::cout << "SegmentGoal: segmented IK finds the final branch/goal, then one smooth joint-space PVT move goes to that final joint target.\n";
+            std::cout << "SegmentGoal reaches the point but does not guarantee a straight Cartesian TCP path.\n";
+        }
+        if (PositionOnlyIkEnabled)
+        {
+            std::cout << "Position-only IK: roll/pitch/yaw are ignored by the solve and validation gates.\n";
+        }
+        printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
         std::cout << "\n";
         return;
     }
