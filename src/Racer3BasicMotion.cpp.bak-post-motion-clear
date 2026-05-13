@@ -2898,93 +2898,6 @@ void Racer3BasicMotion::clearFaults()
     std::this_thread::sleep_for(std::chrono::milliseconds(FaultClearSettleMs));
 }
 
-void Racer3BasicMotion::clearFaultsAfterCompletedMotion(const char* context) noexcept
-{
-    const char* label = context ? context : "completed motion";
-    std::cout << "Clearing faults after "
-              << label
-              << " before final program exit...\n";
-
-    bool warning = false;
-
-    if (multiAxis_)
-    {
-        try
-        {
-            multiAxis_->ClearFaults();
-            std::cout << "  MultiAxis 6 post-motion fault clear sent.\n";
-        }
-        catch (const RR::RsiError& error)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw RapidCode error: "
-                      << error.text
-                      << " ("
-                      << error.functionName
-                      << ")\n";
-        }
-        catch (const std::exception& error)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw exception: "
-                      << error.what()
-                      << "\n";
-        }
-        catch (...)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw unknown exception.\n";
-        }
-    }
-
-    for (int index = 0; index < AxisCount; ++index)
-    {
-        if (!axes_[index])
-        {
-            continue;
-        }
-
-        try
-        {
-            axes_[index]->ClearFaults();
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear sent.\n";
-        }
-        catch (const RR::RsiError& error)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw RapidCode error: "
-                      << error.text
-                      << " ("
-                      << error.functionName
-                      << ")\n";
-        }
-        catch (const std::exception& error)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw exception: "
-                      << error.what()
-                      << "\n";
-        }
-        catch (...)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw unknown exception.\n";
-        }
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(FaultClearSettleMs));
-
-    std::cout << "Post-motion fault clear complete"
-              << (warning ? " with warnings.\n" : ".\n");
-}
 void Racer3BasicMotion::enableAmplifiers()
 {
     std::cout << "Enabling amplifiers bottom-to-top through individual Axis 1..6 objects, then verifying MultiAxis 6...\n";
@@ -4807,7 +4720,6 @@ void Racer3BasicMotion::runCartesianVectorMotion()
         printDiagnosticSnapshot("Before smooth endpoint Cartesian-vector shutdown");
 
         disableAmplifiers();
-        clearFaultsAfterCompletedMotion("smooth endpoint Cartesian-vector motion");
 
         std::cout << "Guarded smooth endpoint Cartesian-vector motion complete.\n";
         return;
@@ -5387,7 +5299,6 @@ void Racer3BasicMotion::runCartesianVectorMotion()
     printDiagnosticSnapshot("Before Cartesian-vector shutdown");
 
     disableAmplifiers();
-    clearFaultsAfterCompletedMotion("segmented Cartesian-vector motion");
 
     std::cout << "Guarded segmented Cartesian-vector motion complete.\n";
 }

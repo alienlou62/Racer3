@@ -63,7 +63,6 @@ private:
     void isolateAxis5And6ForDualMotion();
     void isolateAllAxesForAllMotion();
     void clearFaults();
-    void clearFaultsAfterCompletedMotion(const char* context) noexcept;
     void enableAmplifiers();
     void enableOnlyTest();
     void runTinyMotion();

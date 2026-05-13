@@ -2898,200 +2898,32 @@ void Racer3BasicMotion::clearFaults()
     std::this_thread::sleep_for(std::chrono::milliseconds(FaultClearSettleMs));
 }
 
-void Racer3BasicMotion::clearFaultsAfterCompletedMotion(const char* context) noexcept
-{
-    const char* label = context ? context : "completed motion";
-    std::cout << "Clearing faults after "
-              << label
-              << " before final program exit...\n";
-
-    bool warning = false;
-
-    if (multiAxis_)
-    {
-        try
-        {
-            multiAxis_->ClearFaults();
-            std::cout << "  MultiAxis 6 post-motion fault clear sent.\n";
-        }
-        catch (const RR::RsiError& error)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw RapidCode error: "
-                      << error.text
-                      << " ("
-                      << error.functionName
-                      << ")\n";
-        }
-        catch (const std::exception& error)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw exception: "
-                      << error.what()
-                      << "\n";
-        }
-        catch (...)
-        {
-            warning = true;
-            std::cout << "  MultiAxis 6 post-motion fault clear threw unknown exception.\n";
-        }
-    }
-
-    for (int index = 0; index < AxisCount; ++index)
-    {
-        if (!axes_[index])
-        {
-            continue;
-        }
-
-        try
-        {
-            axes_[index]->ClearFaults();
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear sent.\n";
-        }
-        catch (const RR::RsiError& error)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw RapidCode error: "
-                      << error.text
-                      << " ("
-                      << error.functionName
-                      << ")\n";
-        }
-        catch (const std::exception& error)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw exception: "
-                      << error.what()
-                      << "\n";
-        }
-        catch (...)
-        {
-            warning = true;
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " post-motion fault clear threw unknown exception.\n";
-        }
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(FaultClearSettleMs));
-
-    std::cout << "Post-motion fault clear complete"
-              << (warning ? " with warnings.\n" : ".\n");
-}
 void Racer3BasicMotion::enableAmplifiers()
 {
-    std::cout << "Enabling amplifiers bottom-to-top through individual Axis 1..6 objects, then verifying MultiAxis 6...\n";
+    std::cout << "Enabling amplifiers through MultiAxis 6...\n";
 
     if (!multiAxis_)
     {
         throw std::runtime_error("MultiAxis object is not initialized.");
     }
 
-    for (int index = 0; index < AxisCount; ++index)
-    {
-        if (!axes_[index])
-        {
-            throw std::runtime_error("Axis object " + std::to_string(index + 1) + " is not initialized.");
-        }
-    }
-
     std::cout << "Using overrideRestrictedState="
               << (OverrideRestrictedStateForEnable ? "true" : "false")
               << ".\n";
 
-    std::cout << "Clearing MultiAxis 6 faults before ordered individual axis enable...\n";
-    multiAxis_->ClearFaults();
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    const int result = multiAxis_->AmpEnableSet(
+        true,
+        AmpEnableTimeoutMs,
+        OverrideRestrictedStateForEnable);
 
-    for (int index = 0; index < AxisCount; ++index)
+    if (!multiAxis_->AmpEnableGet())
     {
-        std::cout << "Clearing faults and enabling hardware Axis "
-                  << index
-                  << " / RapidCode Axis "
-                  << (index + 1)
-                  << "...\n";
-
-        try
-        {
-            axes_[index]->ClearFaults();
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-            const int result = axes_[index]->AmpEnableSet(
-                true,
-                AmpEnableTimeoutMs,
-                OverrideRestrictedStateForEnable);
-
-            if (!axes_[index]->AmpEnableGet())
-            {
-                printAllAxisMotionStatus("All-axis status after individual axis AmpEnableGet false");
-                throw std::runtime_error(
-                    "Axis " + std::to_string(index + 1) +
-                    " AmpEnableSet returned but AmpEnableGet is false.");
-            }
-
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " amp enable confirmed. AmpEnableSet returned "
-                      << result
-                      << " ms.\n";
-        }
-        catch (const RR::RsiError& error)
-        {
-            std::cout << "  Axis "
-                      << (index + 1)
-                      << " amp enable threw RapidCode error: "
-                      << error.text
-                      << " ("
-                      << error.functionName
-                      << ")\n";
-            printAllAxisMotionStatus("All-axis status after individual axis AmpEnableSet exception");
-            throw;
-        }
-
-        // Give the fieldbus/drive state a short chance to settle before enabling
-        // the next drive. This is intentionally conservative because intermittent
-        // AMP_ACTIVE timeouts were observed when enabling the whole MultiAxis group at once.
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        throw std::runtime_error("AmpEnableSet failed or timed out.");
     }
 
-    std::cout << "All individual axes report amp enabled. Verifying MultiAxis 6 amp-active state...\n";
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    try
-    {
-        const int result = multiAxis_->AmpEnableSet(
-            true,
-            AmpEnableTimeoutMs,
-            OverrideRestrictedStateForEnable);
-
-        if (!multiAxis_->AmpEnableGet())
-        {
-            printAllAxisMotionStatus("All-axis status after MultiAxis AmpEnableGet false");
-            throw std::runtime_error("MultiAxis 6 AmpEnableSet returned but AmpEnableGet is false.");
-        }
-
-        std::cout << "MultiAxis 6 amp enable confirmed after ordered individual enable. AmpEnableSet returned "
-                  << result
-                  << " ms. Waiting briefly for drives to settle...\n";
-    }
-    catch (const RR::RsiError& error)
-    {
-        std::cout << "MultiAxis 6 amp enable verification threw RapidCode error after individual axes were enabled: "
-                  << error.text
-                  << " ("
-                  << error.functionName
-                  << ")\n";
-        printAllAxisMotionStatus("All-axis status after MultiAxis verification exception");
-        throw;
-    }
-
+    std::cout << "Amplifier enable confirmed. AmpEnableSet returned "
+              << result
+              << " ms. Waiting briefly for drives to settle...\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
 }
 
@@ -4807,7 +4639,6 @@ void Racer3BasicMotion::runCartesianVectorMotion()
         printDiagnosticSnapshot("Before smooth endpoint Cartesian-vector shutdown");
 
         disableAmplifiers();
-        clearFaultsAfterCompletedMotion("smooth endpoint Cartesian-vector motion");
 
         std::cout << "Guarded smooth endpoint Cartesian-vector motion complete.\n";
         return;
@@ -5387,7 +5218,6 @@ void Racer3BasicMotion::runCartesianVectorMotion()
     printDiagnosticSnapshot("Before Cartesian-vector shutdown");
 
     disableAmplifiers();
-    clearFaultsAfterCompletedMotion("segmented Cartesian-vector motion");
 
     std::cout << "Guarded segmented Cartesian-vector motion complete.\n";
 }
