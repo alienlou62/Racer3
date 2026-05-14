@@ -2,12 +2,12 @@
   "repoRoot": "",
   "launcherScript": ".\\scripts\\start-racer3-rmp-and-run.ps1",
   "powerShellPath": "powershell",
-  "defaultVelocity": 0.03,
-  "defaultShapeSizeMeters": 0.10,
+  "defaultVelocity": 0.04,
+  "defaultShapeSizeMeters": 0.05,
   "defaultCenter": {
-    "x": 0.45,
+    "x": 0.50,
     "y": 0.0,
-    "z": -0.60,
+    "z": -0.55,
     "roll": 0.0,
     "pitch": 0.0,
     "yaw": 0.0

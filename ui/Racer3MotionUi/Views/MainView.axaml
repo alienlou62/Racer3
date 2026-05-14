@@ -158,11 +158,11 @@
                     </StackPanel>
                     <StackPanel Grid.Column="1" Spacing="6" Margin="12,0,0,0">
                         <TextBlock Text="Size / Radius m" Classes="Label"/>
-                        <TextBox Text="{Binding ShapeSizeMeters, Mode=TwoWay}" Watermark="0.10"/>
+                        <TextBox Text="{Binding ShapeSizeMeters, Mode=TwoWay}" Watermark="0.05"/>
                     </StackPanel>
                 </Grid>
 
-                <TextBlock Text="Center Point m" Classes="Label"/>
+                <TextBlock Text="Center Point m (X fixed, shape varies Y/Z)" Classes="Label"/>
                 <Grid ColumnDefinitions="*,*,*">
                     <TextBox Text="{Binding CenterX, Mode=TwoWay}" Watermark="X" Margin="0,0,5,0"/>
                     <TextBox Grid.Column="1" Text="{Binding CenterY, Mode=TwoWay}" Watermark="Y" Margin="5,0,5,0"/>

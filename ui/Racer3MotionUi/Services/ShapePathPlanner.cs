@@ -15,17 +15,17 @@ public sealed class ShapePathPlanner : IShapePathPlanner
 
         var waypoints = shape switch
         {
-            ShapeKind.Circle => CreateRadialShape(center, sizeMeters, 16),
-            ShapeKind.Square => CreateSquare(center, sizeMeters),
-            ShapeKind.Triangle => CreateRadialShape(center, sizeMeters, 3, startAngleRadians: -Math.PI / 2.0),
-            ShapeKind.Hexagon => CreateRadialShape(center, sizeMeters, 6),
+            ShapeKind.Circle => CreateRadialShapeInYzPlane(center, sizeMeters, 16),
+            ShapeKind.Square => CreateSquareInYzPlane(center, sizeMeters),
+            ShapeKind.Triangle => CreateRadialShapeInYzPlane(center, sizeMeters, 3, startAngleRadians: -Math.PI / 2.0),
+            ShapeKind.Hexagon => CreateRadialShapeInYzPlane(center, sizeMeters, 6),
             _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unsupported shape.")
         };
 
         return new ShapeTracePlan(shape, center, sizeMeters, waypoints);
     }
 
-    private static IReadOnlyList<CartesianPose> CreateRadialShape(
+    private static IReadOnlyList<CartesianPose> CreateRadialShapeInYzPlane(
         CartesianPose center,
         double radius,
         int segments,
@@ -36,9 +36,9 @@ public sealed class ShapePathPlanner : IShapePathPlanner
         {
             var angle = startAngleRadians + (2.0 * Math.PI * index / segments);
             points.Add(new CartesianPose(
-                center.X + radius * Math.Cos(angle),
-                center.Y + radius * Math.Sin(angle),
-                center.Z,
+                center.X,
+                center.Y + radius * Math.Cos(angle),
+                center.Z + radius * Math.Sin(angle),
                 center.Roll,
                 center.Pitch,
                 center.Yaw));
@@ -48,15 +48,15 @@ public sealed class ShapePathPlanner : IShapePathPlanner
         return points;
     }
 
-    private static IReadOnlyList<CartesianPose> CreateSquare(CartesianPose center, double halfSideMeters)
+    private static IReadOnlyList<CartesianPose> CreateSquareInYzPlane(CartesianPose center, double halfSideMeters)
     {
         var points = new List<CartesianPose>
         {
-            new(center.X - halfSideMeters, center.Y - halfSideMeters, center.Z, center.Roll, center.Pitch, center.Yaw),
-            new(center.X + halfSideMeters, center.Y - halfSideMeters, center.Z, center.Roll, center.Pitch, center.Yaw),
-            new(center.X + halfSideMeters, center.Y + halfSideMeters, center.Z, center.Roll, center.Pitch, center.Yaw),
-            new(center.X - halfSideMeters, center.Y + halfSideMeters, center.Z, center.Roll, center.Pitch, center.Yaw),
-            new(center.X - halfSideMeters, center.Y - halfSideMeters, center.Z, center.Roll, center.Pitch, center.Yaw)
+            new(center.X, center.Y - halfSideMeters, center.Z - halfSideMeters, center.Roll, center.Pitch, center.Yaw),
+            new(center.X, center.Y + halfSideMeters, center.Z - halfSideMeters, center.Roll, center.Pitch, center.Yaw),
+            new(center.X, center.Y + halfSideMeters, center.Z + halfSideMeters, center.Roll, center.Pitch, center.Yaw),
+            new(center.X, center.Y - halfSideMeters, center.Z + halfSideMeters, center.Roll, center.Pitch, center.Yaw),
+            new(center.X, center.Y - halfSideMeters, center.Z - halfSideMeters, center.Roll, center.Pitch, center.Yaw)
         };
 
         return points;

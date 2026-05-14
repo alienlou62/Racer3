@@ -308,9 +308,9 @@ public sealed class MainViewModel : ObservableObject
 
             var preview = new StringBuilder();
             preview.AppendLine(IsDryRun
-                ? $"{plan.Shape} waypoints; validation mode sends the full waypoint list to backend trace planning without -ConfirmMotion."
-                : $"{plan.Shape} waypoints; live mode sends the full waypoint list and requires backend validation before motion.");
-            preview.AppendLine(FormattableString.Invariant($"Center: X={CenterX:0.0000}, Y={CenterY:0.0000}, Z={CenterZ:0.0000}; size/radius={ShapeSizeMeters:0.0000} m"));
+                ? $"{plan.Shape} waypoints; validation mode sends the full constant-X Y/Z-plane waypoint list to backend trace planning without -ConfirmMotion."
+                : $"{plan.Shape} waypoints; live mode sends the full constant-X Y/Z-plane waypoint list and requires backend validation before motion.");
+            preview.AppendLine(FormattableString.Invariant($"Plane: constant X={CenterX:0.0000}; center Y={CenterY:0.0000}, Z={CenterZ:0.0000}; size/radius={ShapeSizeMeters:0.0000} m"));
             preview.AppendLine();
             foreach (var item in plan.Waypoints.Select((pose, index) => pose.ToPreviewLine(index + 1)))
             {
