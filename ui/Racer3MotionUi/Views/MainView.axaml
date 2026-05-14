@@ -1,0 +1,248 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Racer3MotionUi.Views.MainView">
+    <UserControl.Styles>
+        <Style Selector="TextBlock.Label">
+            <Setter Property="Foreground" Value="#8FA3B8"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+        <Style Selector="TextBlock.PanelTitle">
+            <Setter Property="Foreground" Value="#DCE6F2"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+        <Style Selector="ToggleButton.ShapeCard">
+            <Setter Property="Background" Value="#141C25"/>
+            <Setter Property="BorderBrush" Value="#2C3948"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="22"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+        </Style>
+        <Style Selector="ToggleButton.ShapeCard:pointerover">
+            <Setter Property="Background" Value="#1A2632"/>
+            <Setter Property="BorderBrush" Value="#4D647C"/>
+        </Style>
+        <Style Selector="ToggleButton.ShapeCard:checked">
+            <Setter Property="Background" Value="#102334"/>
+            <Setter Property="BorderBrush" Value="#58B8F5"/>
+        </Style>
+        <Style Selector="TextBox">
+            <Setter Property="Background" Value="#0C1219"/>
+            <Setter Property="Foreground" Value="#E7EEF7"/>
+            <Setter Property="BorderBrush" Value="#2C3948"/>
+        </Style>
+        <Style Selector="Button.Primary">
+            <Setter Property="Background" Value="#2878B8"/>
+            <Setter Property="Foreground" Value="#F6FAFF"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="14,10"/>
+        </Style>
+        <Style Selector="Button.Secondary">
+            <Setter Property="Background" Value="#17212C"/>
+            <Setter Property="Foreground" Value="#D9E3EF"/>
+            <Setter Property="BorderBrush" Value="#2C3948"/>
+            <Setter Property="Padding" Value="12,9"/>
+        </Style>
+    </UserControl.Styles>
+
+    <Grid RowDefinitions="64,*,230"
+          ColumnDefinitions="*,360"
+          Background="#0B0F14">
+        <Border Grid.Row="0"
+                Grid.ColumnSpan="2"
+                Background="#101720"
+                BorderBrush="#233040"
+                BorderThickness="0,0,0,1"
+                Padding="24,0">
+            <Grid ColumnDefinitions="*,Auto,Auto" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
+                    <Border Width="10" Height="32" Background="#58B8F5"/>
+                    <StackPanel>
+                        <TextBlock Text="{Binding Title}" Foreground="#F2F7FC" FontSize="20" FontWeight="SemiBold"/>
+                        <TextBlock Text="{Binding SelectedShapeName}" Foreground="#8FA3B8" FontSize="12"/>
+                    </StackPanel>
+                </StackPanel>
+                <TextBlock Grid.Column="1"
+                           Text="{Binding ConnectionState}"
+                           Foreground="#AFC0D2"
+                           VerticalAlignment="Center"
+                           Margin="0,0,18,0"/>
+                <Border Grid.Column="2"
+                        Background="#162431"
+                        BorderBrush="#2E4356"
+                        BorderThickness="1"
+                        Padding="12,6">
+                    <TextBlock Text="{Binding ModeState}" Foreground="#DCE6F2"/>
+                </Border>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1"
+              Grid.Column="0"
+              RowDefinitions="Auto,*"
+              Margin="24,22,16,18">
+            <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,0,0,16">
+                <TextBlock Text="Shape Selection" Classes="PanelTitle" VerticalAlignment="Center"/>
+                <TextBlock Text="Cartesian preview" Classes="Label" VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <Grid Grid.Row="1" RowDefinitions="*,*" ColumnDefinitions="*,*">
+                <ToggleButton Grid.Row="0"
+                              Grid.Column="0"
+                              Classes="ShapeCard"
+                              Margin="0,0,8,8"
+                              IsChecked="{Binding IsCircleSelected, Mode=OneWay}"
+                              Command="{Binding SelectShapeCommand}"
+                              CommandParameter="Circle">
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                        <Ellipse Width="82" Height="82" Stroke="#7DD3FC" StrokeThickness="5"/>
+                        <TextBlock Text="Circle" Foreground="#F3F8FE" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    </StackPanel>
+                </ToggleButton>
+
+                <ToggleButton Grid.Row="0"
+                              Grid.Column="1"
+                              Classes="ShapeCard"
+                              Margin="8,0,0,8"
+                              IsChecked="{Binding IsSquareSelected, Mode=OneWay}"
+                              Command="{Binding SelectShapeCommand}"
+                              CommandParameter="Square">
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                        <Rectangle Width="82" Height="82" Stroke="#A7F3D0" StrokeThickness="5"/>
+                        <TextBlock Text="Square" Foreground="#F3F8FE" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    </StackPanel>
+                </ToggleButton>
+
+                <ToggleButton Grid.Row="1"
+                              Grid.Column="0"
+                              Classes="ShapeCard"
+                              Margin="0,8,8,0"
+                              IsChecked="{Binding IsTriangleSelected, Mode=OneWay}"
+                              Command="{Binding SelectShapeCommand}"
+                              CommandParameter="Triangle">
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                        <Path Width="92" Height="82" Stretch="Uniform" Data="M 46 4 L 88 78 L 4 78 Z" Stroke="#FDE68A" StrokeThickness="5"/>
+                        <TextBlock Text="Triangle" Foreground="#F3F8FE" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    </StackPanel>
+                </ToggleButton>
+
+                <ToggleButton Grid.Row="1"
+                              Grid.Column="1"
+                              Classes="ShapeCard"
+                              Margin="8,8,0,0"
+                              IsChecked="{Binding IsHexagonSelected, Mode=OneWay}"
+                              Command="{Binding SelectShapeCommand}"
+                              CommandParameter="Hexagon">
+                    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                        <Path Width="92" Height="82" Stretch="Uniform" Data="M 25 4 L 67 4 L 90 41 L 67 78 L 25 78 L 2 41 Z" Stroke="#FCA5A5" StrokeThickness="5"/>
+                        <TextBlock Text="Hexagon" Foreground="#F3F8FE" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    </StackPanel>
+                </ToggleButton>
+            </Grid>
+        </Grid>
+
+        <Border Grid.Row="1"
+                Grid.Column="1"
+                Background="#101720"
+                BorderBrush="#233040"
+                BorderThickness="1,0,0,0"
+                Padding="20,22,22,18">
+            <StackPanel Spacing="14">
+                <TextBlock Text="Operator Controls" Classes="PanelTitle"/>
+
+                <Grid ColumnDefinitions="*,*">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Velocity" Classes="Label"/>
+                        <TextBox Text="{Binding Velocity, Mode=TwoWay}" Watermark="0.03"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Spacing="6" Margin="12,0,0,0">
+                        <TextBlock Text="Size / Radius m" Classes="Label"/>
+                        <TextBox Text="{Binding ShapeSizeMeters, Mode=TwoWay}" Watermark="0.10"/>
+                    </StackPanel>
+                </Grid>
+
+                <TextBlock Text="Center Point m" Classes="Label"/>
+                <Grid ColumnDefinitions="*,*,*">
+                    <TextBox Text="{Binding CenterX, Mode=TwoWay}" Watermark="X" Margin="0,0,5,0"/>
+                    <TextBox Grid.Column="1" Text="{Binding CenterY, Mode=TwoWay}" Watermark="Y" Margin="5,0,5,0"/>
+                    <TextBox Grid.Column="2" Text="{Binding CenterZ, Mode=TwoWay}" Watermark="Z" Margin="5,0,0,0"/>
+                </Grid>
+
+                <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
+                    <StackPanel Spacing="10">
+                        <CheckBox Content="Dry Run / Validate Only" IsChecked="{Binding IsDryRun}"/>
+                        <CheckBox Content="Confirm Motion" IsChecked="{Binding ConfirmMotion}"/>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
+                    <TextBlock Text="{Binding ExecutionSummary}"
+                               Foreground="#AFC0D2"
+                               TextWrapping="Wrap"
+                               FontSize="12"/>
+                </Border>
+
+                <Button Content="Run Selected Shape"
+                        Classes="Primary"
+                        Command="{Binding RunSelectedShapeCommand}"
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Center"/>
+
+                <Grid ColumnDefinitions="*,*">
+                    <Button Content="Stop"
+                            Classes="Secondary"
+                            Command="{Binding StopCommand}"
+                            HorizontalAlignment="Stretch"
+                            HorizontalContentAlignment="Center"
+                            Margin="0,0,5,0"/>
+                    <Button Grid.Column="1"
+                            Content="Clear Log"
+                            Classes="Secondary"
+                            Command="{Binding ClearLogCommand}"
+                            HorizontalAlignment="Stretch"
+                            HorizontalContentAlignment="Center"
+                            Margin="5,0,0,0"/>
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="2"
+                Grid.ColumnSpan="2"
+                Background="#0E141C"
+                Padding="24,16,24,20">
+            <Grid ColumnDefinitions="360,430,*">
+                <StackPanel Spacing="8" Margin="0,0,7,0">
+                    <TextBlock Text="Command Preview" Classes="PanelTitle"/>
+                    <TextBox Text="{Binding CommandPreview}"
+                             IsReadOnly="True"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
+                             Height="166"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Spacing="8" Margin="7,0,7,0">
+                    <TextBlock Text="Waypoint Preview" Classes="PanelTitle"/>
+                    <TextBox Text="{Binding WaypointPreview}"
+                             FontFamily="Consolas"
+                             FontSize="12"
+                             IsReadOnly="True"
+                             AcceptsReturn="True"
+                             TextWrapping="NoWrap"
+                             Height="166"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Spacing="8" Margin="7,0,0,0">
+                    <TextBlock Text="Process Log" Classes="PanelTitle"/>
+                    <TextBox Text="{Binding ProcessLog}"
+                             FontFamily="Consolas"
+                             FontSize="12"
+                             IsReadOnly="True"
+                             AcceptsReturn="True"
+                             TextWrapping="NoWrap"
+                             Height="166"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>

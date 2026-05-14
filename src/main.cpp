@@ -36,6 +36,7 @@ void printUsage()
         << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n"
         << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
         << "  racer3-basic-motion --cartesian-vector [--position-only] [--compact-motion] [--trajectory-motion] [--endpoint-only] [--segment-goal] [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --cartesian-trace --position-only --endpoint-only [--compact-motion] [--confirm-motion] --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\" [--velocity 0.02] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -47,6 +48,7 @@ void printUsage()
         << "  --robot-pose-probe  Connect/load MultiAxis and probe read-only Robot pose/FK/IK APIs. No amp enable or motion.\n"
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
+        << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -58,6 +60,7 @@ void printUsage()
         << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
         << "  --joints <list>    Six comma-separated user-unit deltas for --joint-vector, e.g. 0,0,0,0,0.005,0.005.\n"
         << "  --cartesian <list> Six comma-separated Cartesian deltas for --kinematics-dry-run or --cartesian-vector: dx,dy,dz meters and droll,dpitch,dyaw radians.\n"
+        << "  --cartesian-waypoints <list> Semicolon-separated Cartesian waypoint deltas for --cartesian-trace. Each waypoint is dx,dy,dz,droll,dpitch,dyaw from the original software-zero start pose.\n"
         << "  --velocity <value> Velocity in user-units/sec. Default 0.05.\n"
         << "  --return-warn <value> Warn if final absolute actual position exceeds this user-unit tolerance. Default 0.00025.\n"
         << "  --return-fail <value> Fail if final absolute actual position exceeds this user-unit tolerance. Default 0.001.\n"
@@ -197,6 +200,30 @@ std::array<double, AxisCount> parseCartesianVector(const std::string& text)
     return parseSixValueVector(text, "--cartesian");
 }
 
+std::vector<std::array<double, AxisCount>> parseCartesianWaypoints(const std::string& text)
+{
+    std::vector<std::array<double, AxisCount>> waypoints;
+    std::stringstream stream(text);
+    std::string waypointText;
+
+    while (std::getline(stream, waypointText, ';'))
+    {
+        if (waypointText.empty())
+        {
+            continue;
+        }
+
+        waypoints.push_back(parseSixValueVector(waypointText, "--cartesian-waypoints"));
+    }
+
+    if (waypoints.empty())
+    {
+        throw std::runtime_error("--cartesian-waypoints must contain at least one waypoint.");
+    }
+
+    return waypoints;
+}
+
 bool jointVectorHasMotion(const std::array<double, AxisCount>& values)
 {
     for (double value : values)
@@ -296,13 +323,14 @@ int main(int argc, char* argv[])
         options.robotPoseProbe = hasArg(args, "--robot-pose-probe");
         options.kinematicsDryRun = hasArg(args, "--kinematics-dry-run");
         options.cartesianVectorMotion = hasArg(args, "--cartesian-vector");
+        options.cartesianTraceMotion = hasArg(args, "--cartesian-trace");
         options.positionOnlyIk = hasArg(args, "--position-only");
         options.compactMotion = hasArg(args, "--compact-motion");
         options.appendMotion = hasArg(args, "--append-motion");
         options.trajectoryMotion = hasArg(args, "--trajectory-motion");
         options.endpointOnlyMotion = hasArg(args, "--endpoint-only");
         options.segmentGoalMotion = hasArg(args, "--segment-goal");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.cartesianVectorMotion);
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.cartesianVectorMotion && !options.cartesianTraceMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
@@ -326,6 +354,17 @@ int main(int argc, char* argv[])
             options.cartesianVector = parseCartesianVector(cartesianText);
         }
 
+        const std::string cartesianWaypointsText = getStringOption(args, "--cartesian-waypoints", "");
+        if (options.cartesianTraceMotion)
+        {
+            if (cartesianWaypointsText.empty())
+            {
+                throw std::runtime_error("--cartesian-trace requires --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\".");
+            }
+
+            options.cartesianTraceWaypoints = parseCartesianWaypoints(cartesianWaypointsText);
+        }
+
         if (hasArg(args, "--vel"))
         {
             options.velocityUserUnitsPerSecond = getDoubleOption(args, "--vel", DefaultVelocityUserUnitsPerSecond);
@@ -341,10 +380,11 @@ int main(int argc, char* argv[])
             (options.robotModelProbe ? 1 : 0) +
             (options.robotPoseProbe ? 1 : 0) +
             (options.kinematicsDryRun ? 1 : 0) +
-            (options.cartesianVectorMotion ? 1 : 0);
+            (options.cartesianVectorMotion ? 1 : 0) +
+            (options.cartesianTraceMotion ? 1 : 0);
         if (motionModeCount > 1)
         {
-            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, --robot-pose-probe, --kinematics-dry-run, or --cartesian-vector.\n";
+            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, --robot-pose-probe, --kinematics-dry-run, --cartesian-vector, or --cartesian-trace.\n";
             return 2;
         }
 
@@ -406,6 +446,17 @@ int main(int argc, char* argv[])
                 std::cout << "Mode: CARTESIAN VECTOR DRY RUN - compute guarded Cartesian IK candidate only; no amp enable, no motion.\n";
             }
         }
+        else if (options.cartesianTraceMotion)
+        {
+            if (options.motionConfirmed)
+            {
+                std::cout << "Mode: CARTESIAN TRACE - guarded multi-waypoint trace with motion enabled only if validation gates pass.\n";
+            }
+            else
+            {
+                std::cout << "Mode: CARTESIAN TRACE VALIDATION - compute guarded multi-waypoint IK plan only; no amp enable, no motion.\n";
+            }
+        }
 
         std::cout << "Motion step: " << options.stepUserUnits
                   << " user units = " << (options.stepUserUnits * 360.0) << " degrees.\n";
@@ -431,7 +482,23 @@ int main(int argc, char* argv[])
             std::cout << "\n";
         }
 
-        if (options.cartesianVectorMotion)
+        if (options.cartesianTraceMotion)
+        {
+            std::cout << "Cartesian trace waypoints [dx,dy,dz meters, droll,dpitch,dyaw radians]: "
+                      << options.cartesianTraceWaypoints.size()
+                      << "\n";
+            for (size_t waypointIndex = 0; waypointIndex < options.cartesianTraceWaypoints.size(); ++waypointIndex)
+            {
+                std::cout << "  Waypoint " << (waypointIndex + 1) << ":";
+                for (double value : options.cartesianTraceWaypoints[waypointIndex])
+                {
+                    std::cout << " " << value;
+                }
+                std::cout << "\n";
+            }
+        }
+
+        if (options.cartesianVectorMotion || options.cartesianTraceMotion)
         {
             std::cout << "Position-only IK: " << (options.positionOnlyIk ? "ON" : "OFF") << "\n";
             std::cout << "Compact segmented motion: " << (options.compactMotion ? "ON" : "OFF") << "\n";

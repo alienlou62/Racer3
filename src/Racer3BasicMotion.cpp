@@ -82,6 +82,7 @@ static bool RobotModelProbeEnabled = false;
 static bool RobotPoseProbeEnabled = false;
 static bool KinematicsDryRunEnabled = false;
 static bool CartesianVectorMotionEnabled = false;
+static bool CartesianTraceMotionEnabled = false;
 static bool PositionOnlyIkEnabled = false;
 static bool CompactSegmentedExecutionEnabled = false;
 static bool AppendSegmentedExecutionEnabled = false;
@@ -93,6 +94,7 @@ static double ReturnWarnToleranceUserUnits = 0.00025;
 static double ReturnFailToleranceUserUnits = 0.00100;
 static JointVector RequestedJointVector{};
 static CartesianVector RequestedCartesianVector{};
+static std::vector<CartesianVector> RequestedCartesianTraceWaypoints;
 
 double toDegrees(double userUnits)
 {
@@ -129,6 +131,8 @@ JointVector makeAxis5And6Vector(double axis5Value, double axis6Value)
 static constexpr double Pi = 3.141592653589793238462643383279502884;
 static constexpr double RevolutionsToRadians = 2.0 * Pi;
 static constexpr int MaxCartesianSegments = 128;
+static constexpr int MaxCartesianTraceWaypoints = 96;
+static constexpr int MaxCartesianTraceMotionPoints = 512;
 
 // OpenRAVE/RapidRobot Racer3 geometry extracted from racer3.kinbody.xml
 // and racer3.robot.xml. Units are meters and radians.
@@ -1584,6 +1588,215 @@ std::vector<JointVector> makeOutAndBackSequenceFromSegmentPlan(
     return sequence;
 }
 
+struct CartesianTraceLegPlan
+{
+    int waypointNumber = 0;
+    CartesianVector requestedWaypointDeltaFromStart{};
+    CartesianVector legDeltaFromCurrent{};
+    CartesianSegmentPlan segmentPlan{};
+};
+
+struct CartesianTracePlan
+{
+    bool accepted = false;
+    std::vector<CartesianTraceLegPlan> legs;
+    std::vector<JointVector> outboundSequence;
+    std::string rejectionReason;
+};
+
+std::vector<JointVector> makeReturnSequenceFromRelativeSequence(
+    const std::vector<JointVector>& outboundSequence)
+{
+    std::vector<JointVector> returnSequence;
+    returnSequence.reserve(outboundSequence.size());
+
+    for (auto it = outboundSequence.rbegin(); it != outboundSequence.rend(); ++it)
+    {
+        JointVector negativeReturnStep{};
+
+        for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+        {
+            negativeReturnStep[index] = -(*it)[index];
+        }
+
+        returnSequence.push_back(negativeReturnStep);
+    }
+
+    return returnSequence;
+}
+
+int totalCartesianTraceSegmentCount(const CartesianTracePlan& plan)
+{
+    int total = 0;
+
+    for (const CartesianTraceLegPlan& leg : plan.legs)
+    {
+        total += leg.segmentPlan.segmentCount;
+    }
+
+    return total;
+}
+
+CartesianTracePlan buildCartesianTracePlan(
+    const JointVector& startRadians,
+    const std::vector<CartesianVector>& waypointDeltasFromStart)
+{
+    CartesianTracePlan tracePlan{};
+    tracePlan.rejectionReason = "No Cartesian trace waypoints were evaluated.";
+
+    if (waypointDeltasFromStart.empty())
+    {
+        tracePlan.rejectionReason = "Cartesian trace waypoint list is empty.";
+        return tracePlan;
+    }
+
+    if (waypointDeltasFromStart.size() > MaxCartesianTraceWaypoints)
+    {
+        tracePlan.rejectionReason =
+            "Cartesian trace waypoint count exceeds the guarded maximum of " +
+            std::to_string(MaxCartesianTraceWaypoints) +
+            ".";
+        return tracePlan;
+    }
+
+    const CartesianVector originalStartPose = poseVectorFromJoints(startRadians);
+    JointVector currentRadians = startRadians;
+
+    for (size_t waypointIndex = 0; waypointIndex < waypointDeltasFromStart.size(); ++waypointIndex)
+    {
+        CartesianTraceLegPlan leg{};
+        leg.waypointNumber = static_cast<int>(waypointIndex + 1);
+        leg.requestedWaypointDeltaFromStart = waypointDeltasFromStart[waypointIndex];
+
+        const CartesianVector targetPose =
+            targetPoseVectorFromStartPoseAndDelta(
+                originalStartPose,
+                leg.requestedWaypointDeltaFromStart,
+                1.0);
+        const CartesianVector currentPose = poseVectorFromJoints(currentRadians);
+
+        leg.legDeltaFromCurrent = subtractPoseVectorWrapped(targetPose, currentPose);
+        leg.segmentPlan = buildSegmentedCartesianPlan(currentRadians, leg.legDeltaFromCurrent);
+
+        tracePlan.legs.push_back(leg);
+
+        if (!leg.segmentPlan.accepted)
+        {
+            tracePlan.rejectionReason =
+                "Waypoint " +
+                std::to_string(leg.waypointNumber) +
+                " rejected: " +
+                leg.segmentPlan.rejectionReason;
+            return tracePlan;
+        }
+
+        if (leg.segmentPlan.segments.empty())
+        {
+            tracePlan.rejectionReason =
+                "Waypoint " +
+                std::to_string(leg.waypointNumber) +
+                " produced no accepted segments.";
+            return tracePlan;
+        }
+
+        const std::vector<JointVector> legSequence =
+            makeOutboundSequenceFromSegmentPlan(leg.segmentPlan);
+        tracePlan.outboundSequence.insert(
+            tracePlan.outboundSequence.end(),
+            legSequence.begin(),
+            legSequence.end());
+
+        currentRadians = leg.segmentPlan.segments.back().candidate.result.solutionRadians;
+
+        if (tracePlan.outboundSequence.size() > MaxCartesianTraceMotionPoints)
+        {
+            tracePlan.rejectionReason =
+                "Validated Cartesian trace expands to more than " +
+                std::to_string(MaxCartesianTraceMotionPoints) +
+                " joint waypoints. Reduce shape density or size.";
+            return tracePlan;
+        }
+    }
+
+    if (tracePlan.outboundSequence.empty())
+    {
+        tracePlan.rejectionReason = "Cartesian trace produced no outbound joint waypoints.";
+        return tracePlan;
+    }
+
+    tracePlan.accepted = true;
+    tracePlan.rejectionReason.clear();
+    return tracePlan;
+}
+
+void printCartesianTracePlanSummary(const CartesianTracePlan& plan)
+{
+    std::cout << "\nCartesian trace plan summary\n";
+    std::cout << "  Accepted: " << (plan.accepted ? "YES" : "NO") << "\n";
+    std::cout << "  Requested waypoint count: " << plan.legs.size() << "\n";
+    std::cout << "  Validated joint waypoint count: " << plan.outboundSequence.size() << "\n";
+    std::cout << "  Total adaptive Cartesian segments: "
+              << totalCartesianTraceSegmentCount(plan)
+              << "\n";
+    std::cout << "  Waypoint coordinate convention: each requested waypoint is a Cartesian delta from the original software-zero start pose.\n";
+    std::cout << "  Execution convention: stream validated joint waypoint deltas outbound as one PVT phase, then stream the reverse return phase to software zero.\n";
+
+    if (!plan.accepted)
+    {
+        std::cout << "  Rejection reason: " << plan.rejectionReason << "\n";
+    }
+
+    for (const CartesianTraceLegPlan& leg : plan.legs)
+    {
+        std::cout << "\n  Trace waypoint "
+                  << leg.waypointNumber
+                  << " / "
+                  << plan.legs.size()
+                  << "\n";
+        printCartesianVector("    Requested waypoint delta from start", leg.requestedWaypointDeltaFromStart);
+        printCartesianVector("    Planned leg delta from current trace pose", leg.legDeltaFromCurrent);
+        std::cout << "    Accepted: "
+                  << (leg.segmentPlan.accepted ? "YES" : "NO")
+                  << "\n";
+        std::cout << "    Adaptive segments: "
+                  << leg.segmentPlan.segmentCount
+                  << "\n";
+        if (!leg.segmentPlan.accepted)
+        {
+            std::cout << "    Rejection reason: "
+                      << leg.segmentPlan.rejectionReason
+                      << "\n";
+        }
+
+        for (const CartesianSegmentCandidate& segment : leg.segmentPlan.segments)
+        {
+            std::cout << "      Segment "
+                      << segment.segmentNumber
+                      << " / "
+                      << leg.segmentPlan.segmentCount
+                      << ": accepted="
+                      << (segment.accepted ? "YES" : "NO");
+
+            if (segment.candidate.found)
+            {
+                std::cout << ", residualNorm="
+                          << std::fixed << std::setprecision(9)
+                          << segment.candidate.result.residualNorm
+                          << ", maxResidual="
+                          << segment.candidate.result.maxResidualComponent
+                          << ", maxJointDeltaDeg="
+                          << segment.maxCommandDeltaDegrees;
+            }
+            else
+            {
+                std::cout << ", no IK candidate";
+            }
+
+            std::cout << "\n";
+        }
+    }
+}
+
 
 void printMultiSeedIkDryRunReport(
     const char* label,
@@ -2278,6 +2491,7 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     RobotPoseProbeEnabled = options.robotPoseProbe;
     KinematicsDryRunEnabled = options.kinematicsDryRun;
     CartesianVectorMotionEnabled = options.cartesianVectorMotion;
+    CartesianTraceMotionEnabled = options.cartesianTraceMotion;
     PositionOnlyIkEnabled = options.positionOnlyIk;
     CompactSegmentedExecutionEnabled = options.compactMotion;
     AppendSegmentedExecutionEnabled = options.appendMotion;
@@ -2289,6 +2503,7 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     ReturnFailToleranceUserUnits = options.returnFailToleranceUserUnits;
     RequestedJointVector = options.jointVectorUserUnits;
     RequestedCartesianVector = options.cartesianVector;
+    RequestedCartesianTraceWaypoints = options.cartesianTraceWaypoints;
 
     if (ReturnWarnToleranceUserUnits < 0.0)
     {
@@ -2328,6 +2543,22 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         throw std::runtime_error("--cartesian must contain at least one nonzero value for --cartesian-vector.");
     }
 
+    if (CartesianTraceMotionEnabled)
+    {
+        if (RequestedCartesianTraceWaypoints.empty())
+        {
+            throw std::runtime_error("--cartesian-trace requires at least one --cartesian-waypoints entry.");
+        }
+
+        if (RequestedCartesianTraceWaypoints.size() > MaxCartesianTraceWaypoints)
+        {
+            throw std::runtime_error(
+                "--cartesian-trace refuses more than " +
+                std::to_string(MaxCartesianTraceWaypoints) +
+                " waypoints.");
+        }
+    }
+
     if (AppendSegmentedExecutionEnabled)
     {
         if (!CartesianVectorMotionEnabled)
@@ -2362,9 +2593,9 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
 
     if (EndpointOnlyMotionEnabled)
     {
-        if (!CartesianVectorMotionEnabled)
+        if (!CartesianVectorMotionEnabled && !CartesianTraceMotionEnabled)
         {
-            throw std::runtime_error("--endpoint-only requires --cartesian-vector.");
+            throw std::runtime_error("--endpoint-only requires --cartesian-vector or --cartesian-trace.");
         }
 
         if (!PositionOnlyIkEnabled)
@@ -2398,6 +2629,24 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         if (EndpointOnlyMotionEnabled)
         {
             throw std::runtime_error("--segment-goal cannot be combined with --endpoint-only.");
+        }
+    }
+
+    if (CartesianTraceMotionEnabled)
+    {
+        if (!PositionOnlyIkEnabled)
+        {
+            throw std::runtime_error("--cartesian-trace currently requires --position-only.");
+        }
+
+        if (!EndpointOnlyMotionEnabled)
+        {
+            throw std::runtime_error("--cartesian-trace currently requires --endpoint-only.");
+        }
+
+        if (AppendSegmentedExecutionEnabled || TrajectorySegmentedExecutionEnabled || SegmentGoalMotionEnabled)
+        {
+            throw std::runtime_error("--cartesian-trace cannot be combined with --append-motion, --trajectory-motion, or --segment-goal.");
         }
     }
 
@@ -2437,6 +2686,13 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
         if (options.cartesianVectorMotion)
         {
             runCartesianVectorMotion();
+            safeShutdown();
+            return;
+        }
+
+        if (options.cartesianTraceMotion)
+        {
+            runCartesianTraceMotion();
             safeShutdown();
             return;
         }
@@ -5393,8 +5649,373 @@ void Racer3BasicMotion::runCartesianVectorMotion()
 }
 
 
+void Racer3BasicMotion::runCartesianTraceMotion()
+{
+    std::cout << "Starting guarded multi-waypoint Cartesian trace mode.\n";
+    std::cout << "This mode validates a list of Cartesian waypoint deltas from the original software-zero start pose.\n";
+    std::cout << "Execution uses validated joint waypoints streamed through MultiAxis::MovePVT as one outbound trace phase, then one return-to-zero phase.\n";
+    std::cout << "IK residual mode: " << ikResidualModeName() << "\n";
+    if (PositionOnlyIkEnabled)
+    {
+        std::cout << "Position-only IK is active: solve/gates use XYZ only and allow wrist orientation to change naturally.\n";
+    }
+    if (CompactSegmentedExecutionEnabled)
+    {
+        std::cout << "CompactMotion is active: large per-segment status dumps are skipped during confirmed trace motion.\n";
+    }
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    if (RequestedCartesianTraceWaypoints.empty())
+    {
+        throw std::runtime_error("No Cartesian trace waypoints were supplied.");
+    }
+
+    std::cout << "Requested Cartesian trace waypoints: "
+              << RequestedCartesianTraceWaypoints.size()
+              << "\n";
+    for (size_t waypointIndex = 0; waypointIndex < RequestedCartesianTraceWaypoints.size(); ++waypointIndex)
+    {
+        const std::string label =
+            "  Requested waypoint " +
+            std::to_string(waypointIndex + 1) +
+            " delta from start";
+        printCartesianVector(label.c_str(), RequestedCartesianTraceWaypoints[waypointIndex]);
+    }
+
+    JointVector actualUserUnits{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        actualUserUnits[index] = axes_[index]->ActualPositionGet();
+    }
+
+    JointVector actualRadians{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+    }
+
+    const CartesianVector startPoseVector = poseVectorFromJoints(actualRadians);
+    const FkVec3 startPosition = {startPoseVector[0], startPoseVector[1], startPoseVector[2]};
+    const FkVec3 startRpy = {startPoseVector[3], startPoseVector[4], startPoseVector[5]};
+
+    std::cout << "\nCurrent pose and requested trace target preview:\n";
+    printJointDegreesFromRadians("  Current joint degrees", actualRadians);
+    printFkVec3("  Current TCP position", startPosition, "meters");
+    printFkVec3("  Current TCP RPY", startRpy, "radians");
+
+    for (size_t waypointIndex = 0; waypointIndex < RequestedCartesianTraceWaypoints.size(); ++waypointIndex)
+    {
+        const CartesianVector targetPose =
+            targetPoseVectorFromStartPoseAndDelta(
+                startPoseVector,
+                RequestedCartesianTraceWaypoints[waypointIndex],
+                1.0);
+        const FkVec3 targetPosition = {targetPose[0], targetPose[1], targetPose[2]};
+        const FkVec3 targetRpy = {targetPose[3], targetPose[4], targetPose[5]};
+        const std::string positionLabel =
+            "  Trace target " +
+            std::to_string(waypointIndex + 1) +
+            " TCP position";
+        const std::string rpyLabel =
+            "  Trace target " +
+            std::to_string(waypointIndex + 1) +
+            " TCP RPY";
+
+        printFkVec3(positionLabel.c_str(), targetPosition, "meters");
+        printFkVec3(rpyLabel.c_str(), targetRpy, "radians");
+    }
+
+    const CartesianTracePlan tracePlan =
+        buildCartesianTracePlan(actualRadians, RequestedCartesianTraceWaypoints);
+
+    printCartesianTracePlanSummary(tracePlan);
+
+    if (!tracePlan.accepted)
+    {
+        std::cout << "\nCartesian trace candidate rejected by validation gates. No motion commanded.\n";
+        return;
+    }
+
+    if (!CartesianVectorMotionConfirmed)
+    {
+        std::cout << "\nNo --confirm-motion was supplied. This was a guarded Cartesian trace validation run only.\n";
+        std::cout << "No amps were enabled and no motion was commanded.\n";
+        std::cout << "Live behavior would stream "
+                  << tracePlan.outboundSequence.size()
+                  << " validated outbound joint waypoint(s), wait once, then stream the reverse return phase.\n";
+        return;
+    }
+
+    std::cout << "\n--confirm-motion supplied and all trace gates passed.\n";
+    std::cout << "Executing guarded Cartesian trace through the MultiAxis joint-vector PVT path.\n";
+
+    clearFaults();
+
+    printActualPositions("Actual positions after Cartesian trace validation, before amp enable");
+    printDiagnosticSnapshot("After Cartesian trace validation and clear faults, before amp enable");
+
+    enableAmplifiers();
+
+    printActualPositions("Actual positions after amp enable for Cartesian trace motion");
+    printDiagnosticSnapshot("After amp enable for Cartesian trace motion");
+
+    isolateAllAxesForAllMotion();
+
+    std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
+    bool errorLimitsTemporarilyChanged = false;
+
+    if (TemporarilyDisableAxis6ErrorLimitForTinyMotion)
+    {
+        std::cout << "Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for Cartesian trace motion.\n";
+        std::cout << "  Amp fault and hardware limit actions are not changed.\n";
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            originalErrorLimitActions[index] = axes_[index]->ErrorLimitActionGet();
+            std::cout << "  Original Axis "
+                      << (index + 1)
+                      << " ErrorLimitAction: "
+                      << actionName(originalErrorLimitActions[index])
+                      << "\n";
+            axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        }
+
+        errorLimitsTemporarilyChanged = true;
+    }
+
+    const std::vector<JointVector> outboundSequence = tracePlan.outboundSequence;
+    const std::vector<JointVector> returnSequence =
+        makeReturnSequenceFromRelativeSequence(outboundSequence);
+
+    if (outboundSequence.empty() || returnSequence.empty())
+    {
+        throw std::runtime_error("Cartesian trace sequence is empty.");
+    }
+
+    try
+    {
+        const double samplePeriodSeconds = samplePeriodSecondsFromController(controller_);
+
+        auto readAllAxisCommandPositions = [&]() {
+            JointVector commandPositions{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                commandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            return commandPositions;
+        };
+
+        auto commandTracePvtPhase = [&](const char* phaseLabel, const std::vector<JointVector>& phaseSequence) {
+            std::cout << "\n=== Cartesian trace PVT "
+                      << phaseLabel
+                      << " phase ===\n";
+
+            const JointVector startingCommandPositions = readAllAxisCommandPositions();
+            const JointTrajectoryBlock trajectory =
+                makePvtTrajectoryBlock(startingCommandPositions, phaseSequence, samplePeriodSeconds);
+            const std::vector<double> flatPositions =
+                flattenJointTrajectoryPoints(trajectory.positions);
+            const std::vector<double> flatVelocities =
+                flattenJointTrajectoryPoints(trajectory.velocities);
+
+            std::cout << "Streaming "
+                      << trajectory.positions.size()
+                      << " validated MultiAxis::MovePVT waypoint(s), then waiting once for phase completion.\n";
+            std::cout << "  Controller sample period used for time rounding: "
+                      << std::fixed << std::setprecision(6)
+                      << samplePeriodSeconds
+                      << " sec.\n";
+            std::cout << "  PVT emptyCount: "
+                      << TrajectoryPvtEmptyCount
+                      << " frame(s).\n";
+            std::cout << "  Total planned phase time: "
+                      << trajectory.totalSeconds
+                      << " sec; point dt min/max: "
+                      << minTrajectoryPointSeconds(trajectory)
+                      << " / "
+                      << maxTrajectoryPointSeconds(trajectory)
+                      << " sec.\n";
+            std::cout << "  Max specified waypoint velocity: "
+                      << maxAbsTrajectoryVelocity(trajectory)
+                      << " user-units/sec = "
+                      << toDegrees(maxAbsTrajectoryVelocity(trajectory))
+                      << " deg/sec.\n";
+
+            const std::string multiAxisContext =
+                std::string("before Cartesian trace PVT ") + phaseLabel + " phase";
+            configureMultiAxisMotionAttributes(multiAxisContext.c_str());
+            multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+            multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                const std::string axisContext =
+                    std::string("before Cartesian trace PVT ") + phaseLabel + " phase";
+                configureAxisMotionAttributes(index, axisContext.c_str());
+            }
+
+            if (!CompactSegmentedExecutionEnabled)
+            {
+                printAllAxisMotionStatus("All axes before Cartesian trace PVT phase");
+            }
+
+            const uint16_t motionIdBefore = multiAxis_->MotionIdGet();
+
+            multiAxis_->MovePVT(
+                flatPositions.data(),
+                flatVelocities.data(),
+                trajectory.times.data(),
+                static_cast<int32_t>(trajectory.positions.size()),
+                TrajectoryPvtEmptyCount,
+                false,
+                true);
+
+            std::cout << "  MotionId "
+                      << motionIdBefore
+                      << " -> "
+                      << multiAxis_->MotionIdGet()
+                      << " (Cartesian trace PVT stream).\n";
+
+            const std::string startLabel =
+                std::string("Cartesian trace PVT ") + phaseLabel + " MultiAxis::MovePVT";
+            waitForAllAxisMotionStart(startLabel.c_str(), startingCommandPositions);
+
+            const int phaseTimeoutMilliseconds =
+                trajectoryBlockMotionTimeoutMs(trajectory);
+            std::cout << "Waiting once for Cartesian trace PVT "
+                      << phaseLabel
+                      << " phase completion. Timeout="
+                      << phaseTimeoutMilliseconds
+                      << " ms.\n";
+            waitForMotionDone(phaseTimeoutMilliseconds);
+
+            if (CompactSegmentedExecutionEnabled)
+            {
+                const std::string actualLabel =
+                    std::string("Actual positions after Cartesian trace PVT ") + phaseLabel + " phase";
+                printActualPositions(actualLabel.c_str());
+            }
+            else
+            {
+                const std::string statusLabel =
+                    std::string("All axes after Cartesian trace PVT ") + phaseLabel + " MotionDoneWait";
+                printAllAxisMotionStatus(statusLabel.c_str());
+            }
+
+            const std::string resetContext =
+                std::string("after Cartesian trace PVT ") + phaseLabel + " phase";
+            configureMultiAxisMotionAttributes(resetContext.c_str());
+        };
+
+        commandTracePvtPhase("outbound", outboundSequence);
+        commandTracePvtPhase("return", returnSequence);
+    }
+    catch (...)
+    {
+        if (errorLimitsTemporarilyChanged)
+        {
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+                std::cout << "Restored Axis "
+                          << (index + 1)
+                          << " ErrorLimitAction to "
+                          << actionName(originalErrorLimitActions[index])
+                          << " after exception.\n";
+            }
+        }
+
+        throw;
+    }
+
+    if (errorLimitsTemporarilyChanged)
+    {
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            axes_[index]->ErrorLimitActionSet(originalErrorLimitActions[index]);
+            std::cout << "Restored Axis "
+                      << (index + 1)
+                      << " ErrorLimitAction to "
+                      << actionName(originalErrorLimitActions[index])
+                      << ".\n";
+        }
+    }
+
+    std::cout << "Cartesian trace PVT execution complete. Net commanded offsets are zero.\n";
+    printReturnToZeroReport("Return-to-zero check after Cartesian trace motion", true);
+    printActualPositions("Actual positions before Cartesian trace shutdown");
+    printDiagnosticSnapshot("Before Cartesian trace shutdown");
+
+    disableAmplifiers();
+    clearFaultsAfterCompletedMotion("Cartesian trace motion");
+
+    std::cout << "Guarded Cartesian trace motion complete.\n";
+}
+
+
 void Racer3BasicMotion::printMotionPlan() const
 {
+    if (CartesianTraceMotionEnabled)
+    {
+        std::cout << "\nGuarded multi-waypoint Cartesian trace motion plan\n";
+        std::cout << "Purpose: validate and execute a list of Cartesian waypoint deltas using the current OpenRAVE IK scaffold and stable joint-space PVT command path.\n";
+        std::cout << "Default behavior without --confirm-motion: compute and print the accepted/rejected trace plan only; no amp enable and no motion.\n";
+        std::cout << "With --confirm-motion: every trace leg and adaptive segment must pass residual and command joint-delta gates before motion is allowed.\n";
+        std::cout << "Motion execution path: Cartesian trace waypoints -> validated joint waypoints -> one outbound MultiAxis::MovePVT stream -> reverse return MultiAxis::MovePVT stream -> return-to-zero check.\n";
+        std::cout << "Validation gates per adaptive segment: residual norm <= "
+                  << CandidateResidualNormAccept
+                  << ", max residual component <= "
+                  << CandidateMaxResidualComponentAccept
+                  << ", and max command joint delta <= "
+                  << CandidateMaxJointDeltaDegreesAccept
+                  << " degrees.\n";
+        std::cout << "Max trace waypoints: " << MaxCartesianTraceWaypoints << ".\n";
+        std::cout << "Max trace motion points after adaptive splitting: " << MaxCartesianTraceMotionPoints << ".\n";
+        std::cout << "IK residual mode: " << ikResidualModeName() << ".\n";
+        if (PositionOnlyIkEnabled)
+        {
+            std::cout << "Position-only IK: roll/pitch/yaw are ignored by the solve and validation gates.\n";
+        }
+        if (EndpointOnlyMotionEnabled)
+        {
+            std::cout << "EndpointOnly flag is accepted for trace mode as the operator-selected smooth joint-space waypoint execution family.\n";
+        }
+        if (CompactSegmentedExecutionEnabled)
+        {
+            std::cout << "CompactMotion: skips large per-segment live samples/status dumps during confirmed motion.\n";
+        }
+        std::cout << "Requested trace waypoint count: "
+                  << RequestedCartesianTraceWaypoints.size()
+                  << "\n";
+        for (size_t waypointIndex = 0; waypointIndex < RequestedCartesianTraceWaypoints.size(); ++waypointIndex)
+        {
+            const std::string label =
+                "Requested trace waypoint " +
+                std::to_string(waypointIndex + 1);
+            printCartesianVector(label.c_str(), RequestedCartesianTraceWaypoints[waypointIndex]);
+        }
+        std::cout << "\n";
+        return;
+    }
+
     if (CartesianVectorMotionEnabled)
     {
         std::cout << "\nGuarded Cartesian-vector IK motion plan\n";

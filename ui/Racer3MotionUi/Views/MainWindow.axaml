@@ -1,0 +1,18 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="using:Racer3MotionUi.Views"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="1280" d:DesignHeight="820"
+        x:Class="Racer3MotionUi.Views.MainWindow"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="Racer3 Shape Trace Demo"
+        Width="1280"
+        Height="820"
+        MinWidth="1120"
+        MinHeight="720"
+        Background="#0B0F14">
+
+    <views:MainView/>
+
+</Window>

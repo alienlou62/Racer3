@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <vector>
 
 namespace RSI
 {
@@ -25,6 +26,7 @@ struct Racer3RunOptions
     bool robotPoseProbe = false;
     bool kinematicsDryRun = false;
     bool cartesianVectorMotion = false;
+    bool cartesianTraceMotion = false;
     bool positionOnlyIk = false;
     bool compactMotion = false;
     bool appendMotion = false;
@@ -39,6 +41,7 @@ struct Racer3RunOptions
     double returnFailToleranceUserUnits = 0.00100;
     std::array<double, 6> jointVectorUserUnits{};
     std::array<double, 6> cartesianVector{};
+    std::vector<std::array<double, 6>> cartesianTraceWaypoints;
 };
 
 class Racer3BasicMotion
@@ -74,6 +77,7 @@ private:
     void runRobotPoseProbe();
     void runKinematicsDryRun();
     void runCartesianVectorMotion();
+    void runCartesianTraceMotion();
     void printMotionPlan() const;
     void printActualPositions(const char* label);
     void printDiagnosticSnapshot(const char* label, bool includeErrorLogs = true);

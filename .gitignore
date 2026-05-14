@@ -3,6 +3,8 @@ build/
 *.user
 *.log
 *.csv
+bin/
+obj/
 build/
 build-vs2022/
 

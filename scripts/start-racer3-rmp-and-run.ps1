@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe", "kinematics-dry-run", "cartesian-vector")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe", "kinematics-dry-run", "cartesian-vector", "cartesian-trace")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -36,7 +36,9 @@ param(
 
     [string]$Joints = "",
 
-    [string]$Cartesian = "0,0,0,0,0,0"
+    [string]$Cartesian = "0,0,0,0,0,0",
+
+    [string]$CartesianTrace = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,12 +68,13 @@ Write-Host "ReturnWarn: $ReturnWarn user units"
 Write-Host "ReturnFail: $ReturnFail user units"
 if ($Mode -eq "joint-vector") { Write-Host "Joints:    $Joints" }
 if ($Mode -eq "kinematics-dry-run" -or $Mode -eq "cartesian-vector") { Write-Host "Cartesian: $Cartesian" }
-if ($Mode -eq "cartesian-vector") { Write-Host "PositionOnly: $PositionOnly" }
-if ($Mode -eq "cartesian-vector") { Write-Host "CompactMotion: $CompactMotion" }
-if ($Mode -eq "cartesian-vector") { Write-Host "AppendMotion: $AppendMotion" }
-if ($Mode -eq "cartesian-vector") { Write-Host "TrajectoryMotion: $TrajectoryMotion" }
-if ($Mode -eq "cartesian-vector") { Write-Host "EndpointOnly: $EndpointOnly" }
-if ($Mode -eq "cartesian-vector") { Write-Host "SegmentGoal: $SegmentGoal" }
+if ($Mode -eq "cartesian-trace") { Write-Host "CartesianTrace: $CartesianTrace" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "PositionOnly: $PositionOnly" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "CompactMotion: $CompactMotion" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "AppendMotion: $AppendMotion" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "TrajectoryMotion: $TrajectoryMotion" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "EndpointOnly: $EndpointOnly" }
+if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "SegmentGoal: $SegmentGoal" }
 Write-Host "Diag:      $Diagnostics"
 Write-Host "Dry run:   $DryRun"
 
@@ -241,6 +244,22 @@ switch ($Mode) {
         if ($SegmentGoal) { $ExeArgs += "--segment-goal" }
         $ExeArgs += "--cartesian"
         $ExeArgs += $Cartesian
+        if ($ConfirmMotion) { $ExeArgs += "--confirm-motion" }
+    }
+    "cartesian-trace" {
+        if ([string]::IsNullOrWhiteSpace($CartesianTrace)) {
+            throw 'cartesian-trace requires -CartesianTrace "x,y,z,0,0,0;...".'
+        }
+
+        if ($DryRun) {
+            $ExeArgs += "--dry-run"
+        }
+        $ExeArgs += "--cartesian-trace"
+        if ($PositionOnly) { $ExeArgs += "--position-only" }
+        if ($CompactMotion) { $ExeArgs += "--compact-motion" }
+        if ($EndpointOnly) { $ExeArgs += "--endpoint-only" }
+        $ExeArgs += "--cartesian-waypoints"
+        $ExeArgs += $CartesianTrace
         if ($ConfirmMotion) { $ExeArgs += "--confirm-motion" }
     }
     "joint-vector" {
