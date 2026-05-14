@@ -17,8 +17,10 @@ public sealed class ShapePathPlanner : IShapePathPlanner
         {
             ShapeKind.Circle => CreateRadialShapeInYzPlane(center, sizeMeters, 16),
             ShapeKind.Square => CreateSquareInYzPlane(center, sizeMeters),
-            ShapeKind.Triangle => CreateRadialShapeInYzPlane(center, sizeMeters, 3, startAngleRadians: -Math.PI / 2.0),
-            ShapeKind.Hexagon => CreateRadialShapeInYzPlane(center, sizeMeters, 6),
+            ShapeKind.Triangle => CreateCornerHeldClosedShapeInYzPlane(
+                CreateRadialShapeInYzPlane(center, sizeMeters, 3, startAngleRadians: -Math.PI / 2.0)),
+            ShapeKind.Hexagon => CreateCornerHeldClosedShapeInYzPlane(
+                CreateRadialShapeInYzPlane(center, sizeMeters, 6)),
             _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unsupported shape.")
         };
 
@@ -59,6 +61,28 @@ public sealed class ShapePathPlanner : IShapePathPlanner
             new(center.X, center.Y - halfSideMeters, center.Z - halfSideMeters, center.Roll, center.Pitch, center.Yaw)
         };
 
-        return points;
+        return CreateCornerHeldClosedShapeInYzPlane(points);
+    }
+
+    private static IReadOnlyList<CartesianPose> CreateCornerHeldClosedShapeInYzPlane(IReadOnlyList<CartesianPose> closedPoints)
+    {
+        if (closedPoints.Count < 2)
+        {
+            return closedPoints;
+        }
+
+        // Duplicate polygon vertices so the generated PVT trace explicitly reaches
+        // zero velocity at each corner before starting the next edge. This keeps
+        // polygon corners visually sharper without changing the robot backend or
+        // the smooth circle path.
+        var cornerHeldPoints = new List<CartesianPose>(closedPoints.Count * 2);
+
+        foreach (var point in closedPoints)
+        {
+            cornerHeldPoints.Add(point);
+            cornerHeldPoints.Add(point);
+        }
+
+        return cornerHeldPoints;
     }
 }
