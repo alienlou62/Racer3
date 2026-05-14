@@ -28,6 +28,8 @@ public sealed class MainViewModel : ObservableObject
     private bool _isProcessActive;
     private string _modeState = "Dry run ready";
     private string _executionSummary = string.Empty;
+    private string _lastRunStatus = "No run yet";
+    private string _lastRunDetail = "Select a shape and run controller validation first.";
     private string _commandPreview = string.Empty;
     private string _waypointPreview = string.Empty;
     private string _processLog = string.Empty;
@@ -159,6 +161,12 @@ public sealed class MainViewModel : ObservableObject
         {
             if (SetProperty(ref _isDryRun, value))
             {
+                if (_isDryRun && ConfirmMotion)
+                {
+                    ConfirmMotion = false;
+                }
+
+                OnPropertyChanged(nameof(IsConfirmMotionEnabled));
                 RefreshModeState();
                 RefreshPlanAndPreview();
             }
@@ -170,13 +178,16 @@ public sealed class MainViewModel : ObservableObject
         get => _confirmMotion;
         set
         {
-            if (SetProperty(ref _confirmMotion, value))
+            var requestedValue = value && IsConfirmMotionEnabled;
+            if (SetProperty(ref _confirmMotion, requestedValue))
             {
                 RefreshModeState();
                 RefreshPlanAndPreview();
             }
         }
     }
+
+    public bool IsConfirmMotionEnabled => !IsDryRun && !IsProcessActive;
 
     public bool IsProcessActive
     {
@@ -185,6 +196,12 @@ public sealed class MainViewModel : ObservableObject
         {
             if (SetProperty(ref _isProcessActive, value))
             {
+                OnPropertyChanged(nameof(IsConfirmMotionEnabled));
+                if (IsProcessActive && ConfirmMotion)
+                {
+                    ConfirmMotion = false;
+                }
+
                 RunSelectedShapeCommand.NotifyCanExecuteChanged();
                 StopCommand.NotifyCanExecuteChanged();
             }
@@ -207,6 +224,18 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _executionSummary;
         private set => SetProperty(ref _executionSummary, value);
+    }
+
+    public string LastRunStatus
+    {
+        get => _lastRunStatus;
+        private set => SetProperty(ref _lastRunStatus, value);
+    }
+
+    public string LastRunDetail
+    {
+        get => _lastRunDetail;
+        private set => SetProperty(ref _lastRunDetail, value);
     }
 
     public string WaypointPreview
@@ -241,6 +270,8 @@ public sealed class MainViewModel : ObservableObject
     {
         var plan = CreateCurrentPlan();
         var options = CreateMotionOptions();
+        LastRunStatus = options.ConfirmMotion ? "Live run starting" : "Validation starting";
+        LastRunDetail = $"{plan.Shape}: {plan.Waypoints.Count} requested waypoint(s).";
         AppendLog("ui", $"Run requested for {plan.Shape}; dry run: {options.DryRun}; confirm motion: {options.ConfirmMotion}.");
         AppendLog("ui", "Command preview at launch:");
         AppendLog("cmd", CommandPreview.Replace(Environment.NewLine, " "));
@@ -255,15 +286,32 @@ public sealed class MainViewModel : ObservableObject
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             var result = await _robotMotionService.TraceShapeAsync(plan, options, progress, cancellation.Token);
             AppendLog("ui", $"Process exited with code {result.ExitCode}.");
+            if (result.Succeeded)
+            {
+                LastRunStatus = options.ConfirmMotion ? "Live complete" : "Validated";
+                LastRunDetail = options.ConfirmMotion
+                    ? $"{plan.Shape}: backend completed live trace and returned to zero."
+                    : $"{plan.Shape}: backend accepted {plan.Waypoints.Count} waypoint(s); no motion commanded.";
+            }
+            else
+            {
+                LastRunStatus = "Failed";
+                LastRunDetail = $"{plan.Shape}: process exited with code {result.ExitCode}. Check Process Log.";
+            }
+
             ModeState = result.Succeeded ? "Complete" : "Process failed";
         }
         catch (OperationCanceledException)
         {
+            LastRunStatus = "Stopped";
+            LastRunDetail = "Operator cancelled the active process.";
             AppendLog("ui", "Run stopped by operator.");
             ModeState = "Stopped";
         }
         catch (Exception exception)
         {
+            LastRunStatus = "Error";
+            LastRunDetail = exception.Message;
             AppendLog("err", exception.Message);
             ModeState = "Error";
         }
@@ -320,8 +368,10 @@ public sealed class MainViewModel : ObservableObject
             WaypointPreview = preview.ToString();
             CommandPreview = BuildCommandPreview(commands);
             ExecutionSummary = IsDryRun
-                ? $"Validate only: connects/reads RMP, checks {plan.Waypoints.Count} waypoint(s), omits -ConfirmMotion, and should not enable amps."
-                : $"Live mode streams {plan.Waypoints.Count} waypoint(s) through backend cartesian-trace after validation gates pass.";
+                ? $"Controller validation only: connects/reads RMP, checks {plan.Waypoints.Count} waypoint(s), omits -ConfirmMotion, and should not enable amps."
+                : ConfirmMotion
+                    ? $"LIVE MOTION ARMED: streams {plan.Waypoints.Count} waypoint(s) only after backend cartesian-trace validation gates pass."
+                    : "Live mode is locked. Check Confirm Motion to arm live movement, or check Dry Run / Validate Only to validate without motion.";
         }
         catch (Exception exception)
         {
@@ -342,9 +392,9 @@ public sealed class MainViewModel : ObservableObject
         }
 
         ModeState = IsDryRun
-            ? "Dry run ready"
+            ? "Controller validation ready"
             : ConfirmMotion
-                ? "Live motion armed"
+                ? "LIVE MOTION ARMED"
                 : "Live motion locked";
     }
 

@@ -172,15 +172,33 @@
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="10">
                         <CheckBox Content="Dry Run / Validate Only" IsChecked="{Binding IsDryRun}"/>
-                        <CheckBox Content="Confirm Motion" IsChecked="{Binding ConfirmMotion}"/>
+                        <CheckBox Content="Confirm Motion"
+                                  IsChecked="{Binding ConfirmMotion}"
+                                  IsEnabled="{Binding IsConfirmMotionEnabled}"/>
+                        <TextBlock Text="Confirm Motion is disabled while validation-only mode is selected."
+                                   Classes="Label"
+                                   TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
-                    <TextBlock Text="{Binding ExecutionSummary}"
-                               Foreground="#AFC0D2"
-                               TextWrapping="Wrap"
-                               FontSize="12"/>
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="{Binding ExecutionSummary}"
+                                   Foreground="#AFC0D2"
+                                   TextWrapping="Wrap"
+                                   FontSize="12"/>
+                        <Border Background="#162431" BorderBrush="#2E4356" BorderThickness="1" Padding="10,7">
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="{Binding LastRunStatus}"
+                                           Foreground="#F2F7FC"
+                                           FontWeight="SemiBold"/>
+                                <TextBlock Text="{Binding LastRunDetail}"
+                                           Foreground="#AFC0D2"
+                                           TextWrapping="Wrap"
+                                           FontSize="12"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
                 </Border>
 
                 <Button Content="Run Selected Shape"
