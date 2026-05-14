@@ -1599,6 +1599,7 @@ struct CartesianTraceLegPlan
 struct CartesianTracePlan
 {
     bool accepted = false;
+    size_t requestedWaypointCount = 0;
     std::vector<CartesianTraceLegPlan> legs;
     std::vector<JointVector> outboundSequence;
     std::string rejectionReason;
@@ -1642,6 +1643,7 @@ CartesianTracePlan buildCartesianTracePlan(
     const std::vector<CartesianVector>& waypointDeltasFromStart)
 {
     CartesianTracePlan tracePlan{};
+    tracePlan.requestedWaypointCount = waypointDeltasFromStart.size();
     tracePlan.rejectionReason = "No Cartesian trace waypoints were evaluated.";
 
     if (waypointDeltasFromStart.empty())
@@ -1733,7 +1735,8 @@ void printCartesianTracePlanSummary(const CartesianTracePlan& plan)
 {
     std::cout << "\nCartesian trace plan summary\n";
     std::cout << "  Accepted: " << (plan.accepted ? "YES" : "NO") << "\n";
-    std::cout << "  Requested waypoint count: " << plan.legs.size() << "\n";
+    std::cout << "  Requested waypoint count: " << plan.requestedWaypointCount << "\n";
+    std::cout << "  Processed waypoint count: " << plan.legs.size() << "\n";
     std::cout << "  Validated joint waypoint count: " << plan.outboundSequence.size() << "\n";
     std::cout << "  Total adaptive Cartesian segments: "
               << totalCartesianTraceSegmentCount(plan)
@@ -1751,7 +1754,7 @@ void printCartesianTracePlanSummary(const CartesianTracePlan& plan)
         std::cout << "\n  Trace waypoint "
                   << leg.waypointNumber
                   << " / "
-                  << plan.legs.size()
+                  << plan.requestedWaypointCount
                   << "\n";
         printCartesianVector("    Requested waypoint delta from start", leg.requestedWaypointDeltaFromStart);
         printCartesianVector("    Planned leg delta from current trace pose", leg.legDeltaFromCurrent);
@@ -2863,7 +2866,12 @@ void Racer3BasicMotion::configureAxes()
         std::cout << "Axis 5 / J5 HomeActionSet(RSIActionNONE) applied.\n";
     }
 
-    if (AllMotionEnabled || JointVectorMotionEnabled || RobotPoseProbeEnabled || KinematicsDryRunEnabled || CartesianVectorMotionEnabled)
+    if (AllMotionEnabled ||
+        JointVectorMotionEnabled ||
+        RobotPoseProbeEnabled ||
+        KinematicsDryRunEnabled ||
+        CartesianVectorMotionEnabled ||
+        CartesianTraceMotionEnabled)
     {
         configureAllAxesForAllMotion();
     }
