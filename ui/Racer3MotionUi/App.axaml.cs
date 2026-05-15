@@ -28,6 +28,7 @@ public partial class App : Application
             var config = Racer3MotionUiConfig.Load();
             var processRunner = new ProcessRunner();
             var motionService = new PowerShellRobotMotionService(config, processRunner);
+            var robotSessionService = new LocalRobotSessionService(config);
             var shapePathPlanner = new ShapePathPlanner();
             var localMotionChatService = new RuleBasedMotionChatService();
             var ollamaMotionChatService = new OllamaMotionChatService(
@@ -60,6 +61,7 @@ public partial class App : Application
                 DataContext = new MainViewModel(
                     shapePathPlanner,
                     motionService,
+                    robotSessionService,
                     motionChatService,
                     localMotionChatService,
                     config),

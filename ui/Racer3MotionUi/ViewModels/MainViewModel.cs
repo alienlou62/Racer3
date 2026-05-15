@@ -28,6 +28,7 @@ public sealed class MainViewModel : ObservableObject
 
     private readonly IShapePathPlanner _shapePathPlanner;
     private readonly IRobotMotionService _robotMotionService;
+    private readonly IRobotSessionService _robotSessionService;
     private readonly IMotionChatService _llmMotionChatService;
     private readonly IMotionChatService _localMotionChatService;
     private readonly double _defaultVelocity;
@@ -55,7 +56,7 @@ public sealed class MainViewModel : ObservableObject
     private string _motionAssistantStatus = string.Empty;
     private bool _useLlmAssistant = true;
     private bool _isMotionAssistantBusy;
-    private string _robotSessionStatus = "Not connected - armed session not implemented yet";
+    private string _robotSessionStatus = "Not connected - session process skeleton ready to start";
     private bool _keepAmpsEnabledDuringSession = true;
     private bool _holdFinalPoseAfterCommand = true;
     private bool _returnToZeroAfterCommand;
@@ -66,12 +67,14 @@ public sealed class MainViewModel : ObservableObject
     public MainViewModel(
         IShapePathPlanner shapePathPlanner,
         IRobotMotionService robotMotionService,
+        IRobotSessionService robotSessionService,
         IMotionChatService llmMotionChatService,
         IMotionChatService localMotionChatService,
         Racer3MotionUiConfig config)
     {
         _shapePathPlanner = shapePathPlanner;
         _robotMotionService = robotMotionService;
+        _robotSessionService = robotSessionService;
         _llmMotionChatService = llmMotionChatService;
         _localMotionChatService = localMotionChatService;
         _defaultVelocity = config.DefaultVelocity;
@@ -88,9 +91,9 @@ public sealed class MainViewModel : ObservableObject
         RunSelectedShapeCommand = new AsyncRelayCommand(RunSelectedShapeAsync, CanRunSelectedShape);
         StopCommand = new RelayCommand(StopProcess, () => IsProcessActive);
         ClearLogCommand = new RelayCommand(() => ProcessLog = string.Empty);
-        StartArmedSessionCommand = new RelayCommand(StartArmedSessionPlaceholder);
-        ShutdownSessionCommand = new RelayCommand(ShutdownSessionPlaceholder);
-        StopSessionMotionCommand = new RelayCommand(StopSessionMotionPlaceholder);
+        StartArmedSessionCommand = new AsyncRelayCommand(StartArmedSessionAsync, CanStartArmedSession);
+        ShutdownSessionCommand = new AsyncRelayCommand(ShutdownSessionAsync, CanUseSessionControls);
+        StopSessionMotionCommand = new AsyncRelayCommand(StopSessionMotionAsync, CanUseSessionControls);
 
         RefreshMotionAssistantStatus();
         AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
@@ -107,11 +110,11 @@ public sealed class MainViewModel : ObservableObject
 
     public IRelayCommand ClearLogCommand { get; }
 
-    public IRelayCommand StartArmedSessionCommand { get; }
+    public IAsyncRelayCommand StartArmedSessionCommand { get; }
 
-    public IRelayCommand ShutdownSessionCommand { get; }
+    public IAsyncRelayCommand ShutdownSessionCommand { get; }
 
-    public IRelayCommand StopSessionMotionCommand { get; }
+    public IAsyncRelayCommand StopSessionMotionCommand { get; }
 
     public string Title => "Racer3 Shape Trace Demo";
 
@@ -254,6 +257,7 @@ public sealed class MainViewModel : ObservableObject
 
                 RunSelectedShapeCommand.NotifyCanExecuteChanged();
                 StopCommand.NotifyCanExecuteChanged();
+                StartArmedSessionCommand.NotifyCanExecuteChanged();
             }
         }
     }
@@ -640,22 +644,85 @@ public sealed class MainViewModel : ObservableObject
         _runCancellation?.Cancel();
     }
 
-    private void StartArmedSessionPlaceholder()
+    private bool CanStartArmedSession()
     {
-        RobotSessionStatus = "Planned only - persistent armed session backend is not implemented yet.";
-        AppendLog("ui", "Start Armed Session requested, but this patch only adds the planned UI controls. No RMP connection, amp enable, or motion was started.");
+        return !IsProcessActive && !_robotSessionService.IsRunning;
     }
 
-    private void ShutdownSessionPlaceholder()
+    private bool CanUseSessionControls()
     {
-        RobotSessionStatus = "Not connected - shutdown is planned for the future session backend.";
-        AppendLog("ui", "Shutdown Session requested, but no persistent session is active in this UI-only placeholder.");
+        return _robotSessionService.IsRunning;
     }
 
-    private void StopSessionMotionPlaceholder()
+    private async Task StartArmedSessionAsync()
     {
-        RobotSessionStatus = "Stop requested - no persistent session is active.";
-        AppendLog("ui", "Stop Motion requested for the planned armed session. Existing one-shot Stop still controls active one-shot processes.");
+        RobotSessionStatus = "Starting session process skeleton...";
+        AppendLog("ui", "Start Armed Session requested. Starting local persistent session process skeleton; this phase does not connect RMP or enable amps.");
+
+        try
+        {
+            var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
+            await _robotSessionService.StartAsync(progress, CancellationToken.None);
+            RobotSessionStatus = "Session process ready - skeleton only; amps are not enabled yet.";
+            AppendLog("ui", "Persistent session process is ready. Next backend milestone will add RMP connect and one-time amp enable.");
+        }
+        catch (Exception exception)
+        {
+            RobotSessionStatus = "Session start failed";
+            AppendLog("err", $"Persistent session start failed: {exception.Message}");
+        }
+        finally
+        {
+            StartArmedSessionCommand.NotifyCanExecuteChanged();
+            ShutdownSessionCommand.NotifyCanExecuteChanged();
+            StopSessionMotionCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private async Task ShutdownSessionAsync()
+    {
+        RobotSessionStatus = "Shutting down session process...";
+        AppendLog("ui", "Shutdown Session requested for persistent session process.");
+
+        try
+        {
+            await _robotSessionService.ShutdownAsync(CancellationToken.None);
+            RobotSessionStatus = "Not connected - session process stopped.";
+            AppendLog("ui", "Persistent session process shutdown complete.");
+        }
+        catch (Exception exception)
+        {
+            RobotSessionStatus = "Session shutdown failed";
+            AppendLog("err", $"Persistent session shutdown failed: {exception.Message}");
+        }
+        finally
+        {
+            StartArmedSessionCommand.NotifyCanExecuteChanged();
+            ShutdownSessionCommand.NotifyCanExecuteChanged();
+            StopSessionMotionCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private async Task StopSessionMotionAsync()
+    {
+        RobotSessionStatus = "Stop requested for session process skeleton.";
+        AppendLog("ui", "Stop Motion requested for persistent session process skeleton.");
+
+        try
+        {
+            await _robotSessionService.StopMotionAsync(CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            RobotSessionStatus = "Session stop failed";
+            AppendLog("err", $"Persistent session stop failed: {exception.Message}");
+        }
+        finally
+        {
+            StartArmedSessionCommand.NotifyCanExecuteChanged();
+            ShutdownSessionCommand.NotifyCanExecuteChanged();
+            StopSessionMotionCommand.NotifyCanExecuteChanged();
+        }
     }
 
     private IMotionChatService SelectMotionChatService()

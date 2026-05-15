@@ -208,8 +208,8 @@
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="Robot Session (planned)" Classes="PanelTitle"/>
-                        <TextBlock Text="Future armed session mode keeps amps enabled from Start Session until Shutdown Session. Existing one-shot Run Selected Shape is unchanged." Classes="Label" TextWrapping="Wrap"/>
+                        <TextBlock Text="Robot Session (skeleton)" Classes="PanelTitle"/>
+                        <TextBlock Text="Start Armed Session now launches a local persistent process skeleton. It does not connect RMP or enable amps yet. Existing one-shot Run Selected Shape is unchanged." Classes="Label" TextWrapping="Wrap"/>
                         <TextBlock Text="{Binding RobotSessionStatus}" Foreground="#AFC0D2" TextWrapping="Wrap" FontSize="12"/>
                         <Grid ColumnDefinitions="*,*">
                             <Button Content="Start Armed Session"
@@ -254,7 +254,7 @@
                         <TextBlock Text="W/S: Z up/down   A/D: Y left/right   Q/E: X forward/back   Arrow keys: Y/Z plane   Space: stop"
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
-                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend is implemented."
+                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend supports validated cartesian_jog commands."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
                     </StackPanel>

@@ -188,3 +188,39 @@ First implementation should use one key press per small validated jog command. C
 7. **Keyboard jog**: send small validated Cartesian jog commands while armed.
 8. **Idle timeout and fault handling**: disable amps on inactivity, fault, or lost process.
 9. **Optional digital twin export/ROS2 bridge**: publish the same session commands to simulator consumers.
+
+
+## Implemented Phase 2 skeleton
+
+This revision adds the first non-motion implementation step for the local persistent process:
+
+```powershell
+.\build-vs2022\Release\racer3-basic-motion.exe --session-server
+```
+
+The skeleton command loop:
+
+1. Starts without connecting to RMP.
+2. Does not run `rsiconfig`.
+3. Does not create a MotionController.
+4. Does not enable amplifiers.
+5. Prints a JSON `session_ready` event.
+6. Accepts `hello`, `status`, `stop`, and `shutdown` commands over stdin.
+7. Rejects `trace` and `cartesian_jog` commands with a clear no-motion response.
+8. Exits cleanly on `shutdown`.
+
+The Avalonia UI now starts this skeleton process from the **Start Armed Session** button and controls it with **Stop Motion** and **Shutdown Session**. This validates the UI-to-persistent-process architecture before any RMP or amp-enable behavior is added.
+
+The next backend phase should replace the skeleton state with a real armed lifecycle:
+
+```text
+session process starts
+-> run/configure RMP once
+-> connect MotionController once
+-> configure axes once
+-> clear faults
+-> enable amps once
+-> report ARMED_IDLE
+-> accept validated trace/jog commands
+-> keep amps enabled until shutdown/timeout/fault
+```

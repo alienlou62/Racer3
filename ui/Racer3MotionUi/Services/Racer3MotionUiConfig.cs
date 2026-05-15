@@ -13,6 +13,8 @@ public sealed class Racer3MotionUiConfig
 
     public string PowerShellPath { get; init; } = "powershell";
 
+    public string SessionExecutablePath { get; init; } = @".\build-vs2022\Release\racer3-basic-motion.exe";
+
     public double DefaultVelocity { get; init; } = 0.04;
 
     public double DefaultShapeSizeMeters { get; init; } = 0.05;

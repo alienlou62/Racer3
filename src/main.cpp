@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <rsi.h>
@@ -36,7 +37,8 @@ void printUsage()
         << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n"
         << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
         << "  racer3-basic-motion --cartesian-vector [--position-only] [--compact-motion] [--trajectory-motion] [--endpoint-only] [--segment-goal] [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
-        << "  racer3-basic-motion --cartesian-trace --position-only --endpoint-only [--compact-motion] [--confirm-motion] --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\" [--velocity 0.02] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --cartesian-trace --position-only --endpoint-only [--compact-motion] [--confirm-motion] --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\" [--velocity 0.02] [--diagnostics]\n"
+        << "  racer3-basic-motion --session-server\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -49,6 +51,7 @@ void printUsage()
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
+        << "  --session-server Start a persistent local command loop skeleton for future armed sessions. No RMP connection, amp enable, or motion in this phase.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -250,6 +253,68 @@ double maxAbsJointVector(const std::array<double, AxisCount>& values)
 }
 
 
+
+std::string normalizeSessionCommand(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character)
+    {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+void writeSessionEvent(const std::string& json)
+{
+    std::cout << json << std::endl;
+    std::cout.flush();
+}
+
+int runSessionServer()
+{
+    writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server skeleton ready. No RMP connection, amp enable, or motion is implemented in this phase.\"}");
+
+    std::string line;
+    while (std::getline(std::cin, line))
+    {
+        const std::string command = normalizeSessionCommand(line);
+
+        if (command.empty())
+        {
+            continue;
+        }
+
+        if (command.find("shutdown") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"session_shutdown\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server skeleton shutting down. No amps were enabled.\"}");
+            return 0;
+        }
+
+        if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Skeleton session process is alive. Future phases will connect RMP and enable amps once.\"}");
+            continue;
+        }
+
+        if (command.find("stop") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Stop acknowledged by skeleton session. No motion is active.\"}");
+            continue;
+        }
+
+        if (command.find("trace") != std::string::npos || command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Motion commands are rejected in the skeleton session phase. No RMP connection, amp enable, or motion was started.\"}");
+            continue;
+        }
+
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Unknown skeleton session command. Supported now: hello, status, stop, shutdown.\"}");
+    }
+
+    writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session input closed. Skeleton session exiting without amp enable.\"}");
+    return 0;
+}
+
+
 void validateOptions(const Racer3RunOptions& options)
 {
     if (options.stepUserUnits <= 0.0)
@@ -309,6 +374,11 @@ int main(int argc, char* argv[])
     {
         printUsage();
         return 0;
+    }
+
+    if (hasArg(args, "--session-server"))
+    {
+        return runSessionServer();
     }
 
     try
