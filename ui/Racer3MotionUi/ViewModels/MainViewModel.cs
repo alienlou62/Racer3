@@ -338,6 +338,25 @@ public sealed class MainViewModel : ObservableObject
         }
 
         AppendAssistantLog($"> {rawCommand}");
+
+        if (RuleBasedMotionChatService.HasExecutionIntent(rawCommand))
+        {
+            RefreshMotionAssistantStatus();
+            ApplyMotionChatResponse(new MotionChatResponse(
+                MotionChatAction.Explain,
+                "I prepared the plan. Validate first, then arm Confirm Motion and press Run Selected Shape."));
+            MotionAssistantInput = string.Empty;
+            return;
+        }
+
+        if (TryHandleAssistantMetaCommand(rawCommand, out var metaResponse))
+        {
+            RefreshMotionAssistantStatus();
+            AppendAssistantLog(metaResponse);
+            MotionAssistantInput = string.Empty;
+            return;
+        }
+
         IsMotionAssistantBusy = true;
 
         try
@@ -346,16 +365,6 @@ public sealed class MainViewModel : ObservableObject
                 rawCommand,
                 CreateCurrentMotionPlan(),
                 CreateDefaultMotionPlan());
-
-            if (RuleBasedMotionChatService.HasExecutionIntent(rawCommand))
-            {
-                RefreshMotionAssistantStatus();
-                ApplyMotionChatResponse(new MotionChatResponse(
-                    MotionChatAction.Explain,
-                    "I prepared the plan. Validate first, then arm Confirm Motion and press Run Selected Shape."));
-                MotionAssistantInput = string.Empty;
-                return;
-            }
 
             var service = SelectMotionChatService();
             MotionChatResponse response;
@@ -392,6 +401,103 @@ public sealed class MainViewModel : ObservableObject
         {
             IsMotionAssistantBusy = false;
         }
+    }
+
+    private bool TryHandleAssistantMetaCommand(string rawCommand, out string response)
+    {
+        var command = NormalizeAssistantCommand(rawCommand);
+
+        if (command is "help" or "what can you do" or "what do you do" or "commands")
+        {
+            response = "I can plan robot shape previews only. Try: draw square, draw a bigger triangle higher up, make it slower, move left, reset. I cannot execute motion from chat; validate and use Run Selected Shape manually.";
+            return true;
+        }
+
+        if (command is "what are you" or "who are you" or "are you an ai" or "are you ai")
+        {
+            response = "I am the Racer3 Motion Assistant. I convert chat requests into safe preview plans for the shape trace UI. I cannot directly run the robot.";
+            return true;
+        }
+
+        if (command is "what mode are you in"
+            or "what provider are you using"
+            or "which provider are you using"
+            or "what model are you using"
+            or "what model do you run"
+            or "which model are you"
+            or "what is your model"
+            or "what is your provider")
+        {
+            response = BuildAssistantProviderStatusResponse();
+            return true;
+        }
+
+        response = string.Empty;
+        return false;
+    }
+
+    private string BuildAssistantProviderStatusResponse()
+    {
+        var statusText = UseLlmAssistant
+            ? _llmMotionChatService.StatusText
+            : _localMotionChatService.StatusText;
+
+        var provider = UseLlmAssistant ? "configured assistant" : "LocalRules";
+        var model = "none";
+        var details = string.Empty;
+
+        if (statusText.StartsWith("OpenAI mode:", StringComparison.OrdinalIgnoreCase))
+        {
+            provider = "OpenAI";
+            model = statusText["OpenAI mode:".Length..].Trim();
+        }
+        else if (statusText.StartsWith("Gemini mode:", StringComparison.OrdinalIgnoreCase))
+        {
+            provider = "Gemini";
+            model = statusText["Gemini mode:".Length..].Trim();
+        }
+        else if (statusText.StartsWith("Ollama mode:", StringComparison.OrdinalIgnoreCase))
+        {
+            provider = "Ollama";
+            var ollamaStatus = statusText["Ollama mode:".Length..].Trim();
+            var atIndex = ollamaStatus.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+            if (atIndex >= 0)
+            {
+                model = ollamaStatus[..atIndex].Trim();
+                details = $" Base URL: {ollamaStatus[(atIndex + 4)..].Trim()}.";
+            }
+            else
+            {
+                model = ollamaStatus;
+            }
+        }
+        else if (statusText.Contains("local", StringComparison.OrdinalIgnoreCase)
+                 || statusText.Contains("rules", StringComparison.OrdinalIgnoreCase))
+        {
+            provider = "LocalRules";
+            model = "none";
+        }
+        else
+        {
+            details = $" Status: {statusText}";
+        }
+
+        return $"Assistant provider: {provider}. Model: {model}.{details} Chat updates preview only.";
+    }
+
+    private static string NormalizeAssistantCommand(string input)
+    {
+        var builder = new StringBuilder(input.Length);
+        foreach (var character in input.Trim().ToLowerInvariant())
+        {
+            builder.Append(char.IsLetterOrDigit(character) ? character : ' ');
+        }
+
+        return string.Join(
+            ' ',
+            builder
+                .ToString()
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
     private bool CanRunSelectedShape()
