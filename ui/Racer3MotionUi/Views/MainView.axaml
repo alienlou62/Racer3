@@ -148,6 +148,7 @@
                 BorderBrush="#233040"
                 BorderThickness="1,0,0,0"
                 Padding="20,22,22,18">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Spacing="14">
                 <TextBlock Text="Operator Controls" Classes="PanelTitle"/>
 
@@ -168,6 +169,32 @@
                     <TextBox Grid.Column="1" Text="{Binding CenterY, Mode=TwoWay}" Watermark="Y" Margin="5,0,5,0"/>
                     <TextBox Grid.Column="2" Text="{Binding CenterZ, Mode=TwoWay}" Watermark="Z" Margin="5,0,0,0"/>
                 </Grid>
+
+                <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Motion Assistant" Classes="PanelTitle"/>
+                        <TextBlock Text="Try: draw square, make it bigger, move up, go slower."
+                                   Classes="Label"
+                                   TextWrapping="Wrap"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBox Text="{Binding MotionAssistantInput, Mode=TwoWay}"
+                                     Watermark="draw square"
+                                     Margin="0,0,8,0"/>
+                            <Button Grid.Column="1"
+                                    Content="Interpret"
+                                    Classes="Secondary"
+                                    Command="{Binding InterpretMotionCommandCommand}"
+                                    HorizontalContentAlignment="Center"/>
+                        </Grid>
+                        <TextBox Text="{Binding MotionAssistantLog}"
+                                 FontFamily="Consolas"
+                                 FontSize="12"
+                                 IsReadOnly="True"
+                                 AcceptsReturn="True"
+                                 TextWrapping="Wrap"
+                                 Height="92"/>
+                    </StackPanel>
+                </Border>
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="10">
@@ -223,6 +250,7 @@
                             Margin="5,0,0,0"/>
                 </Grid>
             </StackPanel>
+            </ScrollViewer>
         </Border>
 
         <Border Grid.Row="2"

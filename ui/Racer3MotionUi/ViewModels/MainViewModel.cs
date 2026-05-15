@@ -14,8 +14,21 @@ namespace Racer3MotionUi.ViewModels;
 
 public sealed class MainViewModel : ObservableObject
 {
+    private const double MinVelocity = 0.005;
+    private const double MaxVelocity = 0.10;
+    private const double VelocityStep = 0.005;
+    private const double MinShapeSizeMeters = 0.005;
+    private const double MaxShapeSizeMeters = 0.15;
+    private const double BiggerScale = 1.20;
+    private const double SmallerScale = 0.80;
+    private const double CenterStepMeters = 0.01;
+    private static readonly ShapeKind DefaultShape = ShapeKind.Circle;
+
     private readonly IShapePathPlanner _shapePathPlanner;
     private readonly IRobotMotionService _robotMotionService;
+    private readonly double _defaultVelocity;
+    private readonly double _defaultShapeSizeMeters;
+    private readonly CartesianPose _defaultCenter;
     private CancellationTokenSource? _runCancellation;
     private ShapeKind _selectedShape = ShapeKind.Circle;
     private double _velocity;
@@ -33,6 +46,8 @@ public sealed class MainViewModel : ObservableObject
     private string _commandPreview = string.Empty;
     private string _waypointPreview = string.Empty;
     private string _processLog = string.Empty;
+    private string _motionAssistantInput = string.Empty;
+    private string _motionAssistantLog = string.Empty;
 
     public MainViewModel(
         IShapePathPlanner shapePathPlanner,
@@ -41,6 +56,9 @@ public sealed class MainViewModel : ObservableObject
     {
         _shapePathPlanner = shapePathPlanner;
         _robotMotionService = robotMotionService;
+        _defaultVelocity = config.DefaultVelocity;
+        _defaultShapeSizeMeters = config.DefaultShapeSizeMeters;
+        _defaultCenter = config.DefaultCenter;
         _velocity = config.DefaultVelocity;
         _shapeSizeMeters = config.DefaultShapeSizeMeters;
         _centerX = config.DefaultCenter.X;
@@ -48,14 +66,18 @@ public sealed class MainViewModel : ObservableObject
         _centerZ = config.DefaultCenter.Z;
 
         SelectShapeCommand = new RelayCommand<string?>(SelectShape);
+        InterpretMotionCommandCommand = new RelayCommand(InterpretMotionCommand);
         RunSelectedShapeCommand = new AsyncRelayCommand(RunSelectedShapeAsync, CanRunSelectedShape);
         StopCommand = new RelayCommand(StopProcess, () => IsProcessActive);
         ClearLogCommand = new RelayCommand(() => ProcessLog = string.Empty);
 
+        AppendAssistantLog("Assistant ready. Commands update the plan preview only.");
         RefreshPlanAndPreview();
     }
 
     public IRelayCommand<string?> SelectShapeCommand { get; }
+
+    public IRelayCommand InterpretMotionCommandCommand { get; }
 
     public IAsyncRelayCommand RunSelectedShapeCommand { get; }
 
@@ -250,12 +272,59 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _processLog, value);
     }
 
+    public string MotionAssistantInput
+    {
+        get => _motionAssistantInput;
+        set => SetProperty(ref _motionAssistantInput, value);
+    }
+
+    public string MotionAssistantLog
+    {
+        get => _motionAssistantLog;
+        private set => SetProperty(ref _motionAssistantLog, value);
+    }
+
     private void SelectShape(string? shapeName)
     {
         if (Enum.TryParse<ShapeKind>(shapeName, out var shape))
         {
             SelectedShape = shape;
         }
+    }
+
+    private void InterpretMotionCommand()
+    {
+        var rawCommand = MotionAssistantInput.Trim();
+        if (string.IsNullOrWhiteSpace(rawCommand))
+        {
+            AppendAssistantLog("Type a command such as draw square or move up.");
+            return;
+        }
+
+        var normalizedCommand = NormalizeAssistantCommand(rawCommand);
+        AppendAssistantLog($"> {rawCommand}");
+
+        var response = normalizedCommand switch
+        {
+            "draw square" => SelectAssistantShape(ShapeKind.Square),
+            "draw triangle" => SelectAssistantShape(ShapeKind.Triangle),
+            "draw circle" => SelectAssistantShape(ShapeKind.Circle),
+            "draw hexagon" => SelectAssistantShape(ShapeKind.Hexagon),
+            "make it bigger" => ScaleAssistantShape(BiggerScale),
+            "make it smaller" => ScaleAssistantShape(SmallerScale),
+            "move up" => MoveAssistantCenter(deltaY: 0.0, deltaZ: CenterStepMeters),
+            "move down" => MoveAssistantCenter(deltaY: 0.0, deltaZ: -CenterStepMeters),
+            "move left" => MoveAssistantCenter(deltaY: -CenterStepMeters, deltaZ: 0.0),
+            "move right" => MoveAssistantCenter(deltaY: CenterStepMeters, deltaZ: 0.0),
+            "go faster" => AdjustAssistantVelocity(VelocityStep),
+            "go slower" => AdjustAssistantVelocity(-VelocityStep),
+            "reset" => ResetAssistantPlan(),
+            "run it" => "Plan is ready. Validate first, then arm Confirm Motion and press Run Selected Shape.",
+            _ => "I can interpret: draw square, draw triangle, draw circle, draw hexagon, make it bigger, make it smaller, move up, move down, move left, move right, go faster, go slower, reset, run it."
+        };
+
+        AppendAssistantLog(response);
+        MotionAssistantInput = string.Empty;
     }
 
     private bool CanRunSelectedShape()
@@ -326,6 +395,73 @@ public sealed class MainViewModel : ObservableObject
     private void StopProcess()
     {
         _runCancellation?.Cancel();
+    }
+
+    private string SelectAssistantShape(ShapeKind shape)
+    {
+        SelectedShape = shape;
+        return $"{shape} selected. Waypoint preview and command preview updated.";
+    }
+
+    private string ScaleAssistantShape(double scale)
+    {
+        ShapeSizeMeters = RoundMeters(Math.Clamp(
+            ShapeSizeMeters * scale,
+            MinShapeSizeMeters,
+            MaxShapeSizeMeters));
+
+        return FormattableString.Invariant(
+            $"Size/radius set to {ShapeSizeMeters:0.0000} m. Waypoint preview updated.");
+    }
+
+    private string MoveAssistantCenter(double deltaY, double deltaZ)
+    {
+        CenterY = RoundMeters(CenterY + deltaY);
+        CenterZ = RoundMeters(CenterZ + deltaZ);
+
+        return FormattableString.Invariant(
+            $"Center set to Y={CenterY:0.0000} m, Z={CenterZ:0.0000} m. Waypoint preview updated.");
+    }
+
+    private string AdjustAssistantVelocity(double delta)
+    {
+        Velocity = RoundVelocity(Math.Clamp(
+            Velocity + delta,
+            MinVelocity,
+            MaxVelocity));
+
+        return FormattableString.Invariant(
+            $"Velocity set to {Velocity:0.0000} m/s. Command preview updated.");
+    }
+
+    private string ResetAssistantPlan()
+    {
+        SelectedShape = DefaultShape;
+        Velocity = _defaultVelocity;
+        ShapeSizeMeters = _defaultShapeSizeMeters;
+        CenterX = _defaultCenter.X;
+        CenterY = _defaultCenter.Y;
+        CenterZ = _defaultCenter.Z;
+        IsDryRun = true;
+        ConfirmMotion = false;
+
+        return "Reset to safe defaults. Dry Run / Validate Only is enabled and live motion is disarmed.";
+    }
+
+    private static string NormalizeAssistantCommand(string command)
+    {
+        var cleaned = command.Trim().Trim('.', '!', '?').ToLowerInvariant();
+        return string.Join(' ', cleaned.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static double RoundMeters(double value)
+    {
+        return Math.Round(value, 4);
+    }
+
+    private static double RoundVelocity(double value)
+    {
+        return Math.Round(value, 4);
     }
 
     private ShapeTracePlan CreateCurrentPlan()
@@ -419,5 +555,19 @@ public sealed class MainViewModel : ObservableObject
     {
         var timestamp = DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
         ProcessLog += $"[{timestamp}] [{stream}] {text}{Environment.NewLine}";
+    }
+
+    private void AppendAssistantLog(string text)
+    {
+        var timestamp = DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+        var entry = $"[{timestamp}] {text}";
+        var nextLog = string.IsNullOrEmpty(MotionAssistantLog)
+            ? entry
+            : $"{MotionAssistantLog}{Environment.NewLine}{entry}";
+        var lines = nextLog.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
+
+        MotionAssistantLog = string.Join(
+            Environment.NewLine,
+            lines.Skip(Math.Max(0, lines.Length - 24)));
     }
 }
