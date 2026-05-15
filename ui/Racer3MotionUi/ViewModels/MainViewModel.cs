@@ -55,6 +55,13 @@ public sealed class MainViewModel : ObservableObject
     private string _motionAssistantStatus = string.Empty;
     private bool _useLlmAssistant = true;
     private bool _isMotionAssistantBusy;
+    private string _robotSessionStatus = "Not connected - armed session not implemented yet";
+    private bool _keepAmpsEnabledDuringSession = true;
+    private bool _holdFinalPoseAfterCommand = true;
+    private bool _returnToZeroAfterCommand;
+    private bool _isJogModeEnabled;
+    private double _jogStepMeters = 0.005;
+    private double _jogVelocity = 0.025;
 
     public MainViewModel(
         IShapePathPlanner shapePathPlanner,
@@ -81,6 +88,9 @@ public sealed class MainViewModel : ObservableObject
         RunSelectedShapeCommand = new AsyncRelayCommand(RunSelectedShapeAsync, CanRunSelectedShape);
         StopCommand = new RelayCommand(StopProcess, () => IsProcessActive);
         ClearLogCommand = new RelayCommand(() => ProcessLog = string.Empty);
+        StartArmedSessionCommand = new RelayCommand(StartArmedSessionPlaceholder);
+        ShutdownSessionCommand = new RelayCommand(ShutdownSessionPlaceholder);
+        StopSessionMotionCommand = new RelayCommand(StopSessionMotionPlaceholder);
 
         RefreshMotionAssistantStatus();
         AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
@@ -96,6 +106,12 @@ public sealed class MainViewModel : ObservableObject
     public IRelayCommand StopCommand { get; }
 
     public IRelayCommand ClearLogCommand { get; }
+
+    public IRelayCommand StartArmedSessionCommand { get; }
+
+    public IRelayCommand ShutdownSessionCommand { get; }
+
+    public IRelayCommand StopSessionMotionCommand { get; }
 
     public string Title => "Racer3 Shape Trace Demo";
 
@@ -318,6 +334,60 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _isMotionAssistantBusy;
         private set => SetProperty(ref _isMotionAssistantBusy, value);
+    }
+
+    public string RobotSessionStatus
+    {
+        get => _robotSessionStatus;
+        private set => SetProperty(ref _robotSessionStatus, value);
+    }
+
+    public bool KeepAmpsEnabledDuringSession
+    {
+        get => _keepAmpsEnabledDuringSession;
+        set => SetProperty(ref _keepAmpsEnabledDuringSession, value);
+    }
+
+    public bool HoldFinalPoseAfterCommand
+    {
+        get => _holdFinalPoseAfterCommand;
+        set
+        {
+            if (SetProperty(ref _holdFinalPoseAfterCommand, value) && value && ReturnToZeroAfterCommand)
+            {
+                ReturnToZeroAfterCommand = false;
+            }
+        }
+    }
+
+    public bool ReturnToZeroAfterCommand
+    {
+        get => _returnToZeroAfterCommand;
+        set
+        {
+            if (SetProperty(ref _returnToZeroAfterCommand, value) && value && HoldFinalPoseAfterCommand)
+            {
+                HoldFinalPoseAfterCommand = false;
+            }
+        }
+    }
+
+    public bool IsJogModeEnabled
+    {
+        get => _isJogModeEnabled;
+        set => SetProperty(ref _isJogModeEnabled, value);
+    }
+
+    public double JogStepMeters
+    {
+        get => _jogStepMeters;
+        set => SetProperty(ref _jogStepMeters, Math.Clamp(value, 0.001, 0.025));
+    }
+
+    public double JogVelocity
+    {
+        get => _jogVelocity;
+        set => SetProperty(ref _jogVelocity, Math.Clamp(value, 0.005, 0.05));
     }
 
     private void SelectShape(string? shapeName)
@@ -568,6 +638,24 @@ public sealed class MainViewModel : ObservableObject
     private void StopProcess()
     {
         _runCancellation?.Cancel();
+    }
+
+    private void StartArmedSessionPlaceholder()
+    {
+        RobotSessionStatus = "Planned only - persistent armed session backend is not implemented yet.";
+        AppendLog("ui", "Start Armed Session requested, but this patch only adds the planned UI controls. No RMP connection, amp enable, or motion was started.");
+    }
+
+    private void ShutdownSessionPlaceholder()
+    {
+        RobotSessionStatus = "Not connected - shutdown is planned for the future session backend.";
+        AppendLog("ui", "Shutdown Session requested, but no persistent session is active in this UI-only placeholder.");
+    }
+
+    private void StopSessionMotionPlaceholder()
+    {
+        RobotSessionStatus = "Stop requested - no persistent session is active.";
+        AppendLog("ui", "Stop Motion requested for the planned armed session. Existing one-shot Stop still controls active one-shot processes.");
     }
 
     private IMotionChatService SelectMotionChatService()
