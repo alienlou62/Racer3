@@ -30,19 +30,30 @@ public partial class App : Application
             var motionService = new PowerShellRobotMotionService(config, processRunner);
             var shapePathPlanner = new ShapePathPlanner();
             var localMotionChatService = new RuleBasedMotionChatService();
+            var ollamaMotionChatService = new OllamaMotionChatService(
+                config,
+                new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(90)
+                });
             var openAiMotionChatService = new OpenAiMotionChatService(
                 config,
                 new HttpClient
                 {
                     Timeout = TimeSpan.FromSeconds(20)
                 });
+            var motionChatService = new MotionChatProviderRouter(
+                config,
+                localMotionChatService,
+                ollamaMotionChatService,
+                openAiMotionChatService);
 
             desktop.MainWindow = new MainWindow
             {
                 DataContext = new MainViewModel(
                     shapePathPlanner,
                     motionService,
-                    openAiMotionChatService,
+                    motionChatService,
                     localMotionChatService,
                     config),
             };

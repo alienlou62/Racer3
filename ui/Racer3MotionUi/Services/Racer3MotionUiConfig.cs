@@ -21,7 +21,13 @@ public sealed class Racer3MotionUiConfig
 
     public bool AutoAcknowledgeConsolePrompt { get; init; } = true;
 
+    public string ChatProvider { get; init; } = "LocalRules";
+
     public string OpenAiModel { get; init; } = "gpt-4.1-mini";
+
+    public string OllamaBaseUrl { get; init; } = "http://localhost:11434";
+
+    public string OllamaModel { get; init; } = "qwen2.5:7b";
 
     public static Racer3MotionUiConfig Load()
     {

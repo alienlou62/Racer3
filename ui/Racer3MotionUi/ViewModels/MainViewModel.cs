@@ -369,6 +369,7 @@ public sealed class MainViewModel : ObservableObject
                 response = await service.InterpretAsync(request, CancellationToken.None);
             }
 
+            MotionAssistantStatus = service.StatusText;
             ApplyMotionChatResponse(response);
             MotionAssistantInput = string.Empty;
         }

@@ -180,7 +180,7 @@
                                        VerticalAlignment="Center"
                                        Margin="0,0,8,0"/>
                             <CheckBox Grid.Column="1"
-                                      Content="Use LLM assistant"
+                                      Content="Use configured provider"
                                       IsChecked="{Binding UseLlmAssistant}"/>
                         </Grid>
                         <TextBlock Text="Try: draw square, make it bigger, move up, go slower."

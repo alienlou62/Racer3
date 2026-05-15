@@ -13,5 +13,8 @@
     "yaw": 0.0
   },
   "autoAcknowledgeConsolePrompt": true,
-  "openAiModel": "gpt-4.1-mini"
+  "chatProvider": "LocalRules",
+  "openAiModel": "gpt-4.1-mini",
+  "ollamaBaseUrl": "http://localhost:11434",
+  "ollamaModel": "qwen2.5:7b"
 }
