@@ -3,6 +3,8 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
 using Avalonia.Markup.Xaml;
+using System;
+using System.Net.Http;
 using Racer3MotionUi.Services;
 using Racer3MotionUi.ViewModels;
 using Racer3MotionUi.Views;
@@ -27,10 +29,22 @@ public partial class App : Application
             var processRunner = new ProcessRunner();
             var motionService = new PowerShellRobotMotionService(config, processRunner);
             var shapePathPlanner = new ShapePathPlanner();
+            var localMotionChatService = new RuleBasedMotionChatService();
+            var openAiMotionChatService = new OpenAiMotionChatService(
+                config,
+                new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(20)
+                });
 
             desktop.MainWindow = new MainWindow
             {
-                DataContext = new MainViewModel(shapePathPlanner, motionService, config),
+                DataContext = new MainViewModel(
+                    shapePathPlanner,
+                    motionService,
+                    openAiMotionChatService,
+                    localMotionChatService,
+                    config),
             };
         }
 

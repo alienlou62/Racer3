@@ -13,13 +13,15 @@ public sealed class Racer3MotionUiConfig
 
     public string PowerShellPath { get; init; } = "powershell";
 
-    public double DefaultVelocity { get; init; } = 0.03;
+    public double DefaultVelocity { get; init; } = 0.04;
 
-    public double DefaultShapeSizeMeters { get; init; } = 0.10;
+    public double DefaultShapeSizeMeters { get; init; } = 0.05;
 
-    public CartesianPose DefaultCenter { get; init; } = new(0.45, 0.0, -0.60);
+    public CartesianPose DefaultCenter { get; init; } = new(0.50, 0.0, -0.55);
 
     public bool AutoAcknowledgeConsolePrompt { get; init; } = true;
+
+    public string OpenAiModel { get; init; } = "gpt-4.1-mini";
 
     public static Racer3MotionUiConfig Load()
     {

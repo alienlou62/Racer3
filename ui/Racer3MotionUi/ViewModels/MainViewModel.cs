@@ -14,18 +14,22 @@ namespace Racer3MotionUi.ViewModels;
 
 public sealed class MainViewModel : ObservableObject
 {
-    private const double MinVelocity = 0.005;
-    private const double MaxVelocity = 0.10;
-    private const double VelocityStep = 0.005;
-    private const double MinShapeSizeMeters = 0.005;
-    private const double MaxShapeSizeMeters = 0.15;
-    private const double BiggerScale = 1.20;
-    private const double SmallerScale = 0.80;
-    private const double CenterStepMeters = 0.01;
+    private const double MinCenterX = 0.40;
+    private const double MaxCenterX = 0.60;
+    private const double MinCenterY = -0.15;
+    private const double MaxCenterY = 0.15;
+    private const double MinCenterZ = -0.65;
+    private const double MaxCenterZ = -0.45;
+    private const double MinVelocity = 0.02;
+    private const double MaxVelocity = 0.08;
+    private const double MinShapeSizeMeters = 0.02;
+    private const double MaxShapeSizeMeters = 0.08;
     private static readonly ShapeKind DefaultShape = ShapeKind.Circle;
 
     private readonly IShapePathPlanner _shapePathPlanner;
     private readonly IRobotMotionService _robotMotionService;
+    private readonly IMotionChatService _llmMotionChatService;
+    private readonly IMotionChatService _localMotionChatService;
     private readonly double _defaultVelocity;
     private readonly double _defaultShapeSizeMeters;
     private readonly CartesianPose _defaultCenter;
@@ -48,14 +52,21 @@ public sealed class MainViewModel : ObservableObject
     private string _processLog = string.Empty;
     private string _motionAssistantInput = string.Empty;
     private string _motionAssistantLog = string.Empty;
+    private string _motionAssistantStatus = string.Empty;
+    private bool _useLlmAssistant = true;
+    private bool _isMotionAssistantBusy;
 
     public MainViewModel(
         IShapePathPlanner shapePathPlanner,
         IRobotMotionService robotMotionService,
+        IMotionChatService llmMotionChatService,
+        IMotionChatService localMotionChatService,
         Racer3MotionUiConfig config)
     {
         _shapePathPlanner = shapePathPlanner;
         _robotMotionService = robotMotionService;
+        _llmMotionChatService = llmMotionChatService;
+        _localMotionChatService = localMotionChatService;
         _defaultVelocity = config.DefaultVelocity;
         _defaultShapeSizeMeters = config.DefaultShapeSizeMeters;
         _defaultCenter = config.DefaultCenter;
@@ -66,18 +77,19 @@ public sealed class MainViewModel : ObservableObject
         _centerZ = config.DefaultCenter.Z;
 
         SelectShapeCommand = new RelayCommand<string?>(SelectShape);
-        InterpretMotionCommandCommand = new RelayCommand(InterpretMotionCommand);
+        InterpretMotionCommandCommand = new AsyncRelayCommand(InterpretMotionCommandAsync);
         RunSelectedShapeCommand = new AsyncRelayCommand(RunSelectedShapeAsync, CanRunSelectedShape);
         StopCommand = new RelayCommand(StopProcess, () => IsProcessActive);
         ClearLogCommand = new RelayCommand(() => ProcessLog = string.Empty);
 
-        AppendAssistantLog("Assistant ready. Commands update the plan preview only.");
+        RefreshMotionAssistantStatus();
+        AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
         RefreshPlanAndPreview();
     }
 
     public IRelayCommand<string?> SelectShapeCommand { get; }
 
-    public IRelayCommand InterpretMotionCommandCommand { get; }
+    public IAsyncRelayCommand InterpretMotionCommandCommand { get; }
 
     public IAsyncRelayCommand RunSelectedShapeCommand { get; }
 
@@ -284,6 +296,30 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _motionAssistantLog, value);
     }
 
+    public string MotionAssistantStatus
+    {
+        get => _motionAssistantStatus;
+        private set => SetProperty(ref _motionAssistantStatus, value);
+    }
+
+    public bool UseLlmAssistant
+    {
+        get => _useLlmAssistant;
+        set
+        {
+            if (SetProperty(ref _useLlmAssistant, value))
+            {
+                RefreshMotionAssistantStatus();
+            }
+        }
+    }
+
+    public bool IsMotionAssistantBusy
+    {
+        get => _isMotionAssistantBusy;
+        private set => SetProperty(ref _isMotionAssistantBusy, value);
+    }
+
     private void SelectShape(string? shapeName)
     {
         if (Enum.TryParse<ShapeKind>(shapeName, out var shape))
@@ -292,39 +328,69 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    private void InterpretMotionCommand()
+    private async Task InterpretMotionCommandAsync()
     {
         var rawCommand = MotionAssistantInput.Trim();
         if (string.IsNullOrWhiteSpace(rawCommand))
         {
-            AppendAssistantLog("Type a command such as draw square or move up.");
+            AppendAssistantLog("Type a command such as draw a bigger square higher up.");
             return;
         }
 
-        var normalizedCommand = NormalizeAssistantCommand(rawCommand);
         AppendAssistantLog($"> {rawCommand}");
+        IsMotionAssistantBusy = true;
 
-        var response = normalizedCommand switch
+        try
         {
-            "draw square" => SelectAssistantShape(ShapeKind.Square),
-            "draw triangle" => SelectAssistantShape(ShapeKind.Triangle),
-            "draw circle" => SelectAssistantShape(ShapeKind.Circle),
-            "draw hexagon" => SelectAssistantShape(ShapeKind.Hexagon),
-            "make it bigger" => ScaleAssistantShape(BiggerScale),
-            "make it smaller" => ScaleAssistantShape(SmallerScale),
-            "move up" => MoveAssistantCenter(deltaY: 0.0, deltaZ: CenterStepMeters),
-            "move down" => MoveAssistantCenter(deltaY: 0.0, deltaZ: -CenterStepMeters),
-            "move left" => MoveAssistantCenter(deltaY: -CenterStepMeters, deltaZ: 0.0),
-            "move right" => MoveAssistantCenter(deltaY: CenterStepMeters, deltaZ: 0.0),
-            "go faster" => AdjustAssistantVelocity(VelocityStep),
-            "go slower" => AdjustAssistantVelocity(-VelocityStep),
-            "reset" => ResetAssistantPlan(),
-            "run it" => "Plan is ready. Validate first, then arm Confirm Motion and press Run Selected Shape.",
-            _ => "I can interpret: draw square, draw triangle, draw circle, draw hexagon, make it bigger, make it smaller, move up, move down, move left, move right, go faster, go slower, reset, run it."
-        };
+            var request = new MotionChatRequest(
+                rawCommand,
+                CreateCurrentMotionPlan(),
+                CreateDefaultMotionPlan());
 
-        AppendAssistantLog(response);
-        MotionAssistantInput = string.Empty;
+            if (RuleBasedMotionChatService.HasExecutionIntent(rawCommand))
+            {
+                RefreshMotionAssistantStatus();
+                ApplyMotionChatResponse(new MotionChatResponse(
+                    MotionChatAction.Explain,
+                    "I prepared the plan. Validate first, then arm Confirm Motion and press Run Selected Shape."));
+                MotionAssistantInput = string.Empty;
+                return;
+            }
+
+            var service = SelectMotionChatService();
+            MotionChatResponse response;
+            if (UseLlmAssistant && !_llmMotionChatService.IsAvailable)
+            {
+                AppendAssistantLog(_llmMotionChatService.StatusText);
+                response = await _localMotionChatService.InterpretAsync(request, CancellationToken.None);
+            }
+            else
+            {
+                response = await service.InterpretAsync(request, CancellationToken.None);
+            }
+
+            ApplyMotionChatResponse(response);
+            MotionAssistantInput = string.Empty;
+        }
+        catch (MotionChatInvalidResponseException exception)
+        {
+            MotionAssistantStatus = "Error";
+            AppendAssistantLog(exception.Message);
+        }
+        catch (MotionChatServiceException exception)
+        {
+            MotionAssistantStatus = "Error";
+            AppendAssistantLog($"LLM planner error: {exception.Message} The current plan was not changed.");
+        }
+        catch (Exception exception)
+        {
+            MotionAssistantStatus = "Error";
+            AppendAssistantLog($"Assistant error: {exception.Message} The current plan was not changed.");
+        }
+        finally
+        {
+            IsMotionAssistantBusy = false;
+        }
     }
 
     private bool CanRunSelectedShape()
@@ -397,69 +463,150 @@ public sealed class MainViewModel : ObservableObject
         _runCancellation?.Cancel();
     }
 
-    private string SelectAssistantShape(ShapeKind shape)
+    private IMotionChatService SelectMotionChatService()
     {
-        SelectedShape = shape;
-        return $"{shape} selected. Waypoint preview and command preview updated.";
+        if (!UseLlmAssistant)
+        {
+            MotionAssistantStatus = _localMotionChatService.StatusText;
+            return _localMotionChatService;
+        }
+
+        MotionAssistantStatus = _llmMotionChatService.StatusText;
+        return _llmMotionChatService.IsAvailable
+            ? _llmMotionChatService
+            : _localMotionChatService;
     }
 
-    private string ScaleAssistantShape(double scale)
+    private void ApplyMotionChatResponse(MotionChatResponse response)
     {
-        ShapeSizeMeters = RoundMeters(Math.Clamp(
-            ShapeSizeMeters * scale,
-            MinShapeSizeMeters,
-            MaxShapeSizeMeters));
+        if (response.CanExecute)
+        {
+            AppendAssistantLog("Safety: planner execution permission was ignored and forced off.");
+        }
 
-        return FormattableString.Invariant(
-            $"Size/radius set to {ShapeSizeMeters:0.0000} m. Waypoint preview updated.");
+        switch (response.Action)
+        {
+            case MotionChatAction.UpdatePlan:
+                if (response.Plan == null)
+                {
+                    AppendAssistantLog("The planner did not return a complete plan. The current plan was not changed.");
+                    return;
+                }
+
+                var clampedPlan = ClampPlan(response.Plan, out var clampMessages);
+                ApplyMotionPlan(clampedPlan, disarmConfirmMotion: true);
+                AppendAssistantLog(response.AssistantMessage);
+                foreach (var clampMessage in clampMessages)
+                {
+                    AppendAssistantLog(clampMessage);
+                }
+
+                return;
+
+            case MotionChatAction.ResetPlan:
+                ApplyMotionPlan(CreateDefaultMotionPlan(), disarmConfirmMotion: true);
+                IsDryRun = true;
+                ConfirmMotion = false;
+                AppendAssistantLog(response.AssistantMessage);
+                return;
+
+            case MotionChatAction.Explain:
+            case MotionChatAction.Reject:
+                AppendAssistantLog(response.AssistantMessage);
+                return;
+
+            default:
+                AppendAssistantLog("The planner returned an unsupported action. The current plan was not changed.");
+                return;
+        }
     }
 
-    private string MoveAssistantCenter(double deltaY, double deltaZ)
+    private void ApplyMotionPlan(MotionPlan plan, bool disarmConfirmMotion)
     {
-        CenterY = RoundMeters(CenterY + deltaY);
-        CenterZ = RoundMeters(CenterZ + deltaZ);
+        SelectedShape = plan.Shape;
+        CenterX = RoundMotionValue(plan.CenterX);
+        CenterY = RoundMotionValue(plan.CenterY);
+        CenterZ = RoundMotionValue(plan.CenterZ);
+        ShapeSizeMeters = RoundMotionValue(plan.SizeMeters);
+        Velocity = RoundMotionValue(plan.Velocity);
 
-        return FormattableString.Invariant(
-            $"Center set to Y={CenterY:0.0000} m, Z={CenterZ:0.0000} m. Waypoint preview updated.");
+        if (disarmConfirmMotion && ConfirmMotion)
+        {
+            ConfirmMotion = false;
+            AppendAssistantLog("Safety: chat plan changes disarmed Confirm Motion.");
+        }
     }
 
-    private string AdjustAssistantVelocity(double delta)
+    private MotionPlan ClampPlan(MotionPlan plan, out IReadOnlyList<string> clampMessages)
     {
-        Velocity = RoundVelocity(Math.Clamp(
-            Velocity + delta,
-            MinVelocity,
-            MaxVelocity));
+        var messages = new List<string>();
+        var clampedPlan = new MotionPlan
+        {
+            Shape = plan.Shape,
+            CenterX = ClampPlanValue(plan.CenterX, MinCenterX, MaxCenterX, "Center X", messages),
+            CenterY = ClampPlanValue(plan.CenterY, MinCenterY, MaxCenterY, "Center Y", messages),
+            CenterZ = ClampPlanValue(plan.CenterZ, MinCenterZ, MaxCenterZ, "Center Z", messages),
+            SizeMeters = ClampPlanValue(plan.SizeMeters, MinShapeSizeMeters, MaxShapeSizeMeters, "Size/radius", messages),
+            Velocity = ClampPlanValue(plan.Velocity, MinVelocity, MaxVelocity, "Velocity", messages),
+            CornerMode = string.IsNullOrWhiteSpace(plan.CornerMode) ? "sharp" : plan.CornerMode
+        };
 
-        return FormattableString.Invariant(
-            $"Velocity set to {Velocity:0.0000} m/s. Command preview updated.");
+        clampMessages = messages;
+        return clampedPlan;
+
+        double ClampPlanValue(
+            double value,
+            double min,
+            double max,
+            string label,
+            List<string> outputMessages)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+            {
+                outputMessages.Add($"{label} was invalid and was clamped to {min:0.0000}.");
+                return min;
+            }
+
+            var clamped = Math.Clamp(value, min, max);
+            if (Math.Abs(clamped - value) > 0.0000001)
+            {
+                outputMessages.Add(FormattableString.Invariant(
+                    $"{label} was clamped from {value:0.0000} to {clamped:0.0000}."));
+            }
+
+            return clamped;
+        }
     }
 
-    private string ResetAssistantPlan()
+    private MotionPlan CreateCurrentMotionPlan()
     {
-        SelectedShape = DefaultShape;
-        Velocity = _defaultVelocity;
-        ShapeSizeMeters = _defaultShapeSizeMeters;
-        CenterX = _defaultCenter.X;
-        CenterY = _defaultCenter.Y;
-        CenterZ = _defaultCenter.Z;
-        IsDryRun = true;
-        ConfirmMotion = false;
-
-        return "Reset to safe defaults. Dry Run / Validate Only is enabled and live motion is disarmed.";
+        return new MotionPlan
+        {
+            Shape = SelectedShape,
+            CenterX = CenterX,
+            CenterY = CenterY,
+            CenterZ = CenterZ,
+            SizeMeters = ShapeSizeMeters,
+            Velocity = Velocity,
+            CornerMode = "sharp"
+        };
     }
 
-    private static string NormalizeAssistantCommand(string command)
+    private MotionPlan CreateDefaultMotionPlan()
     {
-        var cleaned = command.Trim().Trim('.', '!', '?').ToLowerInvariant();
-        return string.Join(' ', cleaned.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries));
+        return new MotionPlan
+        {
+            Shape = DefaultShape,
+            CenterX = _defaultCenter.X,
+            CenterY = _defaultCenter.Y,
+            CenterZ = _defaultCenter.Z,
+            SizeMeters = _defaultShapeSizeMeters,
+            Velocity = _defaultVelocity,
+            CornerMode = "sharp"
+        };
     }
 
-    private static double RoundMeters(double value)
-    {
-        return Math.Round(value, 4);
-    }
-
-    private static double RoundVelocity(double value)
+    private static double RoundMotionValue(double value)
     {
         return Math.Round(value, 4);
     }
@@ -532,6 +679,13 @@ public sealed class MainViewModel : ObservableObject
             : ConfirmMotion
                 ? "LIVE MOTION ARMED"
                 : "Live motion locked";
+    }
+
+    private void RefreshMotionAssistantStatus()
+    {
+        MotionAssistantStatus = UseLlmAssistant
+            ? _llmMotionChatService.StatusText
+            : _localMotionChatService.StatusText;
     }
 
     private static string BuildCommandPreview(IReadOnlyList<MotionCommand> commands)

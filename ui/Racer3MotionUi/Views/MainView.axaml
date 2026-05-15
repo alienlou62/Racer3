@@ -173,6 +173,16 @@
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
                         <TextBlock Text="Motion Assistant" Classes="PanelTitle"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Text="{Binding MotionAssistantStatus}"
+                                       Classes="Label"
+                                       TextWrapping="Wrap"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,8,0"/>
+                            <CheckBox Grid.Column="1"
+                                      Content="Use LLM assistant"
+                                      IsChecked="{Binding UseLlmAssistant}"/>
+                        </Grid>
                         <TextBlock Text="Try: draw square, make it bigger, move up, go slower."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
