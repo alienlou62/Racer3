@@ -42,11 +42,18 @@ public partial class App : Application
                 {
                     Timeout = TimeSpan.FromSeconds(20)
                 });
+            var geminiMotionChatService = new GeminiMotionChatService(
+                config,
+                new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(20)
+                });
             var motionChatService = new MotionChatProviderRouter(
                 config,
                 localMotionChatService,
                 ollamaMotionChatService,
-                openAiMotionChatService);
+                openAiMotionChatService,
+                geminiMotionChatService);
 
             desktop.MainWindow = new MainWindow
             {

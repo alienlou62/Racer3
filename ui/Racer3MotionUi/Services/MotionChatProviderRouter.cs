@@ -10,6 +10,7 @@ public sealed class MotionChatProviderRouter : IMotionChatService
     private readonly IMotionChatService _localRules;
     private readonly IMotionChatService _ollama;
     private readonly IMotionChatService _openAi;
+    private readonly IMotionChatService _gemini;
     private readonly string _requestedProvider;
     private string _statusText;
 
@@ -17,11 +18,13 @@ public sealed class MotionChatProviderRouter : IMotionChatService
         Racer3MotionUiConfig config,
         IMotionChatService localRules,
         IMotionChatService ollama,
-        IMotionChatService openAi)
+        IMotionChatService openAi,
+        IMotionChatService gemini)
     {
         _localRules = localRules;
         _ollama = ollama;
         _openAi = openAi;
+        _gemini = gemini;
         _requestedProvider = ResolveRequestedProvider(config);
         _statusText = CreateInitialStatusText();
     }
@@ -38,6 +41,7 @@ public sealed class MotionChatProviderRouter : IMotionChatService
         {
             "openai" => await TryProviderWithLocalFallbackAsync(_openAi, "OpenAI", request, cancellationToken),
             "ollama" => await TryProviderWithLocalFallbackAsync(_ollama, "Ollama", request, cancellationToken),
+            "gemini" => await TryProviderWithLocalFallbackAsync(_gemini, "Gemini", request, cancellationToken),
             "auto" => await InterpretAutoAsync(request, cancellationToken),
             "local" or "localrules" or "rules" => await UseLocalRulesAsync(request, cancellationToken),
             _ => await UseUnknownProviderFallbackAsync(request, cancellationToken)
@@ -51,6 +55,11 @@ public sealed class MotionChatProviderRouter : IMotionChatService
         if (_openAi.IsAvailable)
         {
             return await TryProviderWithLocalFallbackAsync(_openAi, "OpenAI", request, cancellationToken);
+        }
+
+        if (_gemini.IsAvailable)
+        {
+            return await TryProviderWithLocalFallbackAsync(_gemini, "Gemini", request, cancellationToken);
         }
 
         return await UseLocalRulesAsync(request, cancellationToken);
@@ -104,7 +113,10 @@ public sealed class MotionChatProviderRouter : IMotionChatService
                 ? _openAi.StatusText
                 : "OpenAI unavailable: OPENAI_API_KEY is not set. Using local command parser.",
             "ollama" => _ollama.StatusText,
-            "auto" => _openAi.IsAvailable ? _openAi.StatusText : _localRules.StatusText,
+            "gemini" => _gemini.IsAvailable
+                ? _gemini.StatusText
+                : "Gemini unavailable: GEMINI_API_KEY is not set. Using local command parser.",
+            "auto" => _openAi.IsAvailable ? _openAi.StatusText : _gemini.IsAvailable ? _gemini.StatusText : _localRules.StatusText,
             "local" or "localrules" or "rules" => _localRules.StatusText,
             _ => $"Unknown chat provider '{_requestedProvider}'. Using local command parser."
         };
@@ -123,6 +135,11 @@ public sealed class MotionChatProviderRouter : IMotionChatService
             return "openai";
         }
 
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY")))
+        {
+            return "gemini";
+        }
+
         return NormalizeProvider(config.ChatProvider);
     }
 
@@ -133,8 +150,11 @@ public sealed class MotionChatProviderRouter : IMotionChatService
 
     private static string ProviderUnavailableReason(string providerName)
     {
-        return providerName == "OpenAI"
-            ? "OPENAI_API_KEY is not set."
-            : "provider is not available.";
+        return providerName switch
+        {
+            "OpenAI" => "OPENAI_API_KEY is not set.",
+            "Gemini" => "GEMINI_API_KEY is not set.",
+            _ => "provider is not available."
+        };
     }
 }

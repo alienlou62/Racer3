@@ -29,6 +29,8 @@ public sealed class Racer3MotionUiConfig
 
     public string OllamaModel { get; init; } = "qwen2.5:7b";
 
+    public string GeminiModel { get; init; } = "gemini-2.5-flash";
+
     public static Racer3MotionUiConfig Load()
     {
         var configPath = Path.Combine(AppContext.BaseDirectory, "Racer3MotionUi.json");

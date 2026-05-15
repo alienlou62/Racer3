@@ -16,5 +16,6 @@
   "chatProvider": "LocalRules",
   "openAiModel": "gpt-4.1-mini",
   "ollamaBaseUrl": "http://localhost:11434",
-  "ollamaModel": "qwen2.5:7b"
+  "ollamaModel": "qwen2.5:7b",
+  "geminiModel": "gemini-2.5-flash"
 }
