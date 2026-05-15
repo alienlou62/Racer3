@@ -2484,6 +2484,116 @@ Racer3BasicMotion::~Racer3BasicMotion()
     safeShutdown();
 }
 
+void Racer3BasicMotion::startArmedSession(double velocityUserUnitsPerSecond, bool diagnostics)
+{
+    DiagnosticsEnabled = diagnostics;
+    DualMotionEnabled = false;
+    AllMotionEnabled = true;
+    JointVectorMotionEnabled = false;
+    RobotModelProbeEnabled = false;
+    RobotPoseProbeEnabled = false;
+    KinematicsDryRunEnabled = false;
+    CartesianVectorMotionEnabled = false;
+    CartesianTraceMotionEnabled = false;
+    PositionOnlyIkEnabled = true;
+    CompactSegmentedExecutionEnabled = true;
+    AppendSegmentedExecutionEnabled = false;
+    TrajectorySegmentedExecutionEnabled = false;
+    EndpointOnlyMotionEnabled = true;
+    SegmentGoalMotionEnabled = false;
+    CartesianVectorMotionConfirmed = false;
+    MotionVelocity = velocityUserUnitsPerSecond;
+
+    if (MotionVelocity <= 0.0)
+    {
+        throw std::runtime_error("Armed session velocity must be greater than zero.");
+    }
+
+    std::cout << "Starting persistent armed session. This mode keeps amps enabled until shutdown.\n";
+    std::cout << "Session velocity=" << MotionVelocity << " user-units/sec.\n";
+
+    connectController();
+    clearFaults();
+
+    printActualPositions("Actual positions after armed-session connect/clear faults, before amp enable");
+    printDiagnosticSnapshot("After armed-session connect/clear faults, before amp enable");
+
+    enableAmplifiers();
+
+    printActualPositions("Actual positions after armed-session amp enable");
+    printDiagnosticSnapshot("After armed-session amp enable");
+
+    isolateAllAxesForAllMotion();
+
+    std::cout << "Persistent armed session is ready. Amps remain enabled until Shutdown Session.\n";
+}
+
+void Racer3BasicMotion::stopArmedSessionMotion()
+{
+    std::cout << "Stop requested for persistent armed session. Aborting MultiAxis motion if active.\n";
+
+    if (!multiAxis_)
+    {
+        std::cout << "  MultiAxis is not initialized; no stop action was required.\n";
+        return;
+    }
+
+    try
+    {
+        multiAxis_->Abort();
+        std::cout << "  MultiAxis abort command sent. Amps remain enabled for the armed session.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  MultiAxis abort threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << ")\n";
+        throw;
+    }
+
+    printDiagnosticSnapshot("After armed-session stop request", false);
+}
+
+void Racer3BasicMotion::shutdownArmedSession() noexcept
+{
+    std::cout << "Shutting down persistent armed session. Disabling amps and clearing faults.\n";
+
+    try
+    {
+        if (multiAxis_)
+        {
+            try
+            {
+                multiAxis_->Abort();
+                std::cout << "  MultiAxis abort command sent before shutdown.\n";
+            }
+            catch (const RR::RsiError& error)
+            {
+                std::cout << "  MultiAxis abort during shutdown threw RapidCode error: "
+                          << error.text
+                          << " ("
+                          << error.functionName
+                          << ")\n";
+            }
+        }
+
+        disableAmplifiers();
+        clearFaultsAfterCompletedMotion("persistent armed session shutdown");
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Armed-session shutdown warning: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Armed-session shutdown warning: unknown exception.\n";
+    }
+
+    safeShutdown();
+}
+
 void Racer3BasicMotion::run(const Racer3RunOptions& options)
 {
     DiagnosticsEnabled = options.diagnostics;

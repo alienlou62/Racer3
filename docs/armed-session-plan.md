@@ -224,3 +224,17 @@ session process starts
 -> accept validated trace/jog commands
 -> keep amps enabled until shutdown/timeout/fault
 ```
+
+## Phase 2 implementation note: armed session startup/shutdown
+
+The first live armed-session milestone keeps the session command loop simple but changes startup ownership:
+
+- `Start Armed Session` runs `rsiconfig` once from the UI service.
+- The UI starts `racer3-basic-motion --session-server` with `C:\RSI\11.0.0` prepended to PATH so RapidCode runtime DLLs are available.
+- The C++ session process connects `MotionController` once, maps/configures axes once, clears faults, enables all six amps once, isolates the six-axis MultiAxis group, then reports `session_ready` with `armed=true` and `ampsEnabled=true`.
+- `status` reports that the session is armed and amps are enabled.
+- `stop` aborts active MultiAxis motion if any but keeps amps enabled.
+- `trace` and `cartesian_jog` remain rejected until the next motion-command phase.
+- `shutdown` aborts if needed, disables amps, clears faults, releases the controller, and exits.
+
+This phase intentionally proves persistent ownership of the controller and one-time amp enable before adding motion commands to the session protocol.

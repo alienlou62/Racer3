@@ -1,4 +1,4 @@
-#include "Racer3BasicMotion.h"
+﻿#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +11,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+namespace RR = RSI::RapidCode;
 
 namespace
 {
@@ -51,7 +53,7 @@ void printUsage()
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
-        << "  --session-server Start a persistent local command loop skeleton for future armed sessions. No RMP connection, amp enable, or motion in this phase.\n"
+        << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, and keeps amps enabled until shutdown. Trace/jog motion commands are rejected in this phase.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -271,7 +273,33 @@ void writeSessionEvent(const std::string& json)
 
 int runSessionServer()
 {
-    writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server skeleton ready. No RMP connection, amp enable, or motion is implemented in this phase.\"}");
+    writeSessionEvent("{\"type\":\"session_starting\",\"state\":\"starting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server starting. Connecting RMP and enabling amps once for persistent armed session.\"}");
+
+    Racer3BasicMotion sessionMotion;
+
+    try
+    {
+        sessionMotion.startArmedSession(DefaultVelocityUserUnitsPerSecond, false);
+        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Motion commands are still not implemented in this phase.\"}");
+    }
+    catch (const RR::RsiError& error)
+    {
+        writeSessionEvent(std::string("{\"type\":\"session_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start armed session RapidCode error: ") + error.text + " (" + error.functionName + "). Shutdown attempted.\"}");
+        sessionMotion.shutdownArmedSession();
+        return 1;
+    }
+    catch (const std::exception& error)
+    {
+        writeSessionEvent(std::string("{\"type\":\"session_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start armed session: ") + error.what() + ". Shutdown attempted.\"}");
+        sessionMotion.shutdownArmedSession();
+        return 1;
+    }
+    catch (...)
+    {
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start armed session with unknown exception. Shutdown attempted.\"}");
+        sessionMotion.shutdownArmedSession();
+        return 1;
+    }
 
     std::string line;
     while (std::getline(std::cin, line))
@@ -285,35 +313,45 @@ int runSessionServer()
 
         if (command.find("shutdown") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_shutdown\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server skeleton shutting down. No amps were enabled.\"}");
+            writeSessionEvent("{\"type\":\"session_shutdown_starting\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Shutdown requested. Disabling amps, clearing faults, and releasing controller.\"}");
+            sessionMotion.shutdownArmedSession();
+            writeSessionEvent("{\"type\":\"session_shutdown\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Persistent armed session shut down. Amps disabled and controller released.\"}");
             return 0;
         }
 
         if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Skeleton session process is alive. Future phases will connect RMP and enable amps once.\"}");
+            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace and jog commands will be added in the next phase.\"}");
             continue;
         }
 
         if (command.find("stop") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Stop acknowledged by skeleton session. No motion is active.\"}");
+            try
+            {
+                sessionMotion.stopArmedSessionMotion();
+                writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop acknowledged. Any active MultiAxis motion was aborted. Amps remain enabled for the armed session.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_error\",\"state\":\"faulted\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop failed: ") + error.what() + "\"}");
+            }
             continue;
         }
 
         if (command.find("trace") != std::string::npos || command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Motion commands are rejected in the skeleton session phase. No RMP connection, amp enable, or motion was started.\"}");
+            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Motion commands are rejected in armed-session phase 2. RMP is connected and amps are enabled, but trace/jog execution will be added in the next phase.\"}");
             continue;
         }
 
-        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"skeleton_idle\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Unknown skeleton session command. Supported now: hello, status, stop, shutdown.\"}");
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, stop, shutdown.\"}");
     }
 
-    writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session input closed. Skeleton session exiting without amp enable.\"}");
+    writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session input closed. Disabling amps and exiting.\"}");
+    sessionMotion.shutdownArmedSession();
     return 0;
 }
-
 
 void validateOptions(const Racer3RunOptions& options)
 {
@@ -609,3 +647,4 @@ int main(int argc, char* argv[])
         return 1;
     }
 }
+

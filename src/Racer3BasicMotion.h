@@ -53,6 +53,9 @@ public:
     ~Racer3BasicMotion();
 
     void run(const Racer3RunOptions& options);
+    void startArmedSession(double velocityUserUnitsPerSecond, bool diagnostics);
+    void stopArmedSessionMotion();
+    void shutdownArmedSession() noexcept;
 
 private:
     void connectController();

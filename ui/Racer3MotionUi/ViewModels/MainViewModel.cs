@@ -56,7 +56,7 @@ public sealed class MainViewModel : ObservableObject
     private string _motionAssistantStatus = string.Empty;
     private bool _useLlmAssistant = true;
     private bool _isMotionAssistantBusy;
-    private string _robotSessionStatus = "Not connected - session process skeleton ready to start";
+    private string _robotSessionStatus = "Not connected - armed session ready to start";
     private bool _keepAmpsEnabledDuringSession = true;
     private bool _holdFinalPoseAfterCommand = true;
     private bool _returnToZeroAfterCommand;
@@ -656,15 +656,15 @@ public sealed class MainViewModel : ObservableObject
 
     private async Task StartArmedSessionAsync()
     {
-        RobotSessionStatus = "Starting session process skeleton...";
-        AppendLog("ui", "Start Armed Session requested. Starting local persistent session process skeleton; this phase does not connect RMP or enable amps.");
+        RobotSessionStatus = "Starting armed session...";
+        AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, and enables amps once.");
 
         try
         {
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             await _robotSessionService.StartAsync(progress, CancellationToken.None);
-            RobotSessionStatus = "Session process ready - skeleton only; amps are not enabled yet.";
-            AppendLog("ui", "Persistent session process is ready. Next backend milestone will add RMP connect and one-time amp enable.");
+            RobotSessionStatus = "Armed session ready - amps enabled";
+            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Trace/jog commands are still rejected in this phase.");
         }
         catch (Exception exception)
         {
@@ -687,7 +687,7 @@ public sealed class MainViewModel : ObservableObject
         try
         {
             await _robotSessionService.ShutdownAsync(CancellationToken.None);
-            RobotSessionStatus = "Not connected - session process stopped.";
+            RobotSessionStatus = "Not connected - armed session stopped.";
             AppendLog("ui", "Persistent session process shutdown complete.");
         }
         catch (Exception exception)
@@ -705,8 +705,8 @@ public sealed class MainViewModel : ObservableObject
 
     private async Task StopSessionMotionAsync()
     {
-        RobotSessionStatus = "Stop requested for session process skeleton.";
-        AppendLog("ui", "Stop Motion requested for persistent session process skeleton.");
+        RobotSessionStatus = "Stop requested for armed session.";
+        AppendLog("ui", "Stop Motion requested for persistent armed session. Backend should abort active motion but keep amps enabled.");
 
         try
         {

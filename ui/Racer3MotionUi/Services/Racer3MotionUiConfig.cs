@@ -15,6 +15,12 @@ public sealed class Racer3MotionUiConfig
 
     public string SessionExecutablePath { get; init; } = @".\build-vs2022\Release\racer3-basic-motion.exe";
 
+    public string RsiRuntimePath { get; init; } = @"C:\RSI\11.0.0";
+
+    public bool SessionRunRsiconfig { get; init; } = true;
+
+    public int SessionReadyTimeoutSeconds { get; init; } = 90;
+
     public double DefaultVelocity { get; init; } = 0.04;
 
     public double DefaultShapeSizeMeters { get; init; } = 0.05;

@@ -37,54 +37,53 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
         {
             if (_process is { HasExited: false })
             {
-                output.Report(new ProcessOutputLine("ui", "Persistent session process is already running."));
+                output.Report(new ProcessOutputLine("ui", "Persistent armed session process is already running."));
                 return;
             }
+        }
 
-            _output = output;
-            _readySignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _output = output;
 
-            var repoRoot = ResolveRepoRoot();
-            var executablePath = ResolveSessionExecutablePath(repoRoot);
+        var repoRoot = ResolveRepoRoot();
+        var executablePath = ResolveSessionExecutablePath(repoRoot);
 
+        if (_config.SessionRunRsiconfig)
+        {
+            await RunRsiconfigAsync(repoRoot, output, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            output.Report(new ProcessOutputLine("ui", "Skipping rsiconfig before session start by config. RMP must already be configured."));
+        }
+
+        var readySignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Process process;
+
+        lock (_sync)
+        {
+            _readySignal = readySignal;
             _process = new Process
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = executablePath,
-                    WorkingDirectory = repoRoot,
-                    UseShellExecute = false,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                },
+                StartInfo = CreateSessionStartInfo(repoRoot, executablePath),
                 EnableRaisingEvents = true
             };
 
             _process.StartInfo.ArgumentList.Add("--session-server");
-            _process.Exited += (_, _) => output.Report(new ProcessOutputLine("ui", "Persistent session process exited."));
+            _process.Exited += (_, _) => output.Report(new ProcessOutputLine("ui", "Persistent armed session process exited."));
+            process = _process;
         }
 
-        Process process;
-        TaskCompletionSource<bool> readySignal;
-        lock (_sync)
-        {
-            process = _process ?? throw new InvalidOperationException("Session process was not initialized.");
-            readySignal = _readySignal ?? throw new InvalidOperationException("Session ready signal was not initialized.");
-        }
-
-        output.Report(new ProcessOutputLine("ui", "Starting persistent session process skeleton. This phase does not connect RMP or enable amps."));
+        output.Report(new ProcessOutputLine("ui", "Starting persistent armed session process. This phase connects RMP and enables amps once; trace/jog commands are still rejected."));
 
         if (!process.Start())
         {
-            throw new InvalidOperationException("Failed to start persistent session process.");
+            throw new InvalidOperationException("Failed to start persistent armed session process.");
         }
 
         _ = Task.Run(() => PumpOutputAsync(process, output), CancellationToken.None);
         _ = Task.Run(() => PumpErrorAsync(process, output), CancellationToken.None);
 
-        await WaitForReadyAsync(readySignal, cancellationToken).ConfigureAwait(false);
+        await WaitForReadyAsync(readySignal, TimeSpan.FromSeconds(_config.SessionReadyTimeoutSeconds), cancellationToken).ConfigureAwait(false);
     }
 
     public Task RequestStatusAsync(CancellationToken cancellationToken)
@@ -107,13 +106,13 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
 
         if (process is null || process.HasExited)
         {
-            _output?.Report(new ProcessOutputLine("ui", "No persistent session process is running."));
+            _output?.Report(new ProcessOutputLine("ui", "No persistent armed session process is running."));
             return;
         }
 
         await SendCommandAsync("{\"type\":\"shutdown\"}", cancellationToken).ConfigureAwait(false);
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
 
         try
@@ -125,7 +124,7 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
             if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
-                _output?.Report(new ProcessOutputLine("ui", "Persistent session process did not exit after shutdown request and was killed."));
+                _output?.Report(new ProcessOutputLine("ui", "Persistent armed session process did not exit after shutdown request and was killed."));
             }
         }
         finally
@@ -152,6 +151,63 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
         }
     }
 
+    private async Task RunRsiconfigAsync(string repoRoot, IProgress<ProcessOutputLine> output, CancellationToken cancellationToken)
+    {
+        var settingsPath = Path.Combine(repoRoot, "config", "racer3-settings.xml");
+        if (!File.Exists(settingsPath))
+        {
+            throw new FileNotFoundException("Racer3 settings file was not found for session rsiconfig.", settingsPath);
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "rsiconfig",
+            WorkingDirectory = Path.GetDirectoryName(settingsPath) ?? repoRoot,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("racer3-settings.xml");
+        startInfo.ArgumentList.Add("--verbose");
+        ApplyRuntimePath(startInfo, repoRoot, Path.Combine(repoRoot, "build-vs2022", "Release"));
+
+        output.Report(new ProcessOutputLine("ui", "Starting/configuring RMP once for persistent armed session with rsiconfig."));
+
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+
+        var stdoutTask = PumpRsiconfigStreamAsync(process.StandardOutput, "rsiconfig", output);
+        var stderrTask = PumpRsiconfigStreamAsync(process.StandardError, "rsiconfig-err", output);
+
+        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"rsiconfig failed with exit code {process.ExitCode}.");
+        }
+
+        output.Report(new ProcessOutputLine("ui", "rsiconfig completed for persistent armed session."));
+    }
+
+    private static async Task PumpRsiconfigStreamAsync(StreamReader reader, string stream, IProgress<ProcessOutputLine> output)
+    {
+        while (true)
+        {
+            var line = await reader.ReadLineAsync().ConfigureAwait(false);
+            if (line is null)
+            {
+                break;
+            }
+
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                output.Report(new ProcessOutputLine(stream, line));
+            }
+        }
+    }
+
     private async Task SendCommandAsync(string command, CancellationToken cancellationToken)
     {
         Process? process;
@@ -162,7 +218,7 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
 
         if (process is null || process.HasExited)
         {
-            _output?.Report(new ProcessOutputLine("ui", "Cannot send session command because no persistent session process is running."));
+            _output?.Report(new ProcessOutputLine("ui", "Cannot send session command because no persistent armed session process is running."));
             return;
         }
 
@@ -189,6 +245,11 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
                 if (line.Contains("\"type\":\"session_ready\"", StringComparison.OrdinalIgnoreCase))
                 {
                     _readySignal?.TrySetResult(true);
+                }
+
+                if (line.Contains("\"type\":\"session_error\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    _readySignal?.TrySetException(new InvalidOperationException(line));
                 }
             }
         }
@@ -219,16 +280,16 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
         }
     }
 
-    private static async Task WaitForReadyAsync(TaskCompletionSource<bool> readySignal, CancellationToken cancellationToken)
+    private static async Task WaitForReadyAsync(TaskCompletionSource<bool> readySignal, TimeSpan timeout, CancellationToken cancellationToken)
     {
         var completed = await Task.WhenAny(
                 readySignal.Task,
-                Task.Delay(TimeSpan.FromSeconds(5), cancellationToken))
+                Task.Delay(timeout, cancellationToken))
             .ConfigureAwait(false);
 
         if (completed != readySignal.Task)
         {
-            throw new TimeoutException("Persistent session process did not report ready within 5 seconds.");
+            throw new TimeoutException($"Persistent armed session process did not report ready within {timeout.TotalSeconds:0} seconds.");
         }
 
         await readySignal.Task.ConfigureAwait(false);
@@ -265,9 +326,32 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
 
         if (!File.Exists(fullPath))
         {
-            throw new FileNotFoundException("Persistent session executable was not found.", fullPath);
+            throw new FileNotFoundException("Persistent armed session executable was not found.", fullPath);
         }
 
         return fullPath;
+    }
+
+    private ProcessStartInfo CreateSessionStartInfo(string repoRoot, string executablePath)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = repoRoot,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        ApplyRuntimePath(startInfo, repoRoot, Path.GetDirectoryName(executablePath) ?? repoRoot);
+        return startInfo;
+    }
+
+    private void ApplyRuntimePath(ProcessStartInfo startInfo, string repoRoot, string executableDirectory)
+    {
+        var existingPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        startInfo.Environment["PATH"] = $"{_config.RsiRuntimePath};{executableDirectory};{existingPath}";
     }
 }
