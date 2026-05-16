@@ -1,4 +1,4 @@
-﻿#include "Racer3BasicMotion.h"
+#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -271,6 +271,164 @@ void writeSessionEvent(const std::string& json)
     std::cout.flush();
 }
 
+std::string escapeJsonText(const std::string& value)
+{
+    std::string result;
+    result.reserve(value.size());
+
+    for (char character : value)
+    {
+        switch (character)
+        {
+        case '\\':
+            result += "\\\\";
+            break;
+        case '"':
+            result += "\\\"";
+            break;
+        case '\n':
+            result += "\\n";
+            break;
+        case '\r':
+            result += "\\r";
+            break;
+        case '\t':
+            result += "\\t";
+            break;
+        default:
+            result += character;
+            break;
+        }
+    }
+
+    return result;
+}
+
+std::string jsonStringField(const std::string& text, const std::string& fieldName)
+{
+    const std::string key = "\"" + fieldName + "\"";
+    const size_t keyPosition = text.find(key);
+    if (keyPosition == std::string::npos)
+    {
+        return {};
+    }
+
+    const size_t colonPosition = text.find(':', keyPosition + key.size());
+    if (colonPosition == std::string::npos)
+    {
+        return {};
+    }
+
+    size_t start = text.find('"', colonPosition + 1);
+    if (start == std::string::npos)
+    {
+        return {};
+    }
+    ++start;
+
+    std::string value;
+    bool escaped = false;
+    for (size_t index = start; index < text.size(); ++index)
+    {
+        const char character = text[index];
+        if (escaped)
+        {
+            value += character;
+            escaped = false;
+            continue;
+        }
+
+        if (character == '\\')
+        {
+            escaped = true;
+            continue;
+        }
+
+        if (character == '"')
+        {
+            return value;
+        }
+
+        value += character;
+    }
+
+    return {};
+}
+
+double jsonNumberField(const std::string& text, const std::string& fieldName, double defaultValue)
+{
+    const std::string key = "\"" + fieldName + "\"";
+    const size_t keyPosition = text.find(key);
+    if (keyPosition == std::string::npos)
+    {
+        return defaultValue;
+    }
+
+    const size_t colonPosition = text.find(':', keyPosition + key.size());
+    if (colonPosition == std::string::npos)
+    {
+        return defaultValue;
+    }
+
+    size_t start = colonPosition + 1;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start])))
+    {
+        ++start;
+    }
+
+    size_t end = start;
+    while (end < text.size())
+    {
+        const char character = text[end];
+        if (!(std::isdigit(static_cast<unsigned char>(character)) || character == '-' || character == '+' || character == '.' || character == 'e' || character == 'E'))
+        {
+            break;
+        }
+        ++end;
+    }
+
+    if (start == end)
+    {
+        return defaultValue;
+    }
+
+    return parseDoubleValue(text.substr(start, end - start), fieldName);
+}
+
+bool jsonBoolField(const std::string& text, const std::string& fieldName, bool defaultValue)
+{
+    const std::string key = "\"" + fieldName + "\"";
+    const size_t keyPosition = text.find(key);
+    if (keyPosition == std::string::npos)
+    {
+        return defaultValue;
+    }
+
+    const size_t colonPosition = text.find(':', keyPosition + key.size());
+    if (colonPosition == std::string::npos)
+    {
+        return defaultValue;
+    }
+
+    size_t start = colonPosition + 1;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start])))
+    {
+        ++start;
+    }
+
+    if (text.compare(start, 4, "true") == 0)
+    {
+        return true;
+    }
+
+    if (text.compare(start, 5, "false") == 0)
+    {
+        return false;
+    }
+
+    return defaultValue;
+}
+
 int runSessionServer()
 {
     writeSessionEvent("{\"type\":\"session_starting\",\"state\":\"starting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Session server starting. Connecting RMP and enabling amps once for persistent armed session.\"}");
@@ -280,7 +438,7 @@ int runSessionServer()
     try
     {
         sessionMotion.startArmedSession(DefaultVelocityUserUnitsPerSecond, false);
-        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Motion commands are still not implemented in this phase.\"}");
+        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands are available in this phase; jog commands are still not implemented.\"}");
     }
     catch (const RR::RsiError& error)
     {
@@ -321,7 +479,7 @@ int runSessionServer()
 
         if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace and jog commands will be added in the next phase.\"}");
+            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace commands are available. Jog commands will be added in the next phase.\"}");
             continue;
         }
 
@@ -339,13 +497,48 @@ int runSessionServer()
             continue;
         }
 
-        if (command.find("trace") != std::string::npos || command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
+        if (command.find("trace") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Motion commands are rejected in armed-session phase 2. RMP is connected and amps are enabled, but trace/jog execution will be added in the next phase.\"}");
+            const std::string cartesianTrace = jsonStringField(line, "cartesianTrace");
+            const double velocity = jsonNumberField(line, "velocity", DefaultVelocityUserUnitsPerSecond);
+            const bool returnToZero = jsonBoolField(line, "returnToZero", true);
+
+            try
+            {
+                if (cartesianTrace.empty())
+                {
+                    throw std::runtime_error("trace command is missing cartesianTrace.");
+                }
+
+                const std::vector<std::array<double, AxisCount>> waypoints = parseCartesianWaypoints(cartesianTrace);
+                if (waypoints.empty())
+                {
+                    throw std::runtime_error("trace command did not contain any valid waypoints.");
+                }
+
+                writeSessionEvent("{\"type\":\"session_trace_starting\",\"state\":\"motion_running\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session trace command accepted. Validating and streaming trace while keeping amps enabled.\"}");
+                sessionMotion.runArmedSessionTrace(waypoints, velocity, returnToZero);
+                writeSessionEvent("{\"type\":\"session_trace_complete\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session trace complete. Amps remain enabled for additional session commands.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_trace_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session trace RapidCode error: ") + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Amps remain enabled; use Stop Motion or Shutdown Session if needed.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_trace_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session trace failed: ") + escapeJsonText(error.what()) + ". Amps remain enabled; use Stop Motion or Shutdown Session if needed.\"}");
+            }
+
             continue;
         }
 
-        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, stop, shutdown.\"}");
+        if (command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Jog commands are still rejected in this phase. Trace commands are implemented first; keyboard jog will be added next.\"}");
+            continue;
+        }
+
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, stop, shutdown.\"}");
     }
 
     writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session input closed. Disabling amps and exiting.\"}");
@@ -647,4 +840,3 @@ int main(int argc, char* argv[])
         return 1;
     }
 }
-

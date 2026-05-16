@@ -6,6 +6,8 @@
   "rsiRuntimePath": "C:\\RSI\\11.0.0",
   "sessionRunRsiconfig": true,
   "sessionReadyTimeoutSeconds": 90,
+  "sessionMotionTimeoutSeconds": 120,
+  "sessionTraceReturnToZero": true,
   "defaultVelocity": 0.04,
   "defaultShapeSizeMeters": 0.05,
   "defaultCenter": {

@@ -1,4 +1,4 @@
-<UserControl xmlns="https://github.com/avaloniaui"
+﻿<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="Racer3MotionUi.Views.MainView">
     <UserControl.Styles>
@@ -208,8 +208,8 @@
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="Robot Session (skeleton)" Classes="PanelTitle"/>
-                        <TextBlock Text="Start Armed Session now launches a local persistent process skeleton. It does not connect RMP or enable amps yet. Existing one-shot Run Selected Shape is unchanged." Classes="Label" TextWrapping="Wrap"/>
+                        <TextBlock Text="Robot Session" Classes="PanelTitle"/>
+                        <TextBlock Text="Start Armed Session runs rsiconfig once, connects RMP, enables amps once, and keeps amps enabled until Shutdown Session. Use Run Shape In Session to stream the selected trace without restarting RMP." Classes="Label" TextWrapping="Wrap"/>
                         <TextBlock Text="{Binding RobotSessionStatus}" Foreground="#AFC0D2" TextWrapping="Wrap" FontSize="12"/>
                         <Grid ColumnDefinitions="*,*">
                             <Button Content="Start Armed Session"
@@ -229,6 +229,11 @@
                         <Button Content="Stop Motion"
                                 Classes="Secondary"
                                 Command="{Binding StopSessionMotionCommand}"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"/>
+                        <Button Content="Run Shape In Session"
+                                Classes="Primary"
+                                Command="{Binding RunSessionShapeCommand}"
                                 HorizontalAlignment="Stretch"
                                 HorizontalContentAlignment="Center"/>
                         <CheckBox Content="Keep amps enabled during armed session" IsChecked="{Binding KeepAmpsEnabledDuringSession}"/>
@@ -254,7 +259,7 @@
                         <TextBlock Text="W/S: Z up/down   A/D: Y left/right   Q/E: X forward/back   Arrow keys: Y/Z plane   Space: stop"
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
-                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend supports validated cartesian_jog commands."
+                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend supports validated cartesian_jog commands. Session trace commands are available first."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
                     </StackPanel>
@@ -292,7 +297,7 @@
                     </StackPanel>
                 </Border>
 
-                <Button Content="Run Selected Shape"
+                <Button Content="Run Selected Shape (one-shot)"
                         Classes="Primary"
                         Command="{Binding RunSelectedShapeCommand}"
                         HorizontalAlignment="Stretch"
@@ -356,3 +361,6 @@
         </Border>
     </Grid>
 </UserControl>
+
+
+

@@ -21,6 +21,10 @@ public sealed class Racer3MotionUiConfig
 
     public int SessionReadyTimeoutSeconds { get; init; } = 90;
 
+    public int SessionMotionTimeoutSeconds { get; init; } = 120;
+
+    public bool SessionTraceReturnToZero { get; init; } = true;
+
     public double DefaultVelocity { get; init; } = 0.04;
 
     public double DefaultShapeSizeMeters { get; init; } = 0.05;

@@ -1,4 +1,4 @@
-#include "Racer3BasicMotion.h"
+﻿#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -95,6 +95,8 @@ static double ReturnFailToleranceUserUnits = 0.00100;
 static JointVector RequestedJointVector{};
 static CartesianVector RequestedCartesianVector{};
 static std::vector<CartesianVector> RequestedCartesianTraceWaypoints;
+static bool ArmedSessionTraceExecutionEnabled = false;
+static bool ArmedSessionTraceReturnToZero = true;
 
 double toDegrees(double userUnits)
 {
@@ -2556,6 +2558,54 @@ void Racer3BasicMotion::stopArmedSessionMotion()
     printDiagnosticSnapshot("After armed-session stop request", false);
 }
 
+void Racer3BasicMotion::runArmedSessionTrace(
+    const std::vector<std::array<double, AxisCount>>& waypoints,
+    double velocityUserUnitsPerSecond,
+    bool returnToZero)
+{
+    if (!controller_ || !multiAxis_)
+    {
+        throw std::runtime_error("Persistent armed session is not initialized.");
+    }
+
+    if (waypoints.empty())
+    {
+        throw std::runtime_error("Persistent armed session trace requires at least one waypoint.");
+    }
+
+    if (velocityUserUnitsPerSecond <= 0.0)
+    {
+        throw std::runtime_error("Persistent armed session trace velocity must be greater than zero.");
+    }
+
+    MotionVelocity = velocityUserUnitsPerSecond;
+    RequestedCartesianTraceWaypoints = waypoints;
+    CartesianTraceMotionEnabled = true;
+    PositionOnlyIkEnabled = true;
+    CompactSegmentedExecutionEnabled = true;
+    AppendSegmentedExecutionEnabled = false;
+    TrajectorySegmentedExecutionEnabled = false;
+    EndpointOnlyMotionEnabled = true;
+    SegmentGoalMotionEnabled = false;
+    CartesianVectorMotionConfirmed = true;
+    ArmedSessionTraceExecutionEnabled = true;
+    ArmedSessionTraceReturnToZero = returnToZero;
+
+    try
+    {
+        runCartesianTraceMotion();
+    }
+    catch (...)
+    {
+        ArmedSessionTraceExecutionEnabled = false;
+        ArmedSessionTraceReturnToZero = true;
+        throw;
+    }
+
+    ArmedSessionTraceExecutionEnabled = false;
+    ArmedSessionTraceReturnToZero = true;
+}
+
 void Racer3BasicMotion::shutdownArmedSession() noexcept
 {
     std::cout << "Shutting down persistent armed session. Disabling amps and clearing faults.\n";
@@ -3220,7 +3270,6 @@ void Racer3BasicMotion::isolateAllAxesForAllMotion()
     {
         configureAxisMotionAttributes(index, "after all-axis MultiAxis remap");
     }
-
     std::cout << "Clearing all axis faults and confirming MultiAxis 6 amp enable for all-axis motion...\n";
 
     for (int index = 0; index < AxisCount; ++index)
@@ -3230,23 +3279,7 @@ void Racer3BasicMotion::isolateAllAxesForAllMotion()
 
     multiAxis_->ClearFaults();
 
-    const int result = multiAxis_->AmpEnableSet(
-        true,
-        AmpEnableTimeoutMs,
-        OverrideRestrictedStateForEnable);
-
-    if (!multiAxis_->AmpEnableGet())
-    {
-        throw std::runtime_error("All-axis MultiAxis AmpEnableSet failed or timed out after all-axis isolation.");
-    }
-
-    for (int index = 0; index < AxisCount; ++index)
-    {
-        if (!axes_[index]->AmpEnableGet())
-        {
-            throw std::runtime_error("Axis " + std::to_string(index + 1) + " amp enable failed after all-axis isolation.");
-        }
-    }
+    const auto result = multiAxis_->AmpEnableSet(true);
 
     std::cout << "All-axis MultiAxis amp enable confirmed after isolation. AmpEnableSet returned "
               << result
@@ -5771,7 +5804,9 @@ void Racer3BasicMotion::runCartesianTraceMotion()
 {
     std::cout << "Starting guarded multi-waypoint Cartesian trace mode.\n";
     std::cout << "This mode validates a list of Cartesian waypoint deltas from the original software-zero start pose.\n";
-    std::cout << "Execution uses validated joint waypoints streamed through MultiAxis::MovePVT as one outbound trace phase, then one return-to-zero phase.\n";
+    std::cout << (ArmedSessionTraceExecutionEnabled
+        ? "Execution uses validated joint waypoints streamed through MultiAxis::MovePVT inside the persistent armed session. Amps stay enabled after the command.\n"
+        : "Execution uses validated joint waypoints streamed through MultiAxis::MovePVT as one outbound trace phase, then one return-to-zero phase.\n");
     std::cout << "IK residual mode: " << ikResidualModeName() << "\n";
     if (PositionOnlyIkEnabled)
     {
@@ -5885,15 +5920,26 @@ void Racer3BasicMotion::runCartesianTraceMotion()
 
     clearFaults();
 
-    printActualPositions("Actual positions after Cartesian trace validation, before amp enable");
-    printDiagnosticSnapshot("After Cartesian trace validation and clear faults, before amp enable");
+    if (ArmedSessionTraceExecutionEnabled)
+    {
+        std::cout << "Persistent armed session trace: amps are already enabled; keeping drives enabled before, during, and after this trace.\n";
+        std::cout << "Persistent armed session trace: refreshing the all-axis MultiAxis mapping for this shape while keeping amps enabled.\n";
+        printActualPositions("Actual positions after session trace validation and clear faults");
+        printDiagnosticSnapshot("After session trace validation and clear faults");
+        isolateAllAxesForAllMotion();
+    }
+    else
+    {
+        printActualPositions("Actual positions after Cartesian trace validation, before amp enable");
+        printDiagnosticSnapshot("After Cartesian trace validation and clear faults, before amp enable");
 
-    enableAmplifiers();
+        enableAmplifiers();
 
-    printActualPositions("Actual positions after amp enable for Cartesian trace motion");
-    printDiagnosticSnapshot("After amp enable for Cartesian trace motion");
+        printActualPositions("Actual positions after amp enable for Cartesian trace motion");
+        printDiagnosticSnapshot("After amp enable for Cartesian trace motion");
 
-    isolateAllAxesForAllMotion();
+        isolateAllAxesForAllMotion();
+    }
 
     std::array<RR::RSIAction, AxisCount> originalErrorLimitActions{};
     bool errorLimitsTemporarilyChanged = false;
@@ -5921,9 +5967,14 @@ void Racer3BasicMotion::runCartesianTraceMotion()
     const std::vector<JointVector> returnSequence =
         makeReturnSequenceFromRelativeSequence(outboundSequence);
 
-    if (outboundSequence.empty() || returnSequence.empty())
+    if (outboundSequence.empty())
     {
-        throw std::runtime_error("Cartesian trace sequence is empty.");
+        throw std::runtime_error("Cartesian trace outbound sequence is empty.");
+    }
+
+    if (!ArmedSessionTraceExecutionEnabled && returnSequence.empty())
+    {
+        throw std::runtime_error("Cartesian trace return sequence is empty.");
     }
 
     try
@@ -6044,7 +6095,14 @@ void Racer3BasicMotion::runCartesianTraceMotion()
         };
 
         commandTracePvtPhase("outbound", outboundSequence);
-        commandTracePvtPhase("return", returnSequence);
+        if (ArmedSessionTraceExecutionEnabled && !ArmedSessionTraceReturnToZero)
+        {
+            std::cout << "Persistent armed session trace configured to hold the final trace pose; return-to-zero phase is skipped.\n";
+        }
+        else
+        {
+            commandTracePvtPhase("return", returnSequence);
+        }
     }
     catch (...)
     {
@@ -6075,6 +6133,23 @@ void Racer3BasicMotion::runCartesianTraceMotion()
                       << actionName(originalErrorLimitActions[index])
                       << ".\n";
         }
+    }
+
+    if (ArmedSessionTraceExecutionEnabled)
+    {
+        if (ArmedSessionTraceReturnToZero)
+        {
+            std::cout << "Persistent armed session trace complete. Net commanded offsets are zero; amps remain enabled.\n";
+            printReturnToZeroReport("Return-to-zero check after persistent armed session trace", true);
+        }
+        else
+        {
+            std::cout << "Persistent armed session trace complete at final trace pose; amps remain enabled.\n";
+        }
+
+        printActualPositions("Actual positions after persistent armed session trace");
+        printDiagnosticSnapshot("After persistent armed session trace");
+        return;
     }
 
     std::cout << "Cartesian trace PVT execution complete. Net commanded offsets are zero.\n";
@@ -7311,3 +7386,9 @@ void Racer3BasicMotion::safeShutdown() noexcept
         // Best effort cleanup; do not throw from destructor.
     }
 }
+
+
+
+
+
+

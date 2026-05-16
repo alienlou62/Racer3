@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Globalization;
 using System.Collections.Generic;
 using System.Linq;
@@ -94,6 +94,7 @@ public sealed class MainViewModel : ObservableObject
         StartArmedSessionCommand = new AsyncRelayCommand(StartArmedSessionAsync, CanStartArmedSession);
         ShutdownSessionCommand = new AsyncRelayCommand(ShutdownSessionAsync, CanUseSessionControls);
         StopSessionMotionCommand = new AsyncRelayCommand(StopSessionMotionAsync, CanUseSessionControls);
+        RunSessionShapeCommand = new AsyncRelayCommand(RunSessionShapeAsync, CanRunSessionShape);
 
         RefreshMotionAssistantStatus();
         AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
@@ -115,6 +116,8 @@ public sealed class MainViewModel : ObservableObject
     public IAsyncRelayCommand ShutdownSessionCommand { get; }
 
     public IAsyncRelayCommand StopSessionMotionCommand { get; }
+
+    public IAsyncRelayCommand RunSessionShapeCommand { get; }
 
     public string Title => "Racer3 Shape Trace Demo";
 
@@ -258,6 +261,7 @@ public sealed class MainViewModel : ObservableObject
                 RunSelectedShapeCommand.NotifyCanExecuteChanged();
                 StopCommand.NotifyCanExecuteChanged();
                 StartArmedSessionCommand.NotifyCanExecuteChanged();
+                RunSessionShapeCommand.NotifyCanExecuteChanged();
             }
         }
     }
@@ -584,6 +588,15 @@ public sealed class MainViewModel : ObservableObject
 
     private async Task RunSelectedShapeAsync()
     {
+        if (_robotSessionService.IsRunning)
+        {
+            LastRunStatus = "Blocked";
+            LastRunDetail = "Persistent armed session is active. Use Run Shape In Session instead of the one-shot runner.";
+            ModeState = "One-shot blocked";
+            AppendLog("ui", "Run Selected Shape blocked because the persistent armed session is active. Use Run Shape In Session instead.");
+            return;
+        }
+
         var plan = CreateCurrentPlan();
         var options = CreateMotionOptions();
         LastRunStatus = options.ConfirmMotion ? "Live run starting" : "Validation starting";
@@ -654,17 +667,88 @@ public sealed class MainViewModel : ObservableObject
         return _robotSessionService.IsRunning;
     }
 
+    private bool CanRunSessionShape()
+    {
+        return !IsProcessActive &&
+               _robotSessionService.IsRunning &&
+               !IsDryRun &&
+               ConfirmMotion &&
+               Velocity > 0.0 &&
+               ShapeSizeMeters > 0.0;
+    }
+
+    private async Task RunSessionShapeAsync()
+    {
+        var plan = CreateCurrentPlan();
+        var options = CreateMotionOptions();
+        LastRunStatus = "Session trace starting";
+        LastRunDetail = $"{plan.Shape}: {plan.Waypoints.Count} waypoint(s), amps remain enabled after trace.";
+        RobotSessionStatus = "Session trace running...";
+        AppendLog("ui", $"Session trace requested for {plan.Shape}; confirm motion: {options.ConfirmMotion}; persistent session running: {_robotSessionService.IsRunning}.");
+
+        using var cancellation = new CancellationTokenSource();
+        _runCancellation = cancellation;
+        IsProcessActive = true;
+        ModeState = "Session trace running";
+
+        try
+        {
+            var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
+            var result = await _robotSessionService.TraceShapeAsync(plan, options, progress, cancellation.Token);
+
+            if (result.Succeeded)
+            {
+                LastRunStatus = "Session trace complete";
+                LastRunDetail = $"{plan.Shape}: trace completed through the persistent armed session. Amps remain enabled until Shutdown Session.";
+                RobotSessionStatus = "Armed session ready - amps enabled";
+                ModeState = "Session trace complete";
+            }
+            else
+            {
+                LastRunStatus = "Session trace failed";
+                LastRunDetail = $"{plan.Shape}: session trace failed or was rejected. Check Process Log.";
+                RobotSessionStatus = "Armed session ready - check trace result";
+                ModeState = "Session trace failed";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            LastRunStatus = "Session trace stopped";
+            LastRunDetail = "Operator cancelled the active session trace wait.";
+            AppendLog("ui", "Session trace wait stopped by operator. Use Stop Motion if the backend is still moving.");
+            ModeState = "Stopped";
+        }
+        catch (Exception exception)
+        {
+            LastRunStatus = "Session trace error";
+            LastRunDetail = exception.Message;
+            RobotSessionStatus = "Session trace error";
+            AppendLog("err", exception.Message);
+            ModeState = "Error";
+        }
+        finally
+        {
+            _runCancellation = null;
+            IsProcessActive = false;
+            RefreshModeState();
+            StartArmedSessionCommand.NotifyCanExecuteChanged();
+            ShutdownSessionCommand.NotifyCanExecuteChanged();
+            StopSessionMotionCommand.NotifyCanExecuteChanged();
+            RunSessionShapeCommand.NotifyCanExecuteChanged();
+        }
+    }
+
     private async Task StartArmedSessionAsync()
     {
         RobotSessionStatus = "Starting armed session...";
-        AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, and enables amps once.");
+        AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, enables amps once, and can run validated session traces.");
 
         try
         {
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             await _robotSessionService.StartAsync(progress, CancellationToken.None);
             RobotSessionStatus = "Armed session ready - amps enabled";
-            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Trace/jog commands are still rejected in this phase.");
+            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; jog commands are still rejected in this phase.");
         }
         catch (Exception exception)
         {
@@ -676,6 +760,7 @@ public sealed class MainViewModel : ObservableObject
             StartArmedSessionCommand.NotifyCanExecuteChanged();
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
+            RunSessionShapeCommand.NotifyCanExecuteChanged();
         }
     }
 
@@ -700,6 +785,7 @@ public sealed class MainViewModel : ObservableObject
             StartArmedSessionCommand.NotifyCanExecuteChanged();
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
+            RunSessionShapeCommand.NotifyCanExecuteChanged();
         }
     }
 
@@ -722,6 +808,7 @@ public sealed class MainViewModel : ObservableObject
             StartArmedSessionCommand.NotifyCanExecuteChanged();
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
+            RunSessionShapeCommand.NotifyCanExecuteChanged();
         }
     }
 
@@ -926,6 +1013,7 @@ public sealed class MainViewModel : ObservableObject
         }
 
         RunSelectedShapeCommand.NotifyCanExecuteChanged();
+        RunSessionShapeCommand.NotifyCanExecuteChanged();
     }
 
     private void RefreshModeState()
@@ -987,3 +1075,4 @@ public sealed class MainViewModel : ObservableObject
             lines.Skip(Math.Max(0, lines.Length - 24)));
     }
 }
+

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Racer3MotionUi.Models;
@@ -9,11 +9,17 @@ public interface IRobotSessionService
 {
     bool IsRunning { get; }
 
-    Task StartAsync(IProgress<ProcessOutputLine> output, CancellationToken cancellationToken = default);
+    Task StartAsync(IProgress<ProcessOutputLine> output, CancellationToken cancellationToken);
 
-    Task RequestStatusAsync(CancellationToken cancellationToken = default);
+    Task RequestStatusAsync(CancellationToken cancellationToken);
 
-    Task StopMotionAsync(CancellationToken cancellationToken = default);
+    Task StopMotionAsync(CancellationToken cancellationToken);
 
-    Task ShutdownAsync(CancellationToken cancellationToken = default);
+    Task<MotionExecutionResult> TraceShapeAsync(
+        ShapeTracePlan plan,
+        RobotMotionOptions options,
+        IProgress<ProcessOutputLine> output,
+        CancellationToken cancellationToken);
+
+    Task ShutdownAsync(CancellationToken cancellationToken);
 }

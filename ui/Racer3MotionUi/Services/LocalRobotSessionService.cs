@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Racer3MotionUi.Models;
@@ -14,6 +16,7 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
     private Process? _process;
     private IProgress<ProcessOutputLine>? _output;
     private TaskCompletionSource<bool>? _readySignal;
+    private TaskCompletionSource<MotionExecutionResult>? _motionCompletionSignal;
 
     public LocalRobotSessionService(Racer3MotionUiConfig config)
     {
@@ -94,6 +97,65 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
     public Task StopMotionAsync(CancellationToken cancellationToken)
     {
         return SendCommandAsync("{\"type\":\"stop\"}", cancellationToken);
+    }
+
+    public async Task<MotionExecutionResult> TraceShapeAsync(
+        ShapeTracePlan plan,
+        RobotMotionOptions options,
+        IProgress<ProcessOutputLine> output,
+        CancellationToken cancellationToken)
+    {
+        if (options.DryRun || !options.ConfirmMotion)
+        {
+            output.Report(new ProcessOutputLine("ui", "Persistent armed session trace requires live mode with Confirm Motion armed."));
+            return new MotionExecutionResult(1, 0);
+        }
+
+        if (!IsRunning)
+        {
+            output.Report(new ProcessOutputLine("ui", "Cannot run a session trace because no persistent armed session is running."));
+            return new MotionExecutionResult(1, 0);
+        }
+
+        var completion = new TaskCompletionSource<MotionExecutionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            _motionCompletionSignal = completion;
+        }
+
+        var cartesianTrace = string.Join(";", plan.Waypoints.Select(waypoint => waypoint.ToCartesianArgument()));
+        var velocityText = options.Velocity.ToString("0.######", CultureInfo.InvariantCulture);
+        var returnToZero = _config.SessionTraceReturnToZero ? "true" : "false";
+        var command = "{\"type\":\"trace\",\"velocity\":" + velocityText + ",\"returnToZero\":" + returnToZero + ",\"cartesianTrace\":\"" + cartesianTrace + "\"}";
+
+        output.Report(new ProcessOutputLine("ui", $"Session trace requested for {plan.Shape}: {plan.Waypoints.Count} waypoint(s). Amps should remain enabled after completion."));
+        await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(_config.SessionMotionTimeoutSeconds));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+
+        try
+        {
+            using (linked.Token.Register(() => completion.TrySetCanceled(linked.Token)))
+            {
+                return await completion.Task.ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            output.Report(new ProcessOutputLine("err", "Timed out waiting for persistent session trace completion."));
+            return new MotionExecutionResult(1, 1);
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_motionCompletionSignal, completion))
+                {
+                    _motionCompletionSignal = null;
+                }
+            }
+        }
     }
 
     public async Task ShutdownAsync(CancellationToken cancellationToken)
@@ -250,6 +312,17 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
                 if (line.Contains("\"type\":\"session_error\"", StringComparison.OrdinalIgnoreCase))
                 {
                     _readySignal?.TrySetException(new InvalidOperationException(line));
+                }
+
+                if (line.Contains("\"type\":\"session_trace_complete\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    _motionCompletionSignal?.TrySetResult(new MotionExecutionResult(0, 1));
+                }
+
+                if (line.Contains("\"type\":\"session_trace_error\"", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("\"type\":\"session_reject\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    _motionCompletionSignal?.TrySetResult(new MotionExecutionResult(1, 1));
                 }
             }
         }

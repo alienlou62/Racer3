@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <array>
 #include <vector>
@@ -55,6 +55,10 @@ public:
     void run(const Racer3RunOptions& options);
     void startArmedSession(double velocityUserUnitsPerSecond, bool diagnostics);
     void stopArmedSessionMotion();
+    void runArmedSessionTrace(
+        const std::vector<std::array<double, AxisCount>>& waypoints,
+        double velocityUserUnitsPerSecond,
+        bool returnToZero);
     void shutdownArmedSession() noexcept;
 
 private:
@@ -107,3 +111,7 @@ private:
     RSI::RapidCode::MultiAxis* multiAxis_;
     std::array<RSI::RapidCode::Axis*, AxisCount> axes_;
 };
+
+
+
+
