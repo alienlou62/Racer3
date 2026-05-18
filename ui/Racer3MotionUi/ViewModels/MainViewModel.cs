@@ -29,6 +29,8 @@ public sealed class MainViewModel : ObservableObject
     private readonly IShapePathPlanner _shapePathPlanner;
     private readonly IRobotMotionService _robotMotionService;
     private readonly IRobotSessionService _robotSessionService;
+    private bool _sessionShapeOriginClean = true;
+    private bool _sessionShapeFailureLatched;
     private readonly IMotionChatService _llmMotionChatService;
     private readonly IMotionChatService _localMotionChatService;
     private readonly double _defaultVelocity;
@@ -778,6 +780,11 @@ public sealed class MainViewModel : ObservableObject
         LastRunDetail = $"Jog {direction}: step={step:0.####} m, velocity={JogVelocity:0.####}.";
         RobotSessionStatus = "Jog running...";
         AppendLog("ui", $"Keyboard jog requested: {direction}, step={step:0.####} m, velocity={JogVelocity:0.####}; persistent session running: {_robotSessionService.IsRunning}.");
+        // Session jog moves the robot away from the full-shape origin.
+        // Full shapes are defined relative to the armed-session origin, so block them
+        // after any jog until the session is restarted from a clean origin.
+        _sessionShapeOriginClean = false;
+        AppendLog("ui", "Session jog marks shape origin dirty. Full Run Shape In Session is blocked until Shutdown Session and Start Armed Session.");
 
         using var cancellation = new CancellationTokenSource();
         _runCancellation = cancellation;
@@ -839,6 +846,24 @@ public sealed class MainViewModel : ObservableObject
         LastRunStatus = "Session trace starting";
         LastRunDetail = $"{plan.Shape}: {plan.Waypoints.Count} waypoint(s), amps remain enabled after trace.";
         RobotSessionStatus = "Session trace running...";
+            if (_sessionShapeFailureLatched)
+            {
+                LastRunStatus = "Blocked";
+                LastRunDetail = "A previous session shape failed its return-to-zero check. Restart the armed session before running another full shape.";
+                ModeState = "Session shape blocked";
+                AppendLog("ui", "Run Shape In Session blocked because the previous session shape failed. Press Shutdown Session, restart the armed session, then run shapes from a clean origin.");
+                return;
+            }
+
+        if (!_sessionShapeOriginClean)
+            {
+                LastRunStatus = "Blocked";
+                LastRunDetail = "The robot has been jogged away from the shape origin. Restart the armed session before running full shapes.";
+                ModeState = "Session shape blocked";
+                AppendLog("ui", "Run Shape In Session blocked because the robot has been jogged away from the shape origin. Use Shutdown Session and Start Armed Session before running full shapes.");
+                return;
+            }
+
         AppendLog("ui", $"Session trace requested for {plan.Shape}; confirm motion: {options.ConfirmMotion}; persistent session running: {_robotSessionService.IsRunning}.");
 
         using var cancellation = new CancellationTokenSource();
@@ -851,7 +876,20 @@ public sealed class MainViewModel : ObservableObject
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             var result = await _robotSessionService.TraceShapeAsync(plan, options, progress, cancellation.Token);
 
-            if (result.Succeeded)
+            
+
+            // Session shape result updates the shape-origin lockout.
+                        if (result.Succeeded)
+            {
+                _sessionShapeOriginClean = true;
+                _sessionShapeFailureLatched = false;
+            }
+            else
+            {
+                _sessionShapeFailureLatched = true;
+            }
+
+if (result.Succeeded)
             {
                 LastRunStatus = "Session trace complete";
                 LastRunDetail = $"{plan.Shape}: trace completed through the persistent armed session. Amps remain enabled until Shutdown Session.";
@@ -898,6 +936,10 @@ public sealed class MainViewModel : ObservableObject
         RobotSessionStatus = "Starting armed session...";
         AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, enables amps once, and can run validated session traces.");
 
+
+            // Starting a new persistent armed session resets the shape origin lockout.
+            _sessionShapeOriginClean = true;
+            _sessionShapeFailureLatched = false;
         try
         {
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
@@ -1230,6 +1272,10 @@ public sealed class MainViewModel : ObservableObject
             lines.Skip(Math.Max(0, lines.Length - 24)));
     }
 }
+
+
+
+
 
 
 
