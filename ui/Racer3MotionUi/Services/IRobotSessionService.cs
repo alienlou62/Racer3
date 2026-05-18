@@ -21,5 +21,14 @@ public interface IRobotSessionService
         IProgress<ProcessOutputLine> output,
         CancellationToken cancellationToken);
 
+    Task<MotionExecutionResult> JogAsync(
+        double deltaX,
+        double deltaY,
+        double deltaZ,
+        double velocity,
+        bool confirmMotion,
+        IProgress<ProcessOutputLine> output,
+        CancellationToken cancellationToken);
+
     Task ShutdownAsync(CancellationToken cancellationToken);
 }

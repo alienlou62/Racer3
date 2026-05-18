@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <array>
 #include <vector>
@@ -72,6 +72,9 @@ private:
     void isolateAxis6ForDirectMotion();
     void isolateAxis5And6ForDualMotion();
     void isolateAllAxesForAllMotion();
+    void prepareAllAxesForArmedSessionMotion();
+    bool areAllAxesAmpEnabled();
+    bool isAnyAllAxisMotionObjectInError();
     void clearFaults();
     void clearFaultsAfterCompletedMotion(const char* context) noexcept;
     void enableAmplifiers();
@@ -110,6 +113,7 @@ private:
     RSI::RapidCode::MotionController* controller_;
     RSI::RapidCode::MultiAxis* multiAxis_;
     std::array<RSI::RapidCode::Axis*, AxisCount> axes_;
+    bool armedSessionAllAxisPrepared_;
 };
 
 

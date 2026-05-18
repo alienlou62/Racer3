@@ -438,7 +438,7 @@ int runSessionServer()
     try
     {
         sessionMotion.startArmedSession(DefaultVelocityUserUnitsPerSecond, false);
-        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands are available in this phase; jog commands are still not implemented.\"}");
+        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace and jog commands are available in this phase.\"}");
     }
     catch (const RR::RsiError& error)
     {
@@ -479,7 +479,7 @@ int runSessionServer()
 
         if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace commands are available. Jog commands will be added in the next phase.\"}");
+            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace and jog commands are available.\"}");
             continue;
         }
 
@@ -534,11 +534,47 @@ int runSessionServer()
 
         if (command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Jog commands are still rejected in this phase. Trace commands are implemented first; keyboard jog will be added next.\"}");
+            const double dx = jsonNumberField(line, "dx", 0.0);
+            const double dy = jsonNumberField(line, "dy", 0.0);
+            const double dz = jsonNumberField(line, "dz", 0.0);
+            const double velocity = jsonNumberField(line, "velocity", DefaultVelocityUserUnitsPerSecond);
+
+            try
+            {
+                constexpr double MaxJogStepMeters = 0.025;
+                if (velocity <= 0.0)
+                {
+                    throw std::runtime_error("cartesian_jog velocity must be greater than zero.");
+                }
+
+                if (std::abs(dx) > MaxJogStepMeters || std::abs(dy) > MaxJogStepMeters || std::abs(dz) > MaxJogStepMeters)
+                {
+                    throw std::runtime_error("cartesian_jog step exceeds the guarded maximum of 0.025 meters on one or more axes.");
+                }
+
+                if (dx == 0.0 && dy == 0.0 && dz == 0.0)
+                {
+                    throw std::runtime_error("cartesian_jog requires a non-zero dx, dy, or dz.");
+                }
+
+                const std::vector<std::array<double, AxisCount>> waypoint = {{{dx, dy, dz, 0.0, 0.0, 0.0}}};
+                writeSessionEvent("{\"type\":\"session_jog_starting\",\"state\":\"motion_running\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session jog accepted. Running one validated Cartesian jog while keeping amps enabled.\"}");
+                sessionMotion.runArmedSessionTrace(waypoint, velocity, false);
+                writeSessionEvent("{\"type\":\"session_jog_complete\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session jog complete. Final pose is held and amps remain enabled.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session jog RapidCode error: ") + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Amps remain enabled; use Stop Motion or Shutdown Session if needed.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session jog failed: ") + escapeJsonText(error.what()) + ". Amps remain enabled; use Stop Motion or Shutdown Session if needed.\"}");
+            }
+
             continue;
         }
 
-        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, stop, shutdown.\"}");
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, cartesian_jog, stop, shutdown.\"}");
     }
 
     writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session input closed. Disabling amps and exiting.\"}");

@@ -1,4 +1,4 @@
-﻿#include "Racer3BasicMotion.h"
+#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -2477,7 +2477,7 @@ void probeConfiguredLinearBuilder(
 }
 
 Racer3BasicMotion::Racer3BasicMotion()
-    : controller_(nullptr), multiAxis_(nullptr), axes_{}
+    : controller_(nullptr), multiAxis_(nullptr), axes_{}, armedSessionAllAxisPrepared_(false)
 {
 }
 
@@ -2526,6 +2526,7 @@ void Racer3BasicMotion::startArmedSession(double velocityUserUnitsPerSecond, boo
     printDiagnosticSnapshot("After armed-session amp enable");
 
     isolateAllAxesForAllMotion();
+    armedSessionAllAxisPrepared_ = true;
 
     std::cout << "Persistent armed session is ready. Amps remain enabled until Shutdown Session.\n";
 }
@@ -2641,6 +2642,7 @@ void Racer3BasicMotion::shutdownArmedSession() noexcept
         std::cout << "  Armed-session shutdown warning: unknown exception.\n";
     }
 
+    armedSessionAllAxisPrepared_ = false;
     safeShutdown();
 }
 
@@ -3287,6 +3289,84 @@ void Racer3BasicMotion::isolateAllAxesForAllMotion()
 
     std::this_thread::sleep_for(std::chrono::milliseconds(EnableSettleMs));
     printAllAxisMotionStatus("All-axis status after all-axis isolation");
+}
+
+bool Racer3BasicMotion::areAllAxesAmpEnabled()
+{
+    if (!multiAxis_ || !multiAxis_->AmpEnableGet())
+    {
+        return false;
+    }
+
+    for (auto* axis : axes_)
+    {
+        if (!axis || !axis->AmpEnableGet())
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool Racer3BasicMotion::isAnyAllAxisMotionObjectInError()
+{
+    if (!multiAxis_)
+    {
+        return true;
+    }
+
+    const RR::RSIState multiState = multiAxis_->StateGet();
+    if (multiState == RR::RSIState::RSIStateERROR ||
+        multiState == RR::RSIState::RSIStateSTOPPING_ERROR)
+    {
+        return true;
+    }
+
+    for (auto* axis : axes_)
+    {
+        if (!axis)
+        {
+            return true;
+        }
+
+        const RR::RSIState axisState = axis->StateGet();
+        if (axisState == RR::RSIState::RSIStateERROR ||
+            axisState == RR::RSIState::RSIStateSTOPPING_ERROR)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void Racer3BasicMotion::prepareAllAxesForArmedSessionMotion()
+{
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    if (armedSessionAllAxisPrepared_ &&
+        areAllAxesAmpEnabled() &&
+        !isAnyAllAxisMotionObjectInError())
+    {
+        std::cout << "Persistent armed session trace: reusing existing all-axis MultiAxis map; amps already enabled, so no Abort, ClearFaults, AxisAdd, or AmpEnableSet is issued for this move.\n";
+        configureMultiAxisMotionAttributes("before armed-session PVT move using existing all-axis map");
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            configureAxisMotionAttributes(index, "before armed-session PVT move using existing all-axis map");
+        }
+
+        printAllAxisMotionStatus("All-axis status before armed-session PVT move using existing map");
+        return;
+    }
+
+    std::cout << "Persistent armed session trace: all-axis map or amp state is not clean. Repairing with fault clear/remap/AmpEnableSet before this move.\n";
+    isolateAllAxesForAllMotion();
+    armedSessionAllAxisPrepared_ = true;
 }
 
 void Racer3BasicMotion::clearFaults()
@@ -5918,18 +5998,17 @@ void Racer3BasicMotion::runCartesianTraceMotion()
     std::cout << "\n--confirm-motion supplied and all trace gates passed.\n";
     std::cout << "Executing guarded Cartesian trace through the MultiAxis joint-vector PVT path.\n";
 
-    clearFaults();
-
     if (ArmedSessionTraceExecutionEnabled)
     {
         std::cout << "Persistent armed session trace: amps are already enabled; keeping drives enabled before, during, and after this trace.\n";
-        std::cout << "Persistent armed session trace: refreshing the all-axis MultiAxis mapping for this shape while keeping amps enabled.\n";
-        printActualPositions("Actual positions after session trace validation and clear faults");
-        printDiagnosticSnapshot("After session trace validation and clear faults");
-        isolateAllAxesForAllMotion();
+        printActualPositions("Actual positions after session trace validation, before armed-session preparation");
+        printDiagnosticSnapshot("After session trace validation, before armed-session preparation");
+        prepareAllAxesForArmedSessionMotion();
     }
     else
     {
+        clearFaults();
+
         printActualPositions("Actual positions after Cartesian trace validation, before amp enable");
         printDiagnosticSnapshot("After Cartesian trace validation and clear faults, before amp enable");
 
@@ -7379,6 +7458,7 @@ void Racer3BasicMotion::safeShutdown() noexcept
             controller_ = nullptr;
             multiAxis_ = nullptr;
             axes_.fill(nullptr);
+            armedSessionAllAxisPrepared_ = false;
         }
     }
     catch (...)

@@ -158,6 +158,72 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
         }
     }
 
+
+    public async Task<MotionExecutionResult> JogAsync(
+        double deltaX,
+        double deltaY,
+        double deltaZ,
+        double velocity,
+        bool confirmMotion,
+        IProgress<ProcessOutputLine> output,
+        CancellationToken cancellationToken)
+    {
+        if (!confirmMotion)
+        {
+            output.Report(new ProcessOutputLine("ui", "Persistent armed session jog requires Confirm Motion armed."));
+            return new MotionExecutionResult(1, 0);
+        }
+
+        if (!IsRunning)
+        {
+            output.Report(new ProcessOutputLine("ui", "Cannot jog because no persistent armed session is running."));
+            return new MotionExecutionResult(1, 0);
+        }
+
+        var completion = new TaskCompletionSource<MotionExecutionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            _motionCompletionSignal = completion;
+        }
+
+        var command = string.Format(
+            CultureInfo.InvariantCulture,
+            "{{\"type\":\"cartesian_jog\",\"dx\":{0:0.######},\"dy\":{1:0.######},\"dz\":{2:0.######},\"velocity\":{3:0.######}}}",
+            deltaX,
+            deltaY,
+            deltaZ,
+            velocity);
+
+        output.Report(new ProcessOutputLine("ui", string.Format(CultureInfo.InvariantCulture, "Session jog requested: dX={0:0.####} m, dY={1:0.####} m, dZ={2:0.####} m, velocity={3:0.####}.", deltaX, deltaY, deltaZ, velocity)));
+        await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(_config.SessionMotionTimeoutSeconds));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+
+        try
+        {
+            using (linked.Token.Register(() => completion.TrySetCanceled(linked.Token)))
+            {
+                return await completion.Task.ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            output.Report(new ProcessOutputLine("err", "Timed out waiting for persistent session jog completion."));
+            return new MotionExecutionResult(1, 1);
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_motionCompletionSignal, completion))
+                {
+                    _motionCompletionSignal = null;
+                }
+            }
+        }
+    }
+
     public async Task ShutdownAsync(CancellationToken cancellationToken)
     {
         Process? process;
@@ -314,12 +380,14 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
                     _readySignal?.TrySetException(new InvalidOperationException(line));
                 }
 
-                if (line.Contains("\"type\":\"session_trace_complete\"", StringComparison.OrdinalIgnoreCase))
+                if (line.Contains("\"type\":\"session_trace_complete\"", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("\"type\":\"session_jog_complete\"", StringComparison.OrdinalIgnoreCase))
                 {
                     _motionCompletionSignal?.TrySetResult(new MotionExecutionResult(0, 1));
                 }
 
                 if (line.Contains("\"type\":\"session_trace_error\"", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("\"type\":\"session_jog_error\"", StringComparison.OrdinalIgnoreCase) ||
                     line.Contains("\"type\":\"session_reject\"", StringComparison.OrdinalIgnoreCase))
                 {
                     _motionCompletionSignal?.TrySetResult(new MotionExecutionResult(1, 1));

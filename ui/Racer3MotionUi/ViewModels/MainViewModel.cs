@@ -95,6 +95,7 @@ public sealed class MainViewModel : ObservableObject
         ShutdownSessionCommand = new AsyncRelayCommand(ShutdownSessionAsync, CanUseSessionControls);
         StopSessionMotionCommand = new AsyncRelayCommand(StopSessionMotionAsync, CanUseSessionControls);
         RunSessionShapeCommand = new AsyncRelayCommand(RunSessionShapeAsync, CanRunSessionShape);
+        JogCommand = new AsyncRelayCommand<string?>(RunSessionJogAsync, CanRunSessionJog);
 
         RefreshMotionAssistantStatus();
         AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
@@ -118,6 +119,8 @@ public sealed class MainViewModel : ObservableObject
     public IAsyncRelayCommand StopSessionMotionCommand { get; }
 
     public IAsyncRelayCommand RunSessionShapeCommand { get; }
+
+    public IAsyncRelayCommand<string?> JogCommand { get; }
 
     public string Title => "Racer3 Shape Trace Demo";
 
@@ -224,6 +227,8 @@ public sealed class MainViewModel : ObservableObject
 
                 OnPropertyChanged(nameof(IsConfirmMotionEnabled));
                 RefreshModeState();
+                RunSessionShapeCommand.NotifyCanExecuteChanged();
+                JogCommand.NotifyCanExecuteChanged();
                 RefreshPlanAndPreview();
             }
         }
@@ -238,6 +243,8 @@ public sealed class MainViewModel : ObservableObject
             if (SetProperty(ref _confirmMotion, requestedValue))
             {
                 RefreshModeState();
+                RunSessionShapeCommand.NotifyCanExecuteChanged();
+                JogCommand.NotifyCanExecuteChanged();
                 RefreshPlanAndPreview();
             }
         }
@@ -253,7 +260,7 @@ public sealed class MainViewModel : ObservableObject
             if (SetProperty(ref _isProcessActive, value))
             {
                 OnPropertyChanged(nameof(IsConfirmMotionEnabled));
-                if (IsProcessActive && ConfirmMotion)
+                if (IsProcessActive && ConfirmMotion && !_robotSessionService.IsRunning)
                 {
                     ConfirmMotion = false;
                 }
@@ -262,6 +269,7 @@ public sealed class MainViewModel : ObservableObject
                 StopCommand.NotifyCanExecuteChanged();
                 StartArmedSessionCommand.NotifyCanExecuteChanged();
                 RunSessionShapeCommand.NotifyCanExecuteChanged();
+                JogCommand.NotifyCanExecuteChanged();
             }
         }
     }
@@ -383,19 +391,37 @@ public sealed class MainViewModel : ObservableObject
     public bool IsJogModeEnabled
     {
         get => _isJogModeEnabled;
-        set => SetProperty(ref _isJogModeEnabled, value);
+        set
+        {
+            if (SetProperty(ref _isJogModeEnabled, value))
+            {
+                JogCommand.NotifyCanExecuteChanged();
+            }
+        }
     }
 
     public double JogStepMeters
     {
         get => _jogStepMeters;
-        set => SetProperty(ref _jogStepMeters, Math.Clamp(value, 0.001, 0.025));
+        set
+        {
+            if (SetProperty(ref _jogStepMeters, Math.Clamp(value, 0.001, 0.025)))
+            {
+                JogCommand.NotifyCanExecuteChanged();
+            }
+        }
     }
 
     public double JogVelocity
     {
         get => _jogVelocity;
-        set => SetProperty(ref _jogVelocity, Math.Clamp(value, 0.005, 0.05));
+        set
+        {
+            if (SetProperty(ref _jogVelocity, Math.Clamp(value, 0.005, 0.05)))
+            {
+                JogCommand.NotifyCanExecuteChanged();
+            }
+        }
     }
 
     private void SelectShape(string? shapeName)
@@ -677,6 +703,135 @@ public sealed class MainViewModel : ObservableObject
                ShapeSizeMeters > 0.0;
     }
 
+    private bool CanRunSessionJog(string? direction)
+    {
+        return !string.IsNullOrWhiteSpace(direction) &&
+               !IsProcessActive &&
+               _robotSessionService.IsRunning &&
+               IsJogModeEnabled &&
+               !IsDryRun &&
+               ConfirmMotion &&
+               JogStepMeters > 0.0 &&
+               JogVelocity > 0.0;
+    }
+
+    public Task HandleJogKeyAsync(string keyName)
+    {
+        var direction = keyName switch
+        {
+            "Up" or "W" => "Z+",
+            "Down" or "S" => "Z-",
+            "Left" or "A" => "Y-",
+            "Right" or "D" => "Y+",
+            "Q" => "X+",
+            "E" => "X-",
+            _ => null
+        };
+
+        if (direction is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        return JogCommand.ExecuteAsync(direction);
+    }
+
+    private async Task RunSessionJogAsync(string? direction)
+    {
+        if (string.IsNullOrWhiteSpace(direction))
+        {
+            return;
+        }
+
+        var step = JogStepMeters;
+        var deltaX = 0.0;
+        var deltaY = 0.0;
+        var deltaZ = 0.0;
+
+        switch (direction.Trim().ToUpperInvariant())
+        {
+            case "X+":
+                deltaX = step;
+                break;
+            case "X-":
+                deltaX = -step;
+                break;
+            case "Y+":
+                deltaY = step;
+                break;
+            case "Y-":
+                deltaY = -step;
+                break;
+            case "Z+":
+                deltaZ = step;
+                break;
+            case "Z-":
+                deltaZ = -step;
+                break;
+            default:
+                AppendLog("ui", $"Unknown jog direction '{direction}'.");
+                return;
+        }
+
+        var confirmMotion = ConfirmMotion;
+        LastRunStatus = "Jog starting";
+        LastRunDetail = $"Jog {direction}: step={step:0.####} m, velocity={JogVelocity:0.####}.";
+        RobotSessionStatus = "Jog running...";
+        AppendLog("ui", $"Keyboard jog requested: {direction}, step={step:0.####} m, velocity={JogVelocity:0.####}; persistent session running: {_robotSessionService.IsRunning}.");
+
+        using var cancellation = new CancellationTokenSource();
+        _runCancellation = cancellation;
+        IsProcessActive = true;
+        ModeState = "Jog running";
+
+        try
+        {
+            var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
+            var result = await _robotSessionService.JogAsync(deltaX, deltaY, deltaZ, JogVelocity, confirmMotion, progress, cancellation.Token);
+
+            if (result.Succeeded)
+            {
+                LastRunStatus = "Jog complete";
+                LastRunDetail = $"Jog {direction}: final pose held. Amps remain enabled until Shutdown Session.";
+                RobotSessionStatus = "Armed session ready - jog pose held";
+                ModeState = "Jog complete";
+            }
+            else
+            {
+                LastRunStatus = "Jog failed";
+                LastRunDetail = $"Jog {direction}: failed or rejected. Check Process Log.";
+                RobotSessionStatus = "Armed session ready - check jog result";
+                ModeState = "Jog failed";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            LastRunStatus = "Jog stopped";
+            LastRunDetail = "Operator cancelled the active jog wait.";
+            AppendLog("ui", "Jog wait stopped by operator. Use Stop Motion if the backend is still moving.");
+            ModeState = "Stopped";
+        }
+        catch (Exception exception)
+        {
+            LastRunStatus = "Jog error";
+            LastRunDetail = exception.Message;
+            RobotSessionStatus = "Jog error";
+            AppendLog("err", exception.Message);
+            ModeState = "Error";
+        }
+        finally
+        {
+            _runCancellation = null;
+            IsProcessActive = false;
+            RefreshModeState();
+            StartArmedSessionCommand.NotifyCanExecuteChanged();
+            ShutdownSessionCommand.NotifyCanExecuteChanged();
+            StopSessionMotionCommand.NotifyCanExecuteChanged();
+            RunSessionShapeCommand.NotifyCanExecuteChanged();
+            JogCommand.NotifyCanExecuteChanged();
+        }
+    }
+
     private async Task RunSessionShapeAsync()
     {
         var plan = CreateCurrentPlan();
@@ -748,7 +903,7 @@ public sealed class MainViewModel : ObservableObject
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             await _robotSessionService.StartAsync(progress, CancellationToken.None);
             RobotSessionStatus = "Armed session ready - amps enabled";
-            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; jog commands are still rejected in this phase.");
+            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace and jog commands are available in this phase.");
         }
         catch (Exception exception)
         {
@@ -1075,4 +1230,8 @@ public sealed class MainViewModel : ObservableObject
             lines.Skip(Math.Max(0, lines.Length - 24)));
     }
 }
+
+
+
+
 

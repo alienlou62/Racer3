@@ -1,6 +1,7 @@
-﻿<UserControl xmlns="https://github.com/avaloniaui"
+<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             x:Class="Racer3MotionUi.Views.MainView">
+             x:Class="Racer3MotionUi.Views.MainView"
+             Focusable="True">
     <UserControl.Styles>
         <Style Selector="TextBlock.Label">
             <Setter Property="Foreground" Value="#8FA3B8"/>
@@ -244,7 +245,7 @@
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="Keyboard Jog (planned)" Classes="PanelTitle"/>
+                        <TextBlock Text="Keyboard Jog" Classes="PanelTitle"/>
                         <CheckBox Content="Enable Jog Mode" IsChecked="{Binding IsJogModeEnabled}"/>
                         <Grid ColumnDefinitions="*,*">
                             <StackPanel Spacing="6">
@@ -256,10 +257,18 @@
                                 <TextBox Text="{Binding JogVelocity, Mode=TwoWay}" Watermark="0.025"/>
                             </StackPanel>
                         </Grid>
-                        <TextBlock Text="W/S: Z up/down   A/D: Y left/right   Q/E: X forward/back   Arrow keys: Y/Z plane   Space: stop"
+                        <Grid ColumnDefinitions="*,*,*" RowDefinitions="Auto,Auto" Margin="0,4,0,0">
+                            <Button Grid.Row="0" Grid.Column="0" Content="X+ / Q" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="X+" Margin="0,0,5,5"/>
+                            <Button Grid.Row="0" Grid.Column="1" Content="Y+ / D" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="Y+" Margin="5,0,5,5"/>
+                            <Button Grid.Row="0" Grid.Column="2" Content="Z+ / W" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="Z+" Margin="5,0,0,5"/>
+                            <Button Grid.Row="1" Grid.Column="0" Content="X- / E" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="X-" Margin="0,5,5,0"/>
+                            <Button Grid.Row="1" Grid.Column="1" Content="Y- / A" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="Y-" Margin="5,5,5,0"/>
+                            <Button Grid.Row="1" Grid.Column="2" Content="Z- / S" Classes="Secondary" Command="{Binding JogCommand}" CommandParameter="Z-" Margin="5,5,0,0"/>
+                        </Grid>
+                        <TextBlock Text="Keyboard: W/S or Up/Down jog Z, A/D or Left/Right jog Y, Q/E jog X. Click the panel first; keyboard shortcuts are ignored while typing in text boxes."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
-                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend supports validated cartesian_jog commands. Session trace commands are available first."
+                        <TextBlock Text="Jog requires Start Armed Session, Enable Jog Mode, Dry Run unchecked, and Confirm Motion checked. Each jog is a validated cartesian_jog command that holds the final pose."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
                     </StackPanel>
