@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe", "kinematics-dry-run", "cartesian-vector", "cartesian-trace")]
+    [ValidateSet("dry-run", "enable-only", "tiny-motion", "dual-motion", "all-motion", "joint-vector", "robot-model-probe", "robot-pose-probe", "kinematics-dry-run", "cartesian-vector", "cartesian-trace", "session-server")]
     [string]$Mode = "enable-only",
 
     [string]$PrimaryNic = "",
@@ -245,6 +245,14 @@ switch ($Mode) {
         $ExeArgs += "--cartesian"
         $ExeArgs += $Cartesian
         if ($ConfirmMotion) { $ExeArgs += "--confirm-motion" }
+    }
+    "session-server" {
+        # Interactive persistent armed session mode. This intentionally uses the same
+        # project launch path as the known-good one-shot tests: optional build,
+        # rsiconfig, brief settle, then racer3-basic-motion --session-server.
+        # stdin/stdout/stderr are inherited by the console so JSON commands can be
+        # typed directly and backend startup logs are not hidden by a wrapper.
+        $ExeArgs += "--session-server"
     }
     "cartesian-trace" {
         if ([string]::IsNullOrWhiteSpace($CartesianTrace)) {

@@ -56,6 +56,13 @@ static constexpr double MotionAcceleration = 1.0;
 static constexpr double MotionDeceleration = 1.0;
 static constexpr double MotionJerkPercent = 5.0;
 
+// Backend-owned smooth jog experiment constants.  The first physical jog proof is
+// deliberately limited to J6 through the already-armed, already-mapped MultiAxis
+// session.  These values are in RMP user units where 1.0 is one J6 revolution.
+static constexpr double ArmedSessionAxis6JogMaxVelocity = 0.010;     // 3.6 deg/sec
+static constexpr double ArmedSessionAxis6JogAcceleration = 0.10;     // 36 deg/sec^2
+static constexpr double ArmedSessionAxis6JogJerkPercent = 5.0;
+
 // After UserUnitsSet(41943040), these values are in revolutions/user-units.
 static constexpr double Axis6FineTolerance = 0.001;     // 0.36 degrees
 static constexpr double Axis6CoarseTolerance = 0.005;   // 1.8 degrees
@@ -2477,7 +2484,11 @@ void probeConfiguredLinearBuilder(
 }
 
 Racer3BasicMotion::Racer3BasicMotion()
-    : controller_(nullptr), multiAxis_(nullptr), axes_{}
+    : controller_(nullptr),
+      multiAxis_(nullptr),
+      axes_{},
+      armedSessionAxis6VelocityJogActive_(false),
+      armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_(0.0)
 {
 }
 
@@ -2527,12 +2538,15 @@ void Racer3BasicMotion::startArmedSession(double velocityUserUnitsPerSecond, boo
 
     isolateAllAxesForAllMotion();
 
+    armedSessionAxis6VelocityJogActive_ = false;
+    armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
+
     std::cout << "Persistent armed session is ready. Amps remain enabled until Shutdown Session.\n";
 }
 
 void Racer3BasicMotion::stopArmedSessionMotion()
 {
-    std::cout << "Stop requested for persistent armed session. Aborting MultiAxis motion if active.\n";
+    std::cout << "Stop requested for persistent armed session.\n";
 
     if (!multiAxis_)
     {
@@ -2540,8 +2554,16 @@ void Racer3BasicMotion::stopArmedSessionMotion()
         return;
     }
 
+    if (armedSessionAxis6VelocityJogActive_)
+    {
+        stopArmedSessionAxis6VelocityJog("Stop Motion command");
+        printDiagnosticSnapshot("After armed-session velocity jog stop request", false);
+        return;
+    }
+
     try
     {
+        std::cout << "  No backend velocity jog is active; preserving legacy Stop Motion behavior for trace/general motion.\n";
         multiAxis_->Abort();
         std::cout << "  MultiAxis abort command sent. Amps remain enabled for the armed session.\n";
     }
@@ -2558,6 +2580,196 @@ void Racer3BasicMotion::stopArmedSessionMotion()
     printDiagnosticSnapshot("After armed-session stop request", false);
 }
 
+void Racer3BasicMotion::startArmedSessionAxis6VelocityJog(double velocityUserUnitsPerSecond)
+{
+    if (!controller_ || !multiAxis_)
+    {
+        throw std::runtime_error("Persistent armed session is not initialized.");
+    }
+
+    if (ArmedSessionTraceExecutionEnabled)
+    {
+        throw std::runtime_error("Axis 6 velocity jog is rejected while a session trace is active.");
+    }
+
+    if (velocityUserUnitsPerSecond == 0.0)
+    {
+        throw std::runtime_error("Axis 6 velocity jog requires a non-zero signed velocity.");
+    }
+
+    const double absoluteVelocity = std::fabs(velocityUserUnitsPerSecond);
+    if (absoluteVelocity > ArmedSessionAxis6JogMaxVelocity)
+    {
+        std::ostringstream message;
+        message << "Axis 6 velocity jog speed "
+                << absoluteVelocity
+                << " exceeds conservative backend limit "
+                << ArmedSessionAxis6JogMaxVelocity
+                << " user-units/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (armedSessionAxis6VelocityJogActive_)
+    {
+        std::ostringstream message;
+        message << "Axis 6 velocity jog is already active at "
+                << armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_
+                << " user-units/sec; send jog_velocity_stop before changing direction or speed.";
+        throw std::runtime_error(message.str());
+    }
+
+    std::cout << "Backend Axis 6 velocity jog start requested. This is a smooth joint-space proof, not Cartesian TCP jog yet.\n";
+    std::cout << "  Commanded J6 velocity=" << velocityUserUnitsPerSecond
+              << " user-units/sec (" << toDegrees(velocityUserUnitsPerSecond) << " deg/sec).\n";
+    std::cout << "  No rsiconfig, AxisAdd/remap, ClearFaults, AmpEnableSet, Abort, or session reinitialization will run on this jog path.\n";
+
+    printArmedSessionPositionSnapshot("Before backend Axis 6 velocity jog start");
+
+    const bool multiAxisAmpEnabled = multiAxis_->AmpEnableGet();
+    const bool axis6AmpEnabled = axes_[Axis6Index] && axes_[Axis6Index]->AmpEnableGet();
+    std::cout << "  Amp validation before jog: MultiAxis AmpEnableGet=" << boolText(multiAxisAmpEnabled)
+              << ", Axis 6 AmpEnableGet=" << boolText(axis6AmpEnabled) << "\n";
+
+    if (!multiAxisAmpEnabled || !axis6AmpEnabled)
+    {
+        throw std::runtime_error("Axis 6 velocity jog rejected because amps are not enabled in the armed session.");
+    }
+
+    configureMultiAxisMotionAttributes("before backend Axis 6 velocity jog start");
+
+    const JointVector velocity = makeAxis6OnlyVector(velocityUserUnitsPerSecond);
+    const JointVector acceleration = makeAllAxesVector(ArmedSessionAxis6JogAcceleration);
+    const JointVector jerk = makeAllAxesVector(ArmedSessionAxis6JogJerkPercent);
+
+    std::cout << "  MultiAxis::MoveVelocitySCurve velocity vector [J1..J6]: ";
+    printJointVector(velocity);
+    std::cout << "  MultiAxis::MoveVelocitySCurve acceleration vector [J1..J6]: ";
+    printJointVector(acceleration);
+    std::cout << "  MultiAxis::MoveVelocitySCurve jerk-percent vector [J1..J6]: ";
+    printJointVector(jerk);
+
+    multiAxis_->MoveVelocitySCurve(velocity.data(), acceleration.data(), jerk.data());
+
+    armedSessionAxis6VelocityJogActive_ = true;
+    armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = velocityUserUnitsPerSecond;
+
+    std::cout << "  Axis 6 velocity jog primitive accepted by RapidCode. Motion continues in the backend/RMP until jog_velocity_stop.\n";
+    std::cout << "  Amps remain enabled for the persistent armed session.\n";
+    printArmedSessionPositionSnapshot("Immediately after backend Axis 6 velocity jog start");
+}
+
+void Racer3BasicMotion::stopArmedSessionAxis6VelocityJog(const char* reason)
+{
+    const char* stopReason = reason ? reason : "unspecified";
+    std::cout << "Backend Axis 6 velocity jog stop requested. Reason: " << stopReason << "\n";
+
+    if (!multiAxis_)
+    {
+        armedSessionAxis6VelocityJogActive_ = false;
+        armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
+        std::cout << "  MultiAxis is not initialized; no jog stop action was required.\n";
+        return;
+    }
+
+    if (!armedSessionAxis6VelocityJogActive_)
+    {
+        std::cout << "  No backend Axis 6 velocity jog is active; stop is a no-op. Amps remain enabled.\n";
+        return;
+    }
+
+    printArmedSessionPositionSnapshot("Before backend Axis 6 velocity jog stop");
+
+    std::cout << "  Sending MultiAxis::TriggeredModify to decelerate the velocity jog to zero without Abort or amp disable.\n";
+    multiAxis_->TriggeredModify();
+
+    armedSessionAxis6VelocityJogActive_ = false;
+    armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
+
+    const bool multiAxisAmpEnabled = multiAxis_->AmpEnableGet();
+    const bool axis6AmpEnabled = axes_[Axis6Index] && axes_[Axis6Index]->AmpEnableGet();
+    std::cout << "  TriggeredModify sent. Amp validation after jog stop: MultiAxis AmpEnableGet="
+              << boolText(multiAxisAmpEnabled)
+              << ", Axis 6 AmpEnableGet="
+              << boolText(axis6AmpEnabled)
+              << "\n";
+    printArmedSessionPositionSnapshot("Immediately after backend Axis 6 velocity jog stop command");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    printArmedSessionPositionSnapshot("250 ms after backend Axis 6 velocity jog stop command");
+}
+
+
+void Racer3BasicMotion::printArmedSessionPositionSnapshot(const char* label)
+{
+    const char* snapshotLabel = label ? label : "Armed-session position snapshot";
+    std::cout << snapshotLabel << ":\n";
+
+    if (!controller_ || !multiAxis_)
+    {
+        std::cout << "  Persistent armed session is not initialized; no positions available.\n";
+        return;
+    }
+
+    try
+    {
+        std::cout << "  MultiAxis: State=" << stateName(multiAxis_->StateGet())
+                  << " Amp=" << boolText(multiAxis_->AmpEnableGet())
+                  << " Done=" << boolText(multiAxis_->MotionDoneGet())
+                  << " MotionId=" << multiAxis_->MotionIdGet()
+                  << " Exec=" << multiAxis_->MotionIdExecutingGet()
+                  << "\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  MultiAxis snapshot threw RapidCode error: " << error.text
+                  << " (" << error.functionName << ")\n";
+    }
+    catch (...)
+    {
+        std::cout << "  MultiAxis snapshot threw unknown exception.\n";
+    }
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        RR::Axis* axis = axes_[index];
+        std::cout << "  J" << (index + 1) << ": ";
+
+        if (!axis)
+        {
+            std::cout << "<null>\n";
+            continue;
+        }
+
+        try
+        {
+            const double commandPosition = axis->CommandPositionGet();
+            const double actualPosition = axis->ActualPositionGet();
+            const double commandVelocity = axis->CommandVelocityGet();
+            const double actualVelocity = axis->ActualVelocityGet();
+
+            std::cout << std::fixed << std::setprecision(6)
+                      << "CmdPos=" << commandPosition
+                      << " ActPos=" << actualPosition
+                      << " DeltaActMinusCmd=" << (actualPosition - commandPosition)
+                      << " CmdVel=" << commandVelocity
+                      << " ActVel=" << actualVelocity
+                      << " State=" << stateName(axis->StateGet())
+                      << " Amp=" << boolText(axis->AmpEnableGet())
+                      << " Done=" << boolText(axis->MotionDoneGet())
+                      << "\n";
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "snapshot threw RapidCode error: " << error.text
+                      << " (" << error.functionName << ")\n";
+        }
+        catch (...)
+        {
+            std::cout << "snapshot threw unknown exception.\n";
+        }
+    }
+}
+
 void Racer3BasicMotion::runArmedSessionTrace(
     const std::vector<std::array<double, AxisCount>>& waypoints,
     double velocityUserUnitsPerSecond,
@@ -2566,6 +2778,11 @@ void Racer3BasicMotion::runArmedSessionTrace(
     if (!controller_ || !multiAxis_)
     {
         throw std::runtime_error("Persistent armed session is not initialized.");
+    }
+
+    if (armedSessionAxis6VelocityJogActive_)
+    {
+        throw std::runtime_error("Persistent armed session trace rejected because backend Axis 6 velocity jog is active. Send jog_velocity_stop first.");
     }
 
     if (waypoints.empty())
@@ -2614,6 +2831,28 @@ void Racer3BasicMotion::shutdownArmedSession() noexcept
     {
         if (multiAxis_)
         {
+            if (armedSessionAxis6VelocityJogActive_)
+            {
+                try
+                {
+                    stopArmedSessionAxis6VelocityJog("persistent armed session shutdown");
+                }
+                catch (const RR::RsiError& error)
+                {
+                    std::cout << "  Axis 6 velocity jog stop during shutdown threw RapidCode error: "
+                              << error.text
+                              << " ("
+                              << error.functionName
+                              << ")\n";
+                }
+                catch (const std::exception& error)
+                {
+                    std::cout << "  Axis 6 velocity jog stop during shutdown threw exception: "
+                              << error.what()
+                              << "\n";
+                }
+            }
+
             try
             {
                 multiAxis_->Abort();

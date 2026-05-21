@@ -748,7 +748,7 @@ public sealed class MainViewModel : ObservableObject
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             await _robotSessionService.StartAsync(progress, CancellationToken.None);
             RobotSessionStatus = "Armed session ready - amps enabled";
-            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; jog commands are still rejected in this phase.");
+            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; backend Axis 6 velocity jog proof commands are available through the session protocol.");
         }
         catch (Exception exception)
         {

@@ -55,6 +55,9 @@ public:
     void run(const Racer3RunOptions& options);
     void startArmedSession(double velocityUserUnitsPerSecond, bool diagnostics);
     void stopArmedSessionMotion();
+    void startArmedSessionAxis6VelocityJog(double velocityUserUnitsPerSecond);
+    void stopArmedSessionAxis6VelocityJog(const char* reason);
+    void printArmedSessionPositionSnapshot(const char* label);
     void runArmedSessionTrace(
         const std::vector<std::array<double, AxisCount>>& waypoints,
         double velocityUserUnitsPerSecond,
@@ -110,6 +113,8 @@ private:
     RSI::RapidCode::MotionController* controller_;
     RSI::RapidCode::MultiAxis* multiAxis_;
     std::array<RSI::RapidCode::Axis*, AxisCount> axes_;
+    bool armedSessionAxis6VelocityJogActive_;
+    double armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_;
 };
 
 

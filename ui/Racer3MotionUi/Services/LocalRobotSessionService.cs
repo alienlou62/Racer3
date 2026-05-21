@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -76,7 +76,7 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
             process = _process;
         }
 
-        output.Report(new ProcessOutputLine("ui", "Starting persistent armed session process. This phase connects RMP and enables amps once; trace/jog commands are still rejected."));
+        output.Report(new ProcessOutputLine("ui", "Starting persistent armed session process. This phase connects RMP and enables amps once. Trace commands and backend Axis 6 velocity jog proof commands are available after session ready."));
 
         if (!process.Start())
         {

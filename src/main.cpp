@@ -1,4 +1,4 @@
-#include "Racer3BasicMotion.h"
+﻿#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +20,8 @@ constexpr double DefaultStepUserUnits = 0.05;
 constexpr double DefaultVelocityUserUnitsPerSecond = 0.05;
 constexpr double DefaultReturnWarnToleranceUserUnits = 0.00025;
 constexpr double DefaultReturnFailToleranceUserUnits = 0.00100;
+constexpr double DefaultAxis6JogVelocityUserUnitsPerSecond = 0.005;
+constexpr double MaxAxis6JogVelocityUserUnitsPerSecond = 0.010;
 constexpr double MaxRecommendedStepUserUnits = 0.25;
 constexpr int AxisCount = 6;
 constexpr double MaxRecommendedJointVectorUserUnits = 0.25;
@@ -53,7 +55,7 @@ void printUsage()
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
-        << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, and keeps amps enabled until shutdown. Trace/jog motion commands are rejected in this phase.\n"
+        << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, trace, and backend-owned Axis 6 velocity jog commands.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -438,7 +440,7 @@ int runSessionServer()
     try
     {
         sessionMotion.startArmedSession(DefaultVelocityUserUnitsPerSecond, false);
-        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands are available in this phase; jog commands are still not implemented.\"}");
+        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands and backend Axis 6 velocity jog proof commands are available.\"}");
     }
     catch (const RR::RsiError& error)
     {
@@ -479,7 +481,76 @@ int runSessionServer()
 
         if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Trace commands are available. Jog commands will be added in the next phase.\"}");
+            sessionMotion.printArmedSessionPositionSnapshot("Session status position snapshot");
+            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Position snapshot was printed to backend stdout. Trace commands and backend Axis 6 velocity jog proof commands are available.\"}");
+            continue;
+        }
+
+        if (command.find("jog_velocity_start") != std::string::npos)
+        {
+            const int requestedAxis = static_cast<int>(jsonNumberField(line, "axis", 6.0));
+            const std::string direction = normalizeSessionCommand(jsonStringField(line, "direction"));
+            const double requestedVelocity = jsonNumberField(line, "velocity", DefaultAxis6JogVelocityUserUnitsPerSecond);
+
+            try
+            {
+                if (requestedAxis != 6)
+                {
+                    throw std::runtime_error("backend velocity jog proof currently accepts only axis=6 / J6.");
+                }
+
+                if (requestedVelocity <= 0.0 || requestedVelocity > MaxAxis6JogVelocityUserUnitsPerSecond)
+                {
+                    std::ostringstream message;
+                    message << "backend Axis 6 velocity jog requires 0 < velocity <= "
+                            << MaxAxis6JogVelocityUserUnitsPerSecond
+                            << " user-units/sec.";
+                    throw std::runtime_error(message.str());
+                }
+
+                double signedVelocity = requestedVelocity;
+                if (direction == "negative" || direction == "-" || direction == "j6-" || direction == "axis6-" || direction == "cw")
+                {
+                    signedVelocity = -requestedVelocity;
+                }
+                else if (!(direction.empty() || direction == "positive" || direction == "+" || direction == "j6+" || direction == "axis6+" || direction == "ccw"))
+                {
+                    throw std::runtime_error("backend Axis 6 velocity jog direction must be positive/J6+ or negative/J6-.");
+                }
+
+                writeSessionEvent("{\"type\":\"session_jog_velocity_starting\",\"state\":\"jog_running\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog command accepted. This is a joint-space smooth-motion proof, not Cartesian TCP jog yet.\"}");
+                sessionMotion.startArmedSessionAxis6VelocityJog(signedVelocity);
+                writeSessionEvent("{\"type\":\"session_jog_velocity_started\",\"state\":\"jog_running\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog is active. Send jog_velocity_stop to decelerate to zero velocity.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_velocity_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Axis 6 velocity jog RapidCode error: ") + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Amps should remain enabled; use jog_velocity_stop or Shutdown Session if needed.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_velocity_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Axis 6 velocity jog failed: ") + escapeJsonText(error.what()) + ". Amps should remain enabled; use jog_velocity_stop or Shutdown Session if needed.\"}");
+            }
+
+            continue;
+        }
+
+        if (command.find("jog_velocity_stop") != std::string::npos)
+        {
+            try
+            {
+                writeSessionEvent("{\"type\":\"session_jog_velocity_stopping\",\"state\":\"jog_stopping\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog stop requested. Using TriggeredModify, not Abort or amp disable.\"}");
+                sessionMotion.stopArmedSessionAxis6VelocityJog("jog_velocity_stop command");
+                writeSessionEvent("{\"type\":\"session_jog_velocity_stopped\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog stop command sent. Amps remain enabled for additional session commands.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_velocity_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Axis 6 velocity jog stop RapidCode error: ") + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Amps should remain enabled; use Shutdown Session if needed.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_jog_velocity_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Axis 6 velocity jog stop failed: ") + escapeJsonText(error.what()) + ". Amps should remain enabled; use Shutdown Session if needed.\"}");
+            }
+
             continue;
         }
 
@@ -488,7 +559,7 @@ int runSessionServer()
             try
             {
                 sessionMotion.stopArmedSessionMotion();
-                writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop acknowledged. Any active MultiAxis motion was aborted. Amps remain enabled for the armed session.\"}");
+                writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop acknowledged. Active backend velocity jog is decelerated with TriggeredModify; otherwise legacy trace/general motion stop uses Abort. Amps remain enabled for the armed session.\"}");
             }
             catch (const std::exception& error)
             {
@@ -534,11 +605,11 @@ int runSessionServer()
 
         if (command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Jog commands are still rejected in this phase. Trace commands are implemented first; keyboard jog will be added next.\"}");
+            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unsupported jog command. This patch intentionally supports only backend jog_velocity_start / jog_velocity_stop for Axis 6 joint-space velocity proof motion.\"}");
             continue;
         }
 
-        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, stop, shutdown.\"}");
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, jog_velocity_start, jog_velocity_stop, stop, shutdown.\"}");
     }
 
     writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session input closed. Disabling amps and exiting.\"}");
