@@ -17,6 +17,8 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
     private IProgress<ProcessOutputLine>? _output;
     private TaskCompletionSource<bool>? _readySignal;
     private TaskCompletionSource<MotionExecutionResult>? _motionCompletionSignal;
+    private TaskCompletionSource<bool>? _cartesianJogStartSignal;
+    private TaskCompletionSource<bool>? _cartesianJogStopSignal;
 
     public LocalRobotSessionService(Racer3MotionUiConfig config)
     {
@@ -76,7 +78,7 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
             process = _process;
         }
 
-        output.Report(new ProcessOutputLine("ui", "Starting persistent armed session process. This phase connects RMP and enables amps once. Trace commands and backend Axis 6 velocity jog proof commands are available after session ready."));
+        output.Report(new ProcessOutputLine("ui", "Starting persistent armed session process. This phase connects RMP and enables amps once. Trace commands and backend-owned Cartesian Z- jog commands are available after session ready."));
 
         if (!process.Start())
         {
@@ -97,6 +99,82 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
     public Task StopMotionAsync(CancellationToken cancellationToken)
     {
         return SendCommandAsync("{\"type\":\"stop\"}", cancellationToken);
+    }
+
+    public async Task StartCartesianJogAsync(string direction, double speedMetersPerSecond, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(direction))
+        {
+            throw new ArgumentException("Jog direction is required.", nameof(direction));
+        }
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            _cartesianJogStartSignal = completion;
+        }
+
+        var speedText = speedMetersPerSecond.ToString("0.######", CultureInfo.InvariantCulture);
+        var command = "{\"type\":\"jog_cartesian_start\",\"direction\":\"" +
+            EscapeJsonString(direction.Trim()) +
+            "\",\"speed\":" +
+            speedText +
+            "}";
+
+        try
+        {
+            await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+            await WaitForSignalAsync(
+                    completion,
+                    TimeSpan.FromSeconds(10),
+                    "backend Cartesian jog start acknowledgement",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_cartesianJogStartSignal, completion))
+                {
+                    _cartesianJogStartSignal = null;
+                }
+            }
+        }
+    }
+
+    public async Task StopCartesianJogAsync(string reason, CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            _cartesianJogStopSignal = completion;
+        }
+
+        var command = "{\"type\":\"jog_cartesian_stop\",\"reason\":\"" +
+            EscapeJsonString(string.IsNullOrWhiteSpace(reason) ? "ui stop" : reason.Trim()) +
+            "\"}";
+
+        try
+        {
+            await SendCommandAsync(command, cancellationToken).ConfigureAwait(false);
+            await WaitForSignalAsync(
+                    completion,
+                    TimeSpan.FromSeconds(20),
+                    "backend Cartesian jog stop completion",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_cartesianJogStopSignal, completion))
+                {
+                    _cartesianJogStopSignal = null;
+                }
+            }
+        }
     }
 
     public async Task<MotionExecutionResult> TraceShapeAsync(
@@ -270,6 +348,13 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
         }
     }
 
+    private static string EscapeJsonString(string value)
+    {
+        return value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+    }
+
     private async Task SendCommandAsync(string command, CancellationToken cancellationToken)
     {
         Process? process;
@@ -323,6 +408,25 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
                     line.Contains("\"type\":\"session_reject\"", StringComparison.OrdinalIgnoreCase))
                 {
                     _motionCompletionSignal?.TrySetResult(new MotionExecutionResult(1, 1));
+                    _cartesianJogStartSignal?.TrySetException(new InvalidOperationException(line));
+                    _cartesianJogStopSignal?.TrySetException(new InvalidOperationException(line));
+                }
+
+                if (line.Contains("\"type\":\"session_jog_cartesian_started\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    _cartesianJogStartSignal?.TrySetResult(true);
+                }
+
+                if (line.Contains("\"type\":\"session_jog_cartesian_stopped\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    _cartesianJogStopSignal?.TrySetResult(true);
+                }
+
+                if (line.Contains("\"type\":\"session_jog_cartesian_error\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    var exception = new InvalidOperationException(line);
+                    _cartesianJogStartSignal?.TrySetException(exception);
+                    _cartesianJogStopSignal?.TrySetException(exception);
                 }
             }
         }
@@ -355,17 +459,31 @@ public sealed class LocalRobotSessionService : IRobotSessionService, IDisposable
 
     private static async Task WaitForReadyAsync(TaskCompletionSource<bool> readySignal, TimeSpan timeout, CancellationToken cancellationToken)
     {
+        await WaitForSignalAsync(
+                readySignal,
+                timeout,
+                "persistent armed session ready",
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task WaitForSignalAsync(
+        TaskCompletionSource<bool> signal,
+        TimeSpan timeout,
+        string description,
+        CancellationToken cancellationToken)
+    {
         var completed = await Task.WhenAny(
-                readySignal.Task,
+                signal.Task,
                 Task.Delay(timeout, cancellationToken))
             .ConfigureAwait(false);
 
-        if (completed != readySignal.Task)
+        if (completed != signal.Task)
         {
-            throw new TimeoutException($"Persistent armed session process did not report ready within {timeout.TotalSeconds:0} seconds.");
+            throw new TimeoutException($"Timed out waiting for {description} within {timeout.TotalSeconds:0} seconds.");
         }
 
-        await readySignal.Task.ConfigureAwait(false);
+        await signal.Task.ConfigureAwait(false);
     }
 
     private string ResolveRepoRoot()

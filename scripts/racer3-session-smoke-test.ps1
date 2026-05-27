@@ -14,7 +14,7 @@ function Write-Log {
 }
 
 Set-Location $RepoRoot
-$env:PATH = "C:\RSI\11.0.0;$env:PATH"
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
 
 $script:LogPath = Join-Path $RepoRoot "session-smoke-test.log"
 Remove-Item $script:LogPath -ErrorAction SilentlyContinue

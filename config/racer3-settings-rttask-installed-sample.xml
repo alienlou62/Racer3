@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Racer3 installed RSI sample RTTaskManager probe settings.
+
+  This file is a no-motion bridge probe. It keeps the same Racer3 network,
+  axis, and MultiAxis configuration as the custom RTTask probe, but the
+  RTTaskManager loads the installed RSI sample RTTaskFunctions.rsl instead of
+  the custom Racer3 RTTask library. Use it only to prove rapidserver + rsiconfig +
+  RTTaskManager + feedback readback while the custom Racer3 .rsl build remains
+  blocked by the local INtime CDEV headers.
+-->
+<XMLSettings xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExpectedNodeCount>6</ExpectedNodeCount>
+  <ExpectedNodeTypes>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+    <RSINodeType>RSINodeTypeKOLLMORGEN_AKD</RSINodeType>
+  </ExpectedNodeTypes>
+  <NetworkStartTimeoutMilliseconds xsi:nil="true" />
+  <SampleRate>1000</SampleRate>
+  <AxisCount>6</AxisCount>
+  <MotionCount>7</MotionCount>
+  <UserLimitCount>0</UserLimitCount>
+  <RecorderCount>0</RecorderCount>
+  <RecorderBufferSize />
+  <CompensatorCount>0</CompensatorCount>
+  <CompensatorPointCount />
+  <AxisFrameBufferSize>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+    <int>1024</int>
+  </AxisFrameBufferSize>
+  <MathBlockCount>0</MathBlockCount>
+  <XMLFiles>
+    <AxisXML>
+      <AxisNumber>0</AxisNumber>
+      <XMLFile>Axis 0.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>1</AxisNumber>
+      <XMLFile>Axis 1.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>2</AxisNumber>
+      <XMLFile>Axis 2.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>3</AxisNumber>
+      <XMLFile>Axis 3.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>4</AxisNumber>
+      <XMLFile>Axis 4.xml</XMLFile>
+    </AxisXML>
+    <AxisXML>
+      <AxisNumber>5</AxisNumber>
+      <XMLFile>Axis 5.xml</XMLFile>
+    </AxisXML>
+  </XMLFiles>
+  <MultiAxisXMLFiles>
+  <MultiAxisXML>
+    <MotionSupervisorIndex>6</MotionSupervisorIndex>
+    <XMLFile>MultiAxis.xml</XMLFile>
+  </MultiAxisXML>
+  </MultiAxisXMLFiles>
+  <RTTaskManagers>
+    <RTTaskManager>
+      <RTTaskDirectory>C:\RSI\11.0.5</RTTaskDirectory>
+      <Platform>INtime</Platform>
+      <NodeName>NodeA</NodeName>
+      <CpuCore>2</CpuCore>
+      <UserLabel>Racer3InstalledSampleProbe</UserLabel>
+      <NoRmp>false</NoRmp>
+      <RTTasks>
+        <RTTask>
+          <FunctionName>Initialize</FunctionName>
+          <LibraryName>RTTaskFunctions</LibraryName>
+          <LibraryDirectory />
+          <UserLabel>Initialize</UserLabel>
+          <Priority>Lowest</Priority>
+          <Repeats>0</Repeats>
+          <Period>1</Period>
+          <Phase>0</Phase>
+          <EnableTiming>true</EnableTiming>
+        </RTTask>
+        <RTTask>
+          <FunctionName>Increment</FunctionName>
+          <LibraryName>RTTaskFunctions</LibraryName>
+          <LibraryDirectory />
+          <UserLabel>Increment</UserLabel>
+          <Priority>Low</Priority>
+          <Repeats>-1</Repeats>
+          <Period>10</Period>
+          <Phase>0</Phase>
+          <EnableTiming>true</EnableTiming>
+        </RTTask>
+      </RTTasks>
+    </RTTaskManager>
+  </RTTaskManagers>
+</XMLSettings>

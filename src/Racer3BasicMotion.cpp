@@ -2,14 +2,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
+#include <memory>
 #include <limits>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <rsi.h>
+#include <rttask.h>
 #include <cartesianrobot.h>
 #include <sstream>
 #include <stdexcept>
@@ -17,8 +24,23 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <conio.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#endif
+
 namespace RR = RSI::RapidCode;
 namespace RC = RSI::RapidCode::Cartesian;
+namespace RT = RSI::RapidCode::RealTimeTasks;
 
 namespace
 {
@@ -63,6 +85,38 @@ static constexpr double ArmedSessionAxis6JogMaxVelocity = 0.010;     // 3.6 deg/
 static constexpr double ArmedSessionAxis6JogAcceleration = 0.10;     // 36 deg/sec^2
 static constexpr double ArmedSessionAxis6JogJerkPercent = 5.0;
 
+// Backend-owned Cartesian jog constants.  The first live-motion hardware
+// validation directions are X+ and Z-, with Z- recommended from the upright
+// start pose.  The default speed is 3 mm/sec after the 2 mm/sec UI jog
+// validation proved stable but a little slow.  The jog loop uses endpoint-only
+// IK and MovePVT rather than continuous MoveVelocity updates, because the first
+// live MoveVelocity loop drove the RMP group into ERROR/amp-disabled.  v14
+// deliberately disables the v13 rolling APPEND experiment because the first
+// appended MovePVT returned path error 3856 and dropped amps.  The safe fallback
+// is medium non-append PVT smoothing spans with MotionDoneWait between spans.
+static constexpr double ArmedSessionCartesianJogDefaultSpeedMetersPerSecond = 0.003; // 3 mm/sec
+static constexpr double ArmedSessionCartesianJogMaxSpeedMetersPerSecond = 0.004;     // 4 mm/sec
+static constexpr double ArmedSessionCartesianJogMaxJointVelocity = 0.060;            // 21.6 deg/sec; temporary faster keyboard jog test cap
+static constexpr int ArmedSessionCartesianJogLoopPeriodMs = 500;                    // 0.5 sec backend-owned non-append PVT smoothing span
+static constexpr double ArmedSessionCartesianJogLoopPeriodSeconds =
+    static_cast<double>(ArmedSessionCartesianJogLoopPeriodMs) / 1000.0;
+static constexpr int ArmedSessionCartesianJogLoopLogEveryTicks = 10;
+static constexpr int ArmedSessionCartesianJogRequiredConsecutiveAmpFailures = 3;
+static constexpr int ArmedSessionCartesianJogPvtWaypointCount = 16;
+static constexpr int ArmedSessionCartesianJogTickMotionDoneWaitMs = 2500;
+static constexpr int ArmedSessionCartesianJogFinalMotionDoneWaitMs = 5000;
+static constexpr int ArmedSessionJogStopMotionDoneWaitMs = 5000;
+static constexpr int ArmedSessionJogStopPostSampleMs = 250;
+static constexpr int ArmedSessionRtTaskDefaultStatusPeriodMs = 10;
+static constexpr int ArmedSessionRtTaskDefaultIntentPeriodMs = 10;
+static constexpr int ArmedSessionRtTaskInitWaitMs = 5000;
+static constexpr int ArmedSessionRtTaskHeartbeatWaitMs = 1000;
+static constexpr const char* ArmedSessionRtTaskDefaultLibraryName = "Racer3RTTaskFunctions";
+static constexpr const char* ArmedSessionRtTaskDefaultLibraryDirectory = "";
+static constexpr const char* ArmedSessionRtTaskDefaultRmpInstallPath = "C:\\RSI\\11.0.5";
+static constexpr const char* ArmedSessionRtTaskDefaultManagerPlatform = "intime";
+
+
 // After UserUnitsSet(41943040), these values are in revolutions/user-units.
 static constexpr double Axis6FineTolerance = 0.001;     // 0.36 degrees
 static constexpr double Axis6CoarseTolerance = 0.005;   // 1.8 degrees
@@ -80,6 +134,58 @@ static constexpr int MotionStartSampleMs = 50;
 
 static constexpr bool OverrideRestrictedStateForEnable = true;
 static constexpr bool TemporarilyDisableAxis6ErrorLimitForTinyMotion = true;
+
+// Startup/enable pre-arm values mirrored from the manual RapidSetup checklist.
+// Axis 3 was observed to fault on Position Error Limit during bottom-to-top
+// AmpEnableSet after the 11.0.5 upgrade.  Keep the bottom-to-top all-axis
+// enable order, but make the per-axis state explicit before each enable.
+static constexpr double BottomToTopPreEnablePositionErrorLimitUserUnits = 0.05;
+static constexpr int BottomToTopPreEnableSettleMs = 250;
+static constexpr double EndpointKeyboardJogMaxVelocityUserUnitsPerSecond = 0.010;
+static constexpr double EndpointKeyboardJogMaxPulseStepUserUnits = 0.0002;
+static constexpr int EndpointKeyboardJogTelemetryPeriodMs = 100;
+static constexpr int EndpointKeyboardJogIdleSleepMs = 5;
+static constexpr int EndpointCartesianKeyboardJogTelemetryPeriodMs = 200;
+static constexpr int EndpointCartesianKeyboardJogIdleSleepMs = 10;
+static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.025;
+static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
+// Smooth keyboard Cartesian jog now uses a finite-difference Jacobian velocity solve
+// at the current pose. The earlier tiny endpoint-only IK lookahead worked for Z,
+// but produced tiny/no-op commands for X and RPY near software zero. Velocity-level
+// DLS gives every keyboard direction a direct Cartesian twist target and keeps the
+// loop closer to the future RTTask/Xbox jog-intent architecture.
+static constexpr double EndpointCartesianKeyboardJogJacobianStepRadians = 1e-5;
+static constexpr double EndpointCartesianKeyboardJogJacobianDamping = 0.035;
+static constexpr double EndpointCartesianKeyboardJogTranslationPriorityDamping = 0.003;
+static constexpr double EndpointCartesianKeyboardJogYDamping = 0.010;
+static constexpr double EndpointCartesianKeyboardJogLinearRotationHoldWeight = 0.18;
+// Operator-planar W/S should feel like the tool leads forward/back while the
+// endpoint stays at the current height. Keep roll/yaw softly held, but do not
+// over-constrain pitch; otherwise the arm preserves tool orientation and reaches
+// along an arc that visibly drops Z.
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldWeight = 12.0;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardRollYawHoldWeight = 0.25;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardPitchHoldWeight = 8.0;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldGainPerSecond = 4.5;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldMaxCorrectionMetersPerSecond = 0.020;
+static constexpr int EndpointCartesianKeyboardJogLinearVelocityRefreshMs = 100;
+static constexpr double EndpointCartesianKeyboardJogYRotationHoldWeight = 0.10;
+// Y jogging from the upright pose legitimately needs base rotation, but it must
+// be efficient: D/A should create useful TCP-Y movement, not just wind up J1/J6.
+static constexpr double EndpointCartesianKeyboardJogYDriftStopRadians = 0.045;
+static constexpr double EndpointCartesianKeyboardJogYMaxXDriftMeters = 0.010;
+static constexpr double EndpointCartesianKeyboardJogYMaxZDriftMeters = 0.010;
+static constexpr double EndpointCartesianKeyboardJogYMaxBaseDriftUserUnits = 0.030;
+static constexpr double EndpointCartesianKeyboardJogYMaxWristYawDriftUserUnits = 0.060;
+static constexpr double EndpointCartesianKeyboardJogYMaxJointVelocityUserUnitsPerSecond = 0.012;
+static constexpr double EndpointCartesianKeyboardJogYMinEfficiency = 0.08;
+static constexpr int EndpointCartesianKeyboardJogYVelocityRefreshMs = 100;
+static constexpr double EndpointCartesianKeyboardJogNearZeroJointVelocityUserUnitsPerSecond = 1e-7;
+static constexpr double EndpointCartesianKeyboardJogMaxJointVelocityUserUnitsPerSecond = ArmedSessionCartesianJogMaxJointVelocity;
+static constexpr double EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2 = 0.20;
+static constexpr double EndpointCartesianKeyboardJogJerkPercent = 5.0;
+static constexpr int EndpointCartesianKeyboardJogVelocityStopSettleMs = 150;
+static constexpr int EndpointCartesianKeyboardJogVelocityStopDoneWaitMs = 1500;
 
 static bool DiagnosticsEnabled = false;
 static bool DualMotionEnabled = false;
@@ -104,6 +210,63 @@ static CartesianVector RequestedCartesianVector{};
 static std::vector<CartesianVector> RequestedCartesianTraceWaypoints;
 static bool ArmedSessionTraceExecutionEnabled = false;
 static bool ArmedSessionTraceReturnToZero = true;
+
+std::string escapeRtTaskJsonText(const std::string& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value)
+    {
+        switch (ch)
+        {
+        case '\\': escaped += "\\\\"; break;
+        case '"': escaped += "\\\""; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default: escaped += ch; break;
+        }
+    }
+    return escaped;
+}
+
+void copyRtTaskText(char* destination, size_t destinationSize, const std::string& value)
+{
+    if (!destination || destinationSize == 0)
+    {
+        return;
+    }
+
+    std::snprintf(destination, destinationSize, "%s", value.c_str());
+}
+
+RT::RTTaskCreationParameters makeRacer3RtTaskParameters(
+    const char* functionName,
+    const char* userLabel,
+    const std::string& libraryDirectory,
+    int periodMilliseconds,
+    int repeats)
+{
+    RT::RTTaskCreationParameters parameters(functionName);
+    copyRtTaskText(parameters.LibraryName, sizeof(parameters.LibraryName), ArmedSessionRtTaskDefaultLibraryName);
+    copyRtTaskText(parameters.LibraryDirectory, sizeof(parameters.LibraryDirectory), libraryDirectory);
+    copyRtTaskText(parameters.UserLabel, sizeof(parameters.UserLabel), userLabel ? userLabel : functionName);
+    parameters.Repeats = repeats;
+    parameters.Period = std::max(1, periodMilliseconds);
+    parameters.Phase = 0;
+    parameters.EnableTiming = true;
+    return parameters;
+}
+
+int64_t getRtTaskInt64Global(RT::RTTaskManager& manager, const char* name)
+{
+    return manager.GlobalValueGet(name).Int64;
+}
+
+double getRtTaskDoubleGlobal(RT::RTTaskManager& manager, const char* name)
+{
+    return manager.GlobalValueGet(name).Double;
+}
 
 double toDegrees(double userUnits)
 {
@@ -1138,6 +1301,78 @@ IkBestCandidate solveBestMultiSeedIkCandidate(
     return best;
 }
 
+IkBestCandidate solveContinuityMultiSeedIkCandidate(
+    const JointVector& baseSeedRadians,
+    const CartesianVector& targetPoseVector)
+{
+    std::vector<IkSeedCandidate> candidates = makeIkSeedCandidates(baseSeedRadians);
+
+    IkBestCandidate bestAccepted{};
+    IkBestCandidate bestFallback{};
+
+    for (IkSeedCandidate& candidate : candidates)
+    {
+        candidate.result = solveNumericalIkDampedLeastSquares(
+            candidate.seedRadians,
+            targetPoseVector);
+
+        JointVector commandDeltaFromCurrent{};
+        for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+        {
+            commandDeltaFromCurrent[index] = candidate.result.solutionRadians[index] - baseSeedRadians[index];
+        }
+
+        const double commandDeltaNorm = candidateJointDeltaNorm(commandDeltaFromCurrent);
+        const double commandMaxDeltaDegrees = maxAbsJointDeltaDegrees(commandDeltaFromCurrent);
+
+        // For live jog ticks, continuity is more important than tiny residual
+        // differences between equally valid IK branches. The older global
+        // Cartesian-vector planning path intentionally tries wide seeds to find
+        // a valid endpoint-only solution from upright poses. In a held jog loop,
+        // however, changing branches between ticks can generate a large joint
+        // delta and trip the conservative velocity guard even for a 0.1 mm TCP
+        // target. Prefer accepted candidates that stay closest to the current
+        // feedback/command neighborhood.
+        candidate.score =
+            commandDeltaNorm +
+            0.0001 * commandMaxDeltaDegrees +
+            0.000001 * candidate.result.residualNorm +
+            0.000001 * candidate.result.maxResidualComponent;
+
+        const bool acceptedForContinuity =
+            residualAcceptedForDryRunCandidate(candidate.result) &&
+            !candidate.result.hitJointLimit &&
+            commandMaxDeltaDegrees <= CandidateMaxJointDeltaDegreesAccept;
+
+        if (acceptedForContinuity &&
+            (!bestAccepted.found || candidate.score < bestAccepted.score))
+        {
+            bestAccepted.found = true;
+            bestAccepted.seedName = candidate.name;
+            bestAccepted.seedRadians = candidate.seedRadians;
+            bestAccepted.result = candidate.result;
+            bestAccepted.score = candidate.score;
+        }
+
+        const double fallbackScore = scoreIkCandidate(candidate.result);
+        if (!bestFallback.found || fallbackScore < bestFallback.score)
+        {
+            bestFallback.found = true;
+            bestFallback.seedName = candidate.name;
+            bestFallback.seedRadians = candidate.seedRadians;
+            bestFallback.result = candidate.result;
+            bestFallback.score = fallbackScore;
+        }
+    }
+
+    if (bestAccepted.found)
+    {
+        return bestAccepted;
+    }
+
+    return bestFallback;
+}
+
 JointVector subtractJointVectors(const JointVector& a, const JointVector& b)
 {
     JointVector result{};
@@ -1344,7 +1579,8 @@ CartesianSegmentCandidate makeCartesianSegmentCandidateForTargetPose(
     int segmentNumber,
     const JointVector& currentRadians,
     const CartesianVector& reportedSegmentDelta,
-    const CartesianVector& absoluteTargetPoseVector)
+    const CartesianVector& absoluteTargetPoseVector,
+    bool preferContinuitySeed = false)
 {
     CartesianSegmentCandidate segment{};
     segment.segmentNumber = segmentNumber;
@@ -1355,8 +1591,9 @@ CartesianSegmentCandidate makeCartesianSegmentCandidateForTargetPose(
     // start-to-final line. The previous implementation solved each segment as
     // current FK + small delta, which allowed a few millimeters of local residual
     // to accumulate into centimeters of final target miss.
-    segment.candidate =
-        solveBestMultiSeedIkCandidate(currentRadians, absoluteTargetPoseVector);
+    segment.candidate = preferContinuitySeed
+        ? solveContinuityMultiSeedIkCandidate(currentRadians, absoluteTargetPoseVector)
+        : solveBestMultiSeedIkCandidate(currentRadians, absoluteTargetPoseVector);
 
     if (segment.candidate.found)
     {
@@ -1374,7 +1611,8 @@ CartesianSegmentCandidate makeCartesianSegmentCandidateForTargetPose(
 
 CartesianSegmentPlan buildSegmentedCartesianPlan(
     const JointVector& startRadians,
-    const CartesianVector& requestedCartesianDelta)
+    const CartesianVector& requestedCartesianDelta,
+    bool preferContinuitySeed = false)
 {
     CartesianSegmentPlan bestRejected{};
     bestRejected.rejectionReason = "No segmented Cartesian plan was evaluated.";
@@ -1413,7 +1651,8 @@ CartesianSegmentPlan buildSegmentedCartesianPlan(
                     segmentIndex + 1,
                     currentRadians,
                     reportedSegmentDelta,
-                    waypointTargetPoseVector);
+                    waypointTargetPoseVector,
+                    preferContinuitySeed);
 
             if (!segment.accepted)
             {
@@ -2150,6 +2389,185 @@ JointTrajectoryBlock makeSmoothEndpointPvtBlock(
     return block;
 }
 
+JointTrajectoryBlock makeJogTickPvtBlock(
+    const JointVector& startingPosition,
+    const JointVector& targetPosition,
+    double samplePeriodSeconds,
+    double requestedSeconds)
+{
+    JointTrajectoryBlock block{};
+    block.positions.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.velocities.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.times.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+
+    const double minimumSeconds =
+        std::max(
+            samplePeriodSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    double totalSeconds =
+        roundUpToSamplePeriod(
+            std::max(requestedSeconds, minimumSeconds),
+            samplePeriodSeconds);
+
+    const double pointSeconds =
+        roundUpToSamplePeriod(
+            totalSeconds / static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    totalSeconds = pointSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+    JointVector delta{};
+
+    for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+    {
+        delta[axis] = targetPosition[axis] - startingPosition[axis];
+    }
+
+    for (int pointIndex = 1; pointIndex <= ArmedSessionCartesianJogPvtWaypointCount; ++pointIndex)
+    {
+        const double u =
+            static_cast<double>(pointIndex) /
+            static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+        const double s = smoothStepQuintic(u);
+        const double dsdu = smoothStepQuinticDerivative(u);
+
+        JointVector position{};
+        JointVector velocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            position[axis] = startingPosition[axis] + delta[axis] * s;
+            velocity[axis] = delta[axis] * dsdu / totalSeconds;
+        }
+
+        if (pointIndex == ArmedSessionCartesianJogPvtWaypointCount)
+        {
+            velocity.fill(0.0);
+        }
+
+        block.positions.push_back(position);
+        block.velocities.push_back(velocity);
+        block.times.push_back(pointSeconds);
+        block.totalSeconds += pointSeconds;
+    }
+
+    return block;
+}
+
+JointTrajectoryBlock makeRollingJogPvtBlock(
+    const JointVector& startingPosition,
+    const JointVector& targetPosition,
+    double samplePeriodSeconds,
+    double requestedSeconds)
+{
+    JointTrajectoryBlock block{};
+    block.positions.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.velocities.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.times.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+
+    const double minimumSeconds =
+        std::max(
+            samplePeriodSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    double totalSeconds =
+        roundUpToSamplePeriod(
+            std::max(requestedSeconds, minimumSeconds),
+            samplePeriodSeconds);
+
+    const double pointSeconds =
+        roundUpToSamplePeriod(
+            totalSeconds / static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    totalSeconds = pointSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+    JointVector delta{};
+    JointVector constantVelocity{};
+
+    for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+    {
+        delta[axis] = targetPosition[axis] - startingPosition[axis];
+        constantVelocity[axis] = delta[axis] / totalSeconds;
+    }
+
+    for (int pointIndex = 1; pointIndex <= ArmedSessionCartesianJogPvtWaypointCount; ++pointIndex)
+    {
+        const double u =
+            static_cast<double>(pointIndex) /
+            static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+        JointVector position{};
+        JointVector velocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            position[axis] = startingPosition[axis] + delta[axis] * u;
+            velocity[axis] = constantVelocity[axis];
+        }
+
+        block.positions.push_back(position);
+        block.velocities.push_back(velocity);
+        block.times.push_back(pointSeconds);
+        block.totalSeconds += pointSeconds;
+    }
+
+    return block;
+}
+
+JointTrajectoryBlock makeRollingJogStopPvtBlock(
+    const JointVector& startingPosition,
+    const JointVector& startingVelocity,
+    double samplePeriodSeconds,
+    double requestedSeconds)
+{
+    JointTrajectoryBlock block{};
+    block.positions.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.velocities.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+    block.times.reserve(ArmedSessionCartesianJogPvtWaypointCount);
+
+    const double minimumSeconds =
+        std::max(
+            samplePeriodSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    double totalSeconds =
+        roundUpToSamplePeriod(
+            std::max(requestedSeconds, minimumSeconds),
+            samplePeriodSeconds);
+
+    const double pointSeconds =
+        roundUpToSamplePeriod(
+            totalSeconds / static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount),
+            samplePeriodSeconds);
+    totalSeconds = pointSeconds * static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+    for (int pointIndex = 1; pointIndex <= ArmedSessionCartesianJogPvtWaypointCount; ++pointIndex)
+    {
+        const double u =
+            static_cast<double>(pointIndex) /
+            static_cast<double>(ArmedSessionCartesianJogPvtWaypointCount);
+
+        JointVector position{};
+        JointVector velocity{};
+
+        for (int axis = 0; axis < Racer3BasicMotion::AxisCount; ++axis)
+        {
+            position[axis] = startingPosition[axis] + startingVelocity[axis] * totalSeconds * (u - 0.5 * u * u);
+            velocity[axis] = startingVelocity[axis] * (1.0 - u);
+        }
+
+        if (pointIndex == ArmedSessionCartesianJogPvtWaypointCount)
+        {
+            velocity.fill(0.0);
+        }
+
+        block.positions.push_back(position);
+        block.velocities.push_back(velocity);
+        block.times.push_back(pointSeconds);
+        block.totalSeconds += pointSeconds;
+    }
+
+    return block;
+}
+
 std::vector<double> flattenJointTrajectoryPoints(const std::vector<JointVector>& points)
 {
     std::vector<double> flattened;
@@ -2240,6 +2658,51 @@ std::string hex64(uint64_t value)
 const char* boolText(bool value)
 {
     return value ? "true" : "false";
+}
+
+std::string cartesianJogDirectionName(const std::array<double, Racer3BasicMotion::AxisCount>& direction)
+{
+    const double epsilon = 1e-9;
+    int nonZeroIndex = -1;
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        if (std::fabs(direction[index]) > epsilon)
+        {
+            if (nonZeroIndex >= 0)
+            {
+                return "custom";
+            }
+
+            nonZeroIndex = index;
+        }
+    }
+
+    if (nonZeroIndex < 0)
+    {
+        return "zero";
+    }
+
+    const char* axisName = nullptr;
+    switch (nonZeroIndex)
+    {
+    case 0: axisName = "X"; break;
+    case 1: axisName = "Y"; break;
+    case 2: axisName = "Z"; break;
+    case 3: axisName = "Roll"; break;
+    case 4: axisName = "Pitch"; break;
+    case 5: axisName = "Yaw"; break;
+    default: axisName = "custom"; break;
+    }
+
+    if (std::string(axisName) == "custom")
+    {
+        return "custom";
+    }
+
+    std::string label(axisName);
+    label.push_back(direction[nonZeroIndex] >= 0.0 ? '+' : '-');
+    return label;
 }
 
 const char* stateName(RR::RSIState state)
@@ -2483,12 +2946,38 @@ void probeConfiguredLinearBuilder(
 }
 }
 
+struct Racer3RtTaskProbeState
+{
+    std::optional<RT::RTTaskManager> manager;
+    std::optional<RT::RTTask> incrementTask;
+    std::optional<RT::RTTask> basicHeartbeatTask;
+    std::optional<RT::RTTask> statusTask;
+    std::optional<RT::RTTask> intentTask;
+    std::string libraryDirectory;
+    std::string rttaskDirectory;
+    std::string managerPlatform;
+    int statusPeriodMilliseconds = ArmedSessionRtTaskDefaultStatusPeriodMs;
+    int intentPeriodMilliseconds = ArmedSessionRtTaskDefaultIntentPeriodMs;
+    bool running = false;
+};
+
+
 Racer3BasicMotion::Racer3BasicMotion()
     : controller_(nullptr),
       multiAxis_(nullptr),
       axes_{},
       armedSessionAxis6VelocityJogActive_(false),
-      armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_(0.0)
+      armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_(0.0),
+      armedSessionCartesianJogActive_(false),
+      armedSessionCartesianJogStopRequested_(false),
+      armedSessionCartesianJogSpeedMetersPerSecond_(0.0),
+      armedSessionCartesianJogDirection_{},
+      armedSessionCartesianJogJointVelocityUserUnitsPerSecond_{},
+      armedSessionCartesianJogThread_(),
+      armedSessionCartesianJogLastError_(),
+      armedSessionCartesianJogOriginalErrorLimitActions_{},
+      armedSessionCartesianJogErrorLimitActionsChanged_(false),
+      rttaskProbe_(nullptr)
 {
 }
 
@@ -2540,8 +3029,1305 @@ void Racer3BasicMotion::startArmedSession(double velocityUserUnitsPerSecond, boo
 
     armedSessionAxis6VelocityJogActive_ = false;
     armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
+    joinArmedSessionCartesianJogThread();
+    armedSessionCartesianJogActive_.store(false);
+    armedSessionCartesianJogStopRequested_.store(false);
+    armedSessionCartesianJogSpeedMetersPerSecond_ = 0.0;
+    armedSessionCartesianJogDirection_.fill(0.0);
+    armedSessionCartesianJogJointVelocityUserUnitsPerSecond_.fill(0.0);
+    armedSessionCartesianJogLastError_.clear();
 
     std::cout << "Persistent armed session is ready. Amps remain enabled until Shutdown Session.\n";
+}
+
+void Racer3BasicMotion::runEndpointOnlyKeyboardJog(
+    int operatorAxis,
+    double velocityUserUnitsPerSecond,
+    double loopPeriodSeconds,
+    bool motionConfirmed,
+    bool diagnostics)
+{
+#ifndef _WIN32
+    (void)operatorAxis;
+    (void)velocityUserUnitsPerSecond;
+    (void)loopPeriodSeconds;
+    (void)motionConfirmed;
+    (void)diagnostics;
+    (void)returnToStartBeforeShutdown;
+    throw std::runtime_error("Endpoint-only keyboard jog currently requires the Windows console backend build.");
+#else
+    if (operatorAxis != 6)
+    {
+        throw std::runtime_error("The first endpoint-only keyboard jog implementation supports operator Axis 6 / J6 only. Use --jog-axis 6.");
+    }
+
+    if (velocityUserUnitsPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--velocity must be greater than zero for endpoint-only keyboard jog.");
+    }
+
+    if (velocityUserUnitsPerSecond > EndpointKeyboardJogMaxVelocityUserUnitsPerSecond)
+    {
+        std::ostringstream message;
+        message << "Refusing keyboard jog velocity "
+                << velocityUserUnitsPerSecond
+                << " user-units/sec. Limit is "
+                << EndpointKeyboardJogMaxVelocityUserUnitsPerSecond
+                << " user-units/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (loopPeriodSeconds <= 0.0)
+    {
+        throw std::runtime_error("--keyboard-jog-period-ms must be greater than zero.");
+    }
+
+    double pulseStepUserUnits = velocityUserUnitsPerSecond * loopPeriodSeconds;
+    if (pulseStepUserUnits > EndpointKeyboardJogMaxPulseStepUserUnits)
+    {
+        pulseStepUserUnits = EndpointKeyboardJogMaxPulseStepUserUnits;
+    }
+
+    std::cout << "Endpoint-only keyboard jog mode starting.\n";
+    std::cout << "  Target: operator Axis 6 / internal RapidCode index 5.\n";
+    std::cout << "  Velocity: " << velocityUserUnitsPerSecond << " user-units/sec.\n";
+    std::cout << "  Loop period: " << (loopPeriodSeconds * 1000.0) << " ms.\n";
+    std::cout << "  Pulse step: " << pulseStepUserUnits << " user-units.\n";
+    std::cout << "  Controls: J or LeftArrow = negative jog, L or RightArrow = positive jog, Space = abort/stop, Q or Esc = shutdown.\n";
+    std::cout << "  This loop runs in the local C++ backend; it does not use PowerShell, rapidserver, or RapidCodeRemote for key commands.\n";
+    if (!motionConfirmed)
+    {
+        std::cout << "  NO-MOTION KEYBOARD PREVIEW: --confirm-keyboard-jog was not supplied. Amps will pre-arm, but key presses will not command motion.\n";
+    }
+    else
+    {
+        std::cout << "  CONFIRMED LIVE KEYBOARD JOG. Keep e-stop ready.\n";
+    }
+
+    try
+    {
+        startArmedSession(velocityUserUnitsPerSecond, diagnostics);
+
+        if (!multiAxis_ || !multiAxis_->AmpEnableGet())
+        {
+            throw std::runtime_error("Keyboard jog rejected because MultiAxis 6 is not amp-enabled after bottom-to-top pre-arm.");
+        }
+
+        RR::Axis* targetAxis = axes_[Axis6Index];
+        if (!targetAxis)
+        {
+            throw std::runtime_error("Keyboard jog rejected because Axis 6 object is not initialized.");
+        }
+
+        if (!targetAxis->AmpEnableGet())
+        {
+            throw std::runtime_error("Keyboard jog rejected because Axis 6 is not amp-enabled after bottom-to-top pre-arm.");
+        }
+
+        configureAxis6MotionAttributes("before endpoint-only keyboard jog loop");
+
+        std::cout << "Endpoint-only keyboard jog ready. Press J/L or Left/Right arrows for small Axis 6 pulses. Press Q or Esc to exit.\n";
+
+        int pulseCount = 0;
+        int direction = 0;
+        auto nextTelemetry = std::chrono::steady_clock::now();
+        bool exitRequested = false;
+
+        while (!exitRequested)
+        {
+            direction = 0;
+
+            if (_kbhit())
+            {
+                int key = _getch();
+
+                if (key == 0 || key == 224)
+                {
+                    const int extended = _getch();
+                    if (extended == 75)
+                    {
+                        direction = -1;
+                    }
+                    else if (extended == 77)
+                    {
+                        direction = 1;
+                    }
+                }
+                else
+                {
+                    key = std::tolower(key);
+                    if (key == 'q' || key == 27)
+                    {
+                        exitRequested = true;
+                    }
+                    else if (key == 'j')
+                    {
+                        direction = -1;
+                    }
+                    else if (key == 'l')
+                    {
+                        direction = 1;
+                    }
+                    else if (key == ' ')
+                    {
+                        std::cout << "Keyboard jog stop requested. Sending MultiAxis abort; amps remain enabled until shutdown.\n";
+                        multiAxis_->Abort();
+                        direction = 0;
+                    }
+                }
+            }
+
+            if (direction != 0)
+            {
+                if (!motionConfirmed)
+                {
+                    std::cout << "Keyboard jog key observed, but motion is blocked because --confirm-keyboard-jog was not supplied.\n";
+                }
+                else if (!targetAxis->AmpEnableGet() || !multiAxis_->AmpEnableGet())
+                {
+                    throw std::runtime_error("Keyboard jog aborted because amp enable dropped during the loop.");
+                }
+                else if (targetAxis->MotionDoneGet())
+                {
+                    const double signedStep = static_cast<double>(direction) * pulseStepUserUnits;
+                    targetAxis->MoveRelative(
+                        signedStep,
+                        velocityUserUnitsPerSecond,
+                        MotionAcceleration,
+                        MotionDeceleration,
+                        MotionJerkPercent);
+                    ++pulseCount;
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= nextTelemetry)
+            {
+                const double commandPosition = targetAxis->CommandPositionGet();
+                const double actualPosition = targetAxis->ActualPositionGet();
+                const double positionError = commandPosition - actualPosition;
+
+                std::cout << "keyboard_jog axis=6"
+                          << " dir=" << direction
+                          << " pulses=" << pulseCount
+                          << " cmd=" << std::fixed << std::setprecision(9) << commandPosition
+                          << " act=" << actualPosition
+                          << " err=" << positionError
+                          << " axisAmp=" << boolText(targetAxis->AmpEnableGet())
+                          << " multiAmp=" << boolText(multiAxis_->AmpEnableGet())
+                          << " done=" << boolText(targetAxis->MotionDoneGet())
+                          << "\n";
+
+                nextTelemetry = now + std::chrono::milliseconds(EndpointKeyboardJogTelemetryPeriodMs);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(EndpointKeyboardJogIdleSleepMs));
+        }
+
+        std::cout << "Endpoint-only keyboard jog exiting. Disabling amps and clearing faults.\n";
+        shutdownArmedSession();
+    }
+    catch (...)
+    {
+        shutdownArmedSession();
+        throw;
+    }
+#endif
+}
+
+void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
+    double linearSpeedMetersPerSecond,
+    double angularSpeedRadiansPerSecond,
+    double loopPeriodSeconds,
+    bool motionConfirmed,
+    bool diagnostics,
+    double gainX,
+    double gainY,
+    double gainZ,
+    double maxJointVelocityUserUnitsPerSecond,
+    double baseRotateVelocityUserUnitsPerSecond)
+{
+#ifndef _WIN32
+    (void)linearSpeedMetersPerSecond;
+    (void)angularSpeedRadiansPerSecond;
+    (void)loopPeriodSeconds;
+    (void)motionConfirmed;
+    (void)diagnostics;
+    (void)gainX;
+    (void)gainY;
+    (void)gainZ;
+    (void)maxJointVelocityUserUnitsPerSecond;
+    (void)baseRotateVelocityUserUnitsPerSecond;
+    throw std::runtime_error("Endpoint-only Cartesian keyboard jog currently requires the Windows console backend build.");
+#else
+    if (linearSpeedMetersPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--cartesian-jog-linear-speed/--cartesian-jog-speed must be greater than zero for endpoint-only Cartesian keyboard jog.");
+    }
+
+    if (angularSpeedRadiansPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--cartesian-jog-angular-speed must be greater than zero for endpoint-only Cartesian keyboard jog.");
+    }
+
+    if (gainX <= 0.0 || gainY <= 0.0 || gainZ <= 0.0)
+    {
+        throw std::runtime_error("--cartesian-jog-gain-x/y/z values must be greater than zero.");
+    }
+
+    if (maxJointVelocityUserUnitsPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--cartesian-jog-max-joint-velocity must be greater than zero.");
+    }
+
+    if (baseRotateVelocityUserUnitsPerSecond <= 0.0)
+    {
+        throw std::runtime_error("--keyboard-base-rotate-speed must be greater than zero.");
+    }
+
+    if (baseRotateVelocityUserUnitsPerSecond > ArmedSessionCartesianJogMaxJointVelocity)
+    {
+        std::ostringstream message;
+        message << "Refusing keyboard base rotate speed "
+                << baseRotateVelocityUserUnitsPerSecond
+                << " user-units/sec. Safety limit is "
+                << ArmedSessionCartesianJogMaxJointVelocity
+                << " user-units/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (maxJointVelocityUserUnitsPerSecond > ArmedSessionCartesianJogMaxJointVelocity)
+    {
+        std::ostringstream message;
+        message << "Refusing Cartesian keyboard jog max joint velocity "
+                << maxJointVelocityUserUnitsPerSecond
+                << " user-units/sec. Safety limit is "
+                << ArmedSessionCartesianJogMaxJointVelocity
+                << " user-units/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (linearSpeedMetersPerSecond > EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond)
+    {
+        std::ostringstream message;
+        message << "Refusing Cartesian keyboard jog linear speed "
+                << linearSpeedMetersPerSecond
+                << " m/sec. Limit is "
+                << EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond
+                << " m/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (angularSpeedRadiansPerSecond > EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond)
+    {
+        std::ostringstream message;
+        message << "Refusing Cartesian keyboard jog angular speed "
+                << angularSpeedRadiansPerSecond
+                << " rad/sec. Limit is "
+                << EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond
+                << " rad/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    if (loopPeriodSeconds <= 0.0)
+    {
+        throw std::runtime_error("--keyboard-jog-period-ms must be greater than zero.");
+    }
+
+    std::cout << "Endpoint-only Cartesian keyboard jog mode starting.\n";
+    std::cout << "  Linear speed: " << linearSpeedMetersPerSecond << " m/sec.\n";
+    std::cout << "  Angular speed: " << angularSpeedRadiansPerSecond << " rad/sec.\n";
+    std::cout << "  Linear jog gains: X=" << gainX << " Y=" << gainY << " Z=" << gainZ << ".\n";
+    std::cout << "  Max joint velocity: " << maxJointVelocityUserUnitsPerSecond << " user-units/sec.\n";
+    std::cout << "  Base rotate speed: " << baseRotateVelocityUserUnitsPerSecond << " J1 user-units/sec.\n";
+    std::cout << "  Loop poll period: " << (loopPeriodSeconds * 1000.0) << " ms.\n";
+    std::cout << "  Controls:\n";
+    std::cout << "    W/S = endpoint forward/back in the current base-facing vertical plane while holding the current tool orientation\n";
+    std::cout << "    A/D = base rotate left/right (direct J1 velocity, no Cartesian Y IK)\n";
+    std::cout << "    R/F = endpoint up/down in that same vertical plane while allowing wrist pitch/J5 for usable vertical motion\n";
+    std::cout << "    I/K = roll +/-\n";
+    std::cout << "    J/L = pitch -/+\n";
+    std::cout << "    U/O = yaw -/+\n";
+    std::cout << "    Space = smooth stop / decelerate current Cartesian jog\n";
+    std::cout << "    H = return to the run-start joint pose, then keep jogging\n";
+    std::cout << "    Q or Esc = shutdown, disable amps, clear faults, exit\n";
+    std::cout << "  This loop runs in the local C++ backend. W/S uses base-facing vertical-plane Jacobian/DLS endpoint velocity with J1/J4/J6 held and J5 allowed as a pitch/orientation compensator; R/F uses vertical-plane Z jog with J1/J4/J6 held and J5 allowed; A/D directly rotate J1 for operator-friendly aiming.\n";
+    std::cout << "  Return-to-start on exit: disabled. Jog mode exits directly on Q/Esc.\n";
+
+    if (!motionConfirmed)
+    {
+        std::cout << "  NO-MOTION CARTESIAN KEYBOARD PREVIEW: --confirm-keyboard-cartesian-jog was not supplied. Amps will pre-arm, but key presses will not command Cartesian motion.\n";
+    }
+    else
+    {
+        std::cout << "  CONFIRMED LIVE CARTESIAN KEYBOARD JOG. Keep e-stop ready.\n";
+    }
+
+    auto keyDown = [](int virtualKey) -> bool
+    {
+        return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    };
+
+    auto directionName = [](const CartesianVector& direction) -> std::string
+    {
+        static const char* const labels[AxisCount] = {"X", "Base", "Z", "Roll", "Pitch", "Yaw"};
+        std::ostringstream stream;
+        bool any = false;
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            if (std::fabs(direction[index]) <= 1e-9)
+            {
+                continue;
+            }
+
+            if (any)
+            {
+                stream << "+";
+            }
+
+            stream << labels[index] << (direction[index] > 0.0 ? "+" : "-");
+            any = true;
+        }
+
+        return any ? stream.str() : std::string("idle");
+    };
+
+    try
+    {
+        startArmedSession(linearSpeedMetersPerSecond, diagnostics);
+
+        if (!multiAxis_ || !multiAxis_->AmpEnableGet())
+        {
+            throw std::runtime_error("Cartesian keyboard jog rejected because MultiAxis 6 is not amp-enabled after bottom-to-top pre-arm.");
+        }
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            if (!axes_[index] || !axes_[index]->AmpEnableGet())
+            {
+                throw std::runtime_error("Cartesian keyboard jog rejected because one or more individual axes are not amp-enabled after bottom-to-top pre-arm.");
+            }
+        }
+
+        std::cout << "Endpoint-only Cartesian keyboard jog ready. Hold keys to jog; release keys to decelerate. Press H to return to run-start pose. Press Q or Esc to exit.\n";
+        std::cout << "Smooth mode: W/S reach with J1/J4/J6 held and J5 allowed for tool-pitch compensation; R/F vertical jog with J1/J4/J6 held and J5 allowed; A/D direct base/J1 velocity. No repeated PVT chunks while held.\n";
+
+        bool cartesianVelocityJogActive = false;
+        std::string cartesianVelocityJogLabel = "idle";
+        JointVector lastCartesianVelocityCommand{};
+        CartesianVector cartesianVelocityJogStartPose{};
+        JointVector cartesianVelocityJogStartUserUnits{};
+
+        auto stopCartesianVelocityJog = [&](const char* reason)
+        {
+            if (!cartesianVelocityJogActive)
+            {
+                return;
+            }
+
+            std::cout << "Smooth Cartesian keyboard jog stop requested. Reason: "
+                      << reason
+                      << ". Sending zero MultiAxis::MoveVelocitySCurve command; amps remain enabled.\n";
+
+            try
+            {
+                JointVector zeroVelocity{};
+                JointVector stopAcceleration{};
+                JointVector stopJerk{};
+
+                for (int axis = 0; axis < AxisCount; ++axis)
+                {
+                    stopAcceleration[axis] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                    stopJerk[axis] = EndpointCartesianKeyboardJogJerkPercent;
+                }
+
+                multiAxis_->MoveVelocitySCurve(
+                    zeroVelocity.data(),
+                    stopAcceleration.data(),
+                    stopJerk.data());
+
+                const auto stopDeadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(EndpointCartesianKeyboardJogVelocityStopDoneWaitMs);
+
+                while (std::chrono::steady_clock::now() < stopDeadline)
+                {
+                    if (multiAxis_->MotionDoneGet())
+                    {
+                        break;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+
+                if (!multiAxis_->MotionDoneGet())
+                {
+                    std::cout << "  Warning: zero-velocity stop is still decelerating after "
+                              << EndpointCartesianKeyboardJogVelocityStopDoneWaitMs
+                              << " ms. Not sending Abort on normal key release; amps should remain enabled for continued jogging/H-home.\n";
+                }
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(EndpointCartesianKeyboardJogVelocityStopSettleMs));
+            }
+            catch (const RR::RsiError& error)
+            {
+                std::cout << "  Zero-velocity stop warning during smooth Cartesian keyboard stop: "
+                          << error.text
+                          << " ("
+                          << error.functionName
+                          << "). Attempting Abort fallback.\n";
+
+                try
+                {
+                    multiAxis_->Abort();
+                }
+                catch (const RR::RsiError& abortError)
+                {
+                    std::cout << "  Abort fallback also failed during smooth Cartesian keyboard stop: "
+                              << abortError.text
+                              << " ("
+                              << abortError.functionName
+                              << ").\n";
+                }
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(EndpointCartesianKeyboardJogVelocityStopSettleMs));
+            }
+
+            cartesianVelocityJogActive = false;
+            cartesianVelocityJogLabel = "idle";
+            lastCartesianVelocityCommand.fill(0.0);
+        };
+
+        auto startCartesianVelocityJog = [&](const CartesianVector& direction)
+        {
+            JointVector actualUserUnits{};
+            JointVector actualRadians{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                if (!axes_[index])
+                {
+                    throw std::runtime_error("Smooth Cartesian keyboard jog found an uninitialized Axis object.");
+                }
+
+                actualUserUnits[index] = axes_[index]->ActualPositionGet();
+                actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+            }
+
+            const CartesianVector currentPose = poseVectorFromJoints(actualRadians);
+            const bool directBaseRotateJog =
+                std::fabs(direction[1]) > 1e-9 &&
+                std::fabs(direction[0]) <= 1e-9 &&
+                std::fabs(direction[2]) <= 1e-9 &&
+                std::fabs(direction[3]) <= 1e-9 &&
+                std::fabs(direction[4]) <= 1e-9 &&
+                std::fabs(direction[5]) <= 1e-9;
+
+            if (directBaseRotateJog)
+            {
+                JointVector velocity{};
+                JointVector acceleration{};
+                JointVector jerk{};
+
+                velocity[0] = direction[1] * baseRotateVelocityUserUnitsPerSecond;
+                for (int axis = 0; axis < AxisCount; ++axis)
+                {
+                    acceleration[axis] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                    jerk[axis] = EndpointCartesianKeyboardJogJerkPercent;
+                }
+
+                double maxJointVelocity = maxAbsJointValue(velocity);
+                if (maxJointVelocity > maxJointVelocityUserUnitsPerSecond)
+                {
+                    const double velocityScale = maxJointVelocityUserUnitsPerSecond / maxJointVelocity;
+                    std::cout << "Smooth operator keyboard base rotate clamp: requested J1 velocity "
+                              << maxJointVelocity
+                              << " user-units/sec exceeds limit "
+                              << maxJointVelocityUserUnitsPerSecond
+                              << ". Scaling by "
+                              << velocityScale
+                              << ".\n";
+                    velocity[0] *= velocityScale;
+                    maxJointVelocity = maxAbsJointValue(velocity);
+                }
+
+                const std::string newDirectionName = directionName(direction);
+                const bool continuingSameVelocityJog =
+                    cartesianVelocityJogActive &&
+                    cartesianVelocityJogLabel == newDirectionName;
+                if (!continuingSameVelocityJog)
+                {
+                    cartesianVelocityJogStartPose = currentPose;
+                    cartesianVelocityJogStartUserUnits = actualUserUnits;
+                }
+
+                std::cout << (continuingSameVelocityJog ? "Refreshing" : "Starting")
+                          << " smooth operator keyboard base rotate direction "
+                          << newDirectionName
+                          << " at J1 velocity="
+                          << velocity[0]
+                          << " user-units/sec using direct MultiAxis::MoveVelocitySCurve. Joint velocity [J1..J6] user-units/sec: ";
+                printJointVector(velocity);
+
+                multiAxis_->MoveVelocitySCurve(
+                    velocity.data(),
+                    acceleration.data(),
+                    jerk.data());
+
+                cartesianVelocityJogActive = true;
+                cartesianVelocityJogLabel = newDirectionName;
+                lastCartesianVelocityCommand = velocity;
+                return;
+            }
+
+            const bool planarOperatorLinearJog =
+                (std::fabs(direction[0]) > 1e-9 || std::fabs(direction[2]) > 1e-9) &&
+                std::fabs(direction[1]) <= 1e-9 &&
+                std::fabs(direction[3]) <= 1e-9 &&
+                std::fabs(direction[4]) <= 1e-9 &&
+                std::fabs(direction[5]) <= 1e-9;
+
+            CartesianVector targetTwist{};
+            const std::string requestedDirectionName = directionName(direction);
+            const bool continuingSameVelocityJogForTarget =
+                cartesianVelocityJogActive &&
+                cartesianVelocityJogLabel == requestedDirectionName;
+            const bool planarForwardBackJog =
+                planarOperatorLinearJog &&
+                std::fabs(direction[0]) > 1e-9 &&
+                std::fabs(direction[2]) <= 1e-9;
+
+            if (planarOperatorLinearJog)
+            {
+                // Operator-friendly planar jog: A/D aims the base, then W/S moves
+                // forward/back in the base-facing vertical plane and R/F moves
+                // up/down.  This is intentionally not global-X/global-Y Cartesian
+                // jogging.  It gives the operator a simpler joystick-like model
+                // and avoids wrist/base yaw being used to satisfy an abstract
+                // lateral solve.
+                const double baseAngleRadians = actualRadians[0];
+                const double forwardX = std::cos(baseAngleRadians);
+                const double forwardY = std::sin(baseAngleRadians);
+                const double forwardSpeed = direction[0] * linearSpeedMetersPerSecond * gainX;
+                const double verticalSpeed = direction[2] * linearSpeedMetersPerSecond * gainZ;
+
+                targetTwist[0] = forwardSpeed * forwardX;
+                targetTwist[1] = forwardSpeed * forwardY;
+                targetTwist[2] = verticalSpeed;
+
+                if (planarForwardBackJog && continuingSameVelocityJogForTarget)
+                {
+                    // While W/S is held, recompute the velocity vector and add a
+                    // stronger height-lock correction back to the Z height where the
+                    // forward/back jog started. This keeps the endpoint from
+                    // sagging downward as the shoulder/elbow geometry changes,
+                    // Wrist orientation is owned by the manual wrist keys, so the
+                    // reach jog should preserve the user's current wrist setup.
+                    const double zErrorMeters = cartesianVelocityJogStartPose[2] - currentPose[2];
+                    const double zCorrectionMetersPerSecond = std::clamp(
+                        zErrorMeters * EndpointCartesianKeyboardJogPlanarForwardZHoldGainPerSecond,
+                        -EndpointCartesianKeyboardJogPlanarForwardZHoldMaxCorrectionMetersPerSecond,
+                        EndpointCartesianKeyboardJogPlanarForwardZHoldMaxCorrectionMetersPerSecond);
+                    targetTwist[2] += zCorrectionMetersPerSecond;
+                }
+            }
+            else
+            {
+                const std::array<double, 3> linearGains = {gainX, gainY, gainZ};
+                for (int index = 0; index < 3; ++index)
+                {
+                    targetTwist[index] = direction[index] * linearSpeedMetersPerSecond * linearGains[index];
+                }
+            }
+
+            for (int index = 3; index < AxisCount; ++index)
+            {
+                targetTwist[index] = direction[index] * angularSpeedRadiansPerSecond;
+            }
+
+            std::array<std::array<double, AxisCount>, AxisCount> jacobian{};
+            for (int joint = 0; joint < AxisCount; ++joint)
+            {
+                JointVector perturbedRadians = actualRadians;
+                perturbedRadians[joint] += EndpointCartesianKeyboardJogJacobianStepRadians;
+
+                const CartesianVector perturbedPose = poseVectorFromJoints(perturbedRadians);
+                const CartesianVector poseDifference = subtractPoseVectorWrapped(perturbedPose, currentPose);
+
+                for (int row = 0; row < AxisCount; ++row)
+                {
+                    jacobian[row][joint] = poseDifference[row] / EndpointCartesianKeyboardJogJacobianStepRadians;
+                }
+            }
+
+            if (planarOperatorLinearJog)
+            {
+                // Keep the base and roll/yaw wrist axes out of operator-plane
+                // jogging. A/D owns J1 aiming. Manual wrist roll/yaw own J4/J6.
+                // For W/S reach, do NOT hard-lock J5. Let J5 participate as a
+                // pitch/orientation compensator so J2/J3/J5 can move together to
+                // reach faster while the tool pitch task holds the user-selected
+                // end-effector orientation. Hard-locking J5 left only J2/J3 for
+                // W/S and made X reach collapse to a very slow near-singular move.
+                for (int row = 0; row < AxisCount; ++row)
+                {
+                    jacobian[row][0] = 0.0;
+                    jacobian[row][3] = 0.0;
+                    jacobian[row][5] = 0.0;
+                }
+            }
+
+            const bool linearOnlyJog =
+                (std::fabs(direction[0]) > 1e-9 ||
+                 std::fabs(direction[1]) > 1e-9 ||
+                 std::fabs(direction[2]) > 1e-9) &&
+                std::fabs(direction[3]) <= 1e-9 &&
+                std::fabs(direction[4]) <= 1e-9 &&
+                std::fabs(direction[5]) <= 1e-9;
+            const bool pureYJog =
+                std::fabs(direction[1]) > 1e-9 &&
+                std::fabs(direction[0]) <= 1e-9 &&
+                std::fabs(direction[2]) <= 1e-9 &&
+                std::fabs(direction[3]) <= 1e-9 &&
+                std::fabs(direction[4]) <= 1e-9 &&
+                std::fabs(direction[5]) <= 1e-9;
+
+            std::array<double, AxisCount> taskWeights{};
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                if (linearOnlyJog)
+                {
+                    // Translation-priority solve with a soft orientation hold.
+                    // In operator planar mode W/S reach locks J1/J4/J6 but allows
+                    // J5/pitch to participate as a compensator. The pitch task below
+                    // holds the user-selected tool orientation in TCP space instead
+                    // of hard-locking J5 mechanically. R/F vertical jog also keeps
+                    // J1/J4/J6 held while allowing J5/pitch for usable Z motion.
+                    if (planarForwardBackJog)
+                    {
+                        if (index == 2)
+                        {
+                            taskWeights[index] = EndpointCartesianKeyboardJogPlanarForwardZHoldWeight;
+                        }
+                        else if (index < 3)
+                        {
+                            taskWeights[index] = 1.0;
+                        }
+                        else if (index == 4)
+                        {
+                            // Hold tool pitch during reach in TCP/orientation space while
+                            // still allowing J5 to move as the compensating joint.
+                            taskWeights[index] = EndpointCartesianKeyboardJogPlanarForwardPitchHoldWeight;
+                        }
+                        else
+                        {
+                            taskWeights[index] = EndpointCartesianKeyboardJogPlanarForwardRollYawHoldWeight;
+                        }
+                    }
+                    else
+                    {
+                        taskWeights[index] = index < 3
+                            ? 1.0
+                            : (pureYJog
+                                ? EndpointCartesianKeyboardJogYRotationHoldWeight
+                                : EndpointCartesianKeyboardJogLinearRotationHoldWeight);
+                    }
+                }
+                else
+                {
+                    taskWeights[index] = 1.0;
+                }
+            }
+
+            const double dlsDamping = pureYJog
+                ? EndpointCartesianKeyboardJogYDamping
+                : (linearOnlyJog
+                    ? EndpointCartesianKeyboardJogTranslationPriorityDamping
+                    : EndpointCartesianKeyboardJogJacobianDamping);
+
+            std::array<std::array<double, AxisCount>, AxisCount> normal{};
+            std::array<double, AxisCount> rhs{};
+
+            for (int row = 0; row < AxisCount; ++row)
+            {
+                for (int col = 0; col < AxisCount; ++col)
+                {
+                    double value = 0.0;
+                    for (int k = 0; k < AxisCount; ++k)
+                    {
+                        value += taskWeights[k] * jacobian[k][row] * jacobian[k][col];
+                    }
+
+                    if (row == col)
+                    {
+                        value += dlsDamping * dlsDamping;
+                    }
+
+                    normal[row][col] = value;
+                }
+
+                double rhsValue = 0.0;
+                for (int k = 0; k < AxisCount; ++k)
+                {
+                    rhsValue += taskWeights[k] * jacobian[k][row] * targetTwist[k];
+                }
+                rhs[row] = rhsValue;
+            }
+
+            std::array<double, AxisCount> jointVelocityRadiansPerSecond{};
+            if (!solveLinearSystem6x6(normal, rhs, jointVelocityRadiansPerSecond))
+            {
+                std::cout << "Smooth Cartesian keyboard jog Jacobian/DLS solve was singular; treating this as an idle/no-op command instead of faulting the keyboard jog.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("singular Jacobian/DLS velocity solve");
+                }
+
+                return;
+            }
+
+            JointVector velocity{};
+            JointVector acceleration{};
+            JointVector jerk{};
+            for (int axis = 0; axis < AxisCount; ++axis)
+            {
+                velocity[axis] = jointVelocityRadiansPerSecond[axis] / RevolutionsToRadians;
+                acceleration[axis] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                jerk[axis] = EndpointCartesianKeyboardJogJerkPercent;
+            }
+
+            double maxJointVelocity = maxAbsJointValue(velocity);
+            if (maxJointVelocity <= EndpointCartesianKeyboardJogNearZeroJointVelocityUserUnitsPerSecond)
+            {
+                std::cout << "Smooth Cartesian keyboard jog Jacobian/DLS produced a near-zero joint velocity for "
+                          << directionName(direction)
+                          << "; treating this as an idle/no-op command instead of faulting the keyboard jog.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("near-zero Jacobian/DLS velocity");
+                }
+
+                return;
+            }
+
+            const double effectiveMaxJointVelocityUserUnitsPerSecond = pureYJog
+                ? std::min(maxJointVelocityUserUnitsPerSecond, EndpointCartesianKeyboardJogYMaxJointVelocityUserUnitsPerSecond)
+                : maxJointVelocityUserUnitsPerSecond;
+
+            double velocityScale = 1.0;
+            if (maxJointVelocity > effectiveMaxJointVelocityUserUnitsPerSecond)
+            {
+                velocityScale =
+                    effectiveMaxJointVelocityUserUnitsPerSecond / maxJointVelocity;
+
+                std::cout << "Smooth Cartesian keyboard jog joint velocity clamp: requested max "
+                          << maxJointVelocity
+                          << " user-units/sec exceeds "
+                          << (pureYJog ? "Y-specific " : "")
+                          << "limit "
+                          << effectiveMaxJointVelocityUserUnitsPerSecond
+                          << ". Scaling velocity command by "
+                          << velocityScale
+                          << " instead of faulting the keyboard jog.\n";
+
+                for (int axis = 0; axis < AxisCount; ++axis)
+                {
+                    velocity[axis] *= velocityScale;
+                }
+
+                maxJointVelocity = maxAbsJointValue(velocity);
+            }
+
+            CartesianVector predictedTwist{};
+            for (int row = 0; row < AxisCount; ++row)
+            {
+                double value = 0.0;
+                for (int joint = 0; joint < AxisCount; ++joint)
+                {
+                    value += jacobian[row][joint] * velocity[joint] * RevolutionsToRadians;
+                }
+                predictedTwist[row] = value;
+            }
+
+            const double predictedYEfficiency = pureYJog && std::fabs(targetTwist[1]) > 1e-12
+                ? std::fabs(predictedTwist[1] / targetTwist[1])
+                : 1.0;
+            if (pureYJog && predictedYEfficiency < EndpointCartesianKeyboardJogYMinEfficiency)
+            {
+                std::cout << "Smooth Cartesian keyboard jog Y efficiency guard rejected "
+                          << directionName(direction)
+                          << ": predictedY/requestedY efficiency "
+                          << predictedYEfficiency
+                          << " is below "
+                          << EndpointCartesianKeyboardJogYMinEfficiency
+                          << ". Treating this Y command as no-op instead of spinning the base/wrist with little lateral TCP motion. Try lowering from home with Z- or use H to reset.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("Y predicted efficiency guard");
+                }
+
+                return;
+            }
+
+            const double predictedAngularMax = std::max(
+                std::fabs(predictedTwist[3]),
+                std::max(std::fabs(predictedTwist[4]), std::fabs(predictedTwist[5])));
+            if (pureYJog && predictedAngularMax > EndpointCartesianKeyboardJogYDriftStopRadians)
+            {
+                std::cout << "Smooth Cartesian keyboard jog Y drift guard rejected "
+                          << directionName(direction)
+                          << ": predicted angular drift rate max "
+                          << predictedAngularMax
+                          << " rad/sec exceeds "
+                          << EndpointCartesianKeyboardJogYDriftStopRadians
+                          << " rad/sec. Treating Y command as no-op instead of twisting the wrist/base. Try lowering from home with Z- or use H to reset.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("Y predicted angular drift guard");
+                }
+
+                return;
+            }
+
+            const std::string newDirectionName = directionName(direction);
+            const bool continuingSameVelocityJog =
+                cartesianVelocityJogActive &&
+                cartesianVelocityJogLabel == newDirectionName;
+            if (!continuingSameVelocityJog)
+            {
+                cartesianVelocityJogStartPose = currentPose;
+                cartesianVelocityJogStartUserUnits = actualUserUnits;
+            }
+
+            std::cout << (continuingSameVelocityJog ? "Refreshing" : "Starting")
+                      << " smooth Cartesian keyboard jog direction "
+                      << directionName(direction)
+                      << " at linear="
+                      << linearSpeedMetersPerSecond
+                      << " m/sec angular="
+                      << angularSpeedRadiansPerSecond
+                      << " rad/sec gains[X,Y,Z]="
+                      << gainX << "," << gainY << "," << gainZ
+                      << " using "
+                      << (planarOperatorLinearJog ? "operator vertical-plane " : (linearOnlyJog ? "translation-priority " : ""))
+                      << "Jacobian/DLS MoveVelocitySCurve. Damping="
+                      << dlsDamping
+                      << ". Target twist [X Y Z R P Y]: "
+                      << std::fixed << std::setprecision(6)
+                      << targetTwist[0] << " " << targetTwist[1] << " " << targetTwist[2] << " "
+                      << targetTwist[3] << " " << targetTwist[4] << " " << targetTwist[5]
+                      << ". Predicted twist [X Y Z R P Y]: "
+                      << predictedTwist[0] << " " << predictedTwist[1] << " " << predictedTwist[2] << " "
+                      << predictedTwist[3] << " " << predictedTwist[4] << " " << predictedTwist[5]
+                      << (pureYJog ? ". Y efficiency=" : ".")
+                      << (pureYJog ? predictedYEfficiency : 0.0)
+                      << ". Joint velocity [J1..J6] user-units/sec: ";
+            printJointVector(velocity);
+
+            multiAxis_->MoveVelocitySCurve(
+                velocity.data(),
+                acceleration.data(),
+                jerk.data());
+
+            cartesianVelocityJogActive = true;
+            cartesianVelocityJogLabel = directionName(direction);
+            lastCartesianVelocityCommand = velocity;
+        };
+
+        JointVector keyboardJogStartUserUnits{};
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            keyboardJogStartUserUnits[index] = axes_[index] ? axes_[index]->ActualPositionGet() : 0.0;
+        }
+
+        std::cout << "Keyboard Cartesian jog H-home reference [J1..J6] actual user-units: ";
+        printJointVector(keyboardJogStartUserUnits);
+
+        auto returnToKeyboardJogStart = [&]()
+        {
+            if (!motionConfirmed)
+            {
+                std::cout << "Keyboard Cartesian H-home observed, but motion is blocked because --confirm-keyboard-cartesian-jog was not supplied.\n";
+                return;
+            }
+
+            if (!multiAxis_ || !multiAxis_->AmpEnableGet())
+            {
+                throw std::runtime_error("Keyboard Cartesian H-home rejected because MultiAxis 6 is not amp-enabled.");
+            }
+
+            JointVector currentUserUnits{};
+            JointVector relativePosition{};
+            JointVector velocity{};
+            JointVector acceleration{};
+            JointVector deceleration{};
+            JointVector jerk{};
+            std::array<double, AxisCount> startingCommandPositions{};
+
+            double maxReturnDistance = 0.0;
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                if (!axes_[index] || !axes_[index]->AmpEnableGet())
+                {
+                    throw std::runtime_error("Keyboard Cartesian H-home rejected because one or more individual axes are not amp-enabled.");
+                }
+
+                currentUserUnits[index] = axes_[index]->ActualPositionGet();
+                relativePosition[index] = keyboardJogStartUserUnits[index] - currentUserUnits[index];
+                maxReturnDistance = std::max(maxReturnDistance, std::fabs(relativePosition[index]));
+
+                velocity[index] = std::min(maxJointVelocityUserUnitsPerSecond, 0.020);
+                acceleration[index] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                deceleration[index] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                jerk[index] = EndpointCartesianKeyboardJogJerkPercent;
+                startingCommandPositions[index] = axes_[index]->CommandPositionGet();
+            }
+
+            if (maxReturnDistance <= 1e-7)
+            {
+                std::cout << "Keyboard Cartesian H-home requested; robot is already at the run-start joint pose. Jog mode remains active.\n";
+                return;
+            }
+
+            std::cout << "Keyboard Cartesian H-home requested. Returning to run-start joint pose while keeping jog mode alive.\n";
+            std::cout << "  Current actual [J1..J6] user-units: ";
+            printJointVector(currentUserUnits);
+            std::cout << "  Relative return [J1..J6] user-units: ";
+            printJointVector(relativePosition);
+
+            configureMultiAxisMotionAttributes("before keyboard Cartesian H-home MultiAxis::MoveRelative");
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                configureAxisMotionAttributes(index, "before keyboard Cartesian H-home MultiAxis::MoveRelative");
+            }
+
+            multiAxis_->MoveRelative(
+                relativePosition.data(),
+                velocity.data(),
+                acceleration.data(),
+                deceleration.data(),
+                jerk.data());
+
+            waitForAllAxisMotionStart(
+                "Keyboard Cartesian H-home MultiAxis::MoveRelative",
+                startingCommandPositions);
+            waitForMotionDone(MotionTimeoutMs);
+
+            printActualPositions("Actual positions after keyboard Cartesian H-home return");
+            std::cout << "Keyboard Cartesian H-home complete. Jog mode remains active; continue jogging or press Q/Esc to exit.\n";
+        };
+
+        CartesianVector activeDirection{};
+        CartesianVector requestedDirection{};
+        auto nextTelemetry = std::chrono::steady_clock::now();
+        auto nextLinearVelocityRefresh = std::chrono::steady_clock::now();
+        auto nextYVelocityRefresh = std::chrono::steady_clock::now();
+        bool exitRequested = false;
+        bool hKeyWasDown = false;
+        int cartesianJogTransitions = 0;
+
+        while (!exitRequested)
+        {
+            requestedDirection.fill(0.0);
+
+            if (keyDown('W'))
+            {
+                requestedDirection[0] += 1.0;
+            }
+            if (keyDown('S'))
+            {
+                requestedDirection[0] -= 1.0;
+            }
+            if (keyDown('D'))
+            {
+                requestedDirection[1] += 1.0;
+            }
+            if (keyDown('A'))
+            {
+                requestedDirection[1] -= 1.0;
+            }
+            if (keyDown('R'))
+            {
+                requestedDirection[2] += 1.0;
+            }
+            if (keyDown('F'))
+            {
+                requestedDirection[2] -= 1.0;
+            }
+            if (keyDown('I'))
+            {
+                requestedDirection[3] += 1.0;
+            }
+            if (keyDown('K'))
+            {
+                requestedDirection[3] -= 1.0;
+            }
+            if (keyDown('L'))
+            {
+                requestedDirection[4] += 1.0;
+            }
+            if (keyDown('J'))
+            {
+                requestedDirection[4] -= 1.0;
+            }
+            if (keyDown('O'))
+            {
+                requestedDirection[5] += 1.0;
+            }
+            if (keyDown('U'))
+            {
+                requestedDirection[5] -= 1.0;
+            }
+
+            if (keyDown(VK_SPACE))
+            {
+                requestedDirection.fill(0.0);
+                stopCartesianVelocityJog("keyboard Cartesian Space stop");
+                if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+                {
+                    stopArmedSessionCartesianJog("keyboard Cartesian Space stop");
+                }
+            }
+
+            const bool hKeyDown = keyDown('H');
+            if (hKeyDown && !hKeyWasDown)
+            {
+                requestedDirection.fill(0.0);
+                stopCartesianVelocityJog("keyboard Cartesian H-home");
+                if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+                {
+                    stopArmedSessionCartesianJog("keyboard Cartesian H-home");
+                }
+
+                activeDirection.fill(0.0);
+                lastCartesianVelocityCommand.fill(0.0);
+                cartesianVelocityJogLabel = "idle";
+                ++cartesianJogTransitions;
+
+                returnToKeyboardJogStart();
+                nextTelemetry = std::chrono::steady_clock::now();
+                nextLinearVelocityRefresh = std::chrono::steady_clock::now();
+                nextYVelocityRefresh = std::chrono::steady_clock::now();
+            }
+            hKeyWasDown = hKeyDown;
+
+            if (keyDown('Q') || keyDown(VK_ESCAPE))
+            {
+                exitRequested = true;
+                requestedDirection.fill(0.0);
+            }
+
+            double magnitude = 0.0;
+            for (double component : requestedDirection)
+            {
+                magnitude += component * component;
+            }
+            magnitude = std::sqrt(magnitude);
+
+            if (magnitude > 1e-9)
+            {
+                for (double& component : requestedDirection)
+                {
+                    component /= magnitude;
+                }
+            }
+
+            const bool directionChanged =
+                std::fabs(requestedDirection[0] - activeDirection[0]) > 1e-9 ||
+                std::fabs(requestedDirection[1] - activeDirection[1]) > 1e-9 ||
+                std::fabs(requestedDirection[2] - activeDirection[2]) > 1e-9 ||
+                std::fabs(requestedDirection[3] - activeDirection[3]) > 1e-9 ||
+                std::fabs(requestedDirection[4] - activeDirection[4]) > 1e-9 ||
+                std::fabs(requestedDirection[5] - activeDirection[5]) > 1e-9;
+
+            if (directionChanged)
+            {
+                stopCartesianVelocityJog("keyboard Cartesian direction changed/released");
+                if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+                {
+                    stopArmedSessionCartesianJog("keyboard Cartesian direction changed/released");
+                }
+
+                activeDirection = requestedDirection;
+                ++cartesianJogTransitions;
+
+                if (magnitude > 1e-9)
+                {
+                    if (!motionConfirmed)
+                    {
+                        std::cout << "Cartesian keyboard key observed for "
+                                  << directionName(activeDirection)
+                                  << ", but motion is blocked because --confirm-keyboard-cartesian-jog was not supplied.\n";
+                    }
+                    else
+                    {
+                        startCartesianVelocityJog(activeDirection);
+                        nextLinearVelocityRefresh = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(EndpointCartesianKeyboardJogLinearVelocityRefreshMs);
+                        nextYVelocityRefresh = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(EndpointCartesianKeyboardJogYVelocityRefreshMs);
+                    }
+                }
+                else
+                {
+                    std::cout << "Cartesian keyboard jog idle/released.\n";
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const bool activePlanarLinearRefresh =
+                !directionChanged &&
+                cartesianVelocityJogActive &&
+                (std::fabs(activeDirection[0]) > 1e-9 || std::fabs(activeDirection[2]) > 1e-9) &&
+                std::fabs(activeDirection[1]) <= 1e-9 &&
+                std::fabs(activeDirection[3]) <= 1e-9 &&
+                std::fabs(activeDirection[4]) <= 1e-9 &&
+                std::fabs(activeDirection[5]) <= 1e-9 &&
+                magnitude > 1e-9;
+            if (motionConfirmed && activePlanarLinearRefresh && now >= nextLinearVelocityRefresh)
+            {
+                // Recompute W/S/R/F planar jog while held. This is important for
+                // tool-leading W/S reach because the Jacobian changes quickly as
+                // the arm extends; a stale velocity vector lets the endpoint sag
+                // in Z even when the commanded target twist has zero vertical
+                // velocity.
+                startCartesianVelocityJog(activeDirection);
+                nextLinearVelocityRefresh = now +
+                    std::chrono::milliseconds(EndpointCartesianKeyboardJogLinearVelocityRefreshMs);
+            }
+
+            const bool activePureYRefresh =
+                false &&
+                !directionChanged &&
+                cartesianVelocityJogActive &&
+                std::fabs(activeDirection[1]) > 1e-9 &&
+                std::fabs(activeDirection[0]) <= 1e-9 &&
+                std::fabs(activeDirection[2]) <= 1e-9 &&
+                std::fabs(activeDirection[3]) <= 1e-9 &&
+                std::fabs(activeDirection[4]) <= 1e-9 &&
+                std::fabs(activeDirection[5]) <= 1e-9 &&
+                magnitude > 1e-9;
+            if (motionConfirmed && activePureYRefresh && now >= nextYVelocityRefresh)
+            {
+                // Y from the upright pose is highly pose-dependent. Recompute the
+                // Jacobian velocity command while the key is held so J1/base
+                // rotation can help when useful, but does not keep integrating a
+                // stale tangent command after the geometry changes.
+                startCartesianVelocityJog(activeDirection);
+                nextYVelocityRefresh = now +
+                    std::chrono::milliseconds(EndpointCartesianKeyboardJogYVelocityRefreshMs);
+            }
+
+            if (now >= nextTelemetry)
+            {
+                const JointVector actualUserUnits = {
+                    axes_[0] ? axes_[0]->ActualPositionGet() : 0.0,
+                    axes_[1] ? axes_[1]->ActualPositionGet() : 0.0,
+                    axes_[2] ? axes_[2]->ActualPositionGet() : 0.0,
+                    axes_[3] ? axes_[3]->ActualPositionGet() : 0.0,
+                    axes_[4] ? axes_[4]->ActualPositionGet() : 0.0,
+                    axes_[5] ? axes_[5]->ActualPositionGet() : 0.0};
+
+                JointVector actualRadians{};
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+                }
+
+                const CartesianVector pose = poseVectorFromJoints(actualRadians);
+
+                const bool activePureYJog =
+                    false &&
+                    cartesianVelocityJogActive &&
+                    std::fabs(activeDirection[1]) > 1e-9 &&
+                    std::fabs(activeDirection[0]) <= 1e-9 &&
+                    std::fabs(activeDirection[2]) <= 1e-9 &&
+                    std::fabs(activeDirection[3]) <= 1e-9 &&
+                    std::fabs(activeDirection[4]) <= 1e-9 &&
+                    std::fabs(activeDirection[5]) <= 1e-9;
+                if (activePureYJog)
+                {
+                    const CartesianVector jogDelta = subtractPoseVectorWrapped(pose, cartesianVelocityJogStartPose);
+                    const double angularDriftMax = std::max(
+                        std::fabs(jogDelta[3]),
+                        std::max(std::fabs(jogDelta[4]), std::fabs(jogDelta[5])));
+                    const double baseDriftUserUnits = std::fabs(actualUserUnits[0] - cartesianVelocityJogStartUserUnits[0]);
+                    const double wristYawDriftUserUnits = std::fabs(actualUserUnits[5] - cartesianVelocityJogStartUserUnits[5]);
+
+                    if (angularDriftMax > EndpointCartesianKeyboardJogYDriftStopRadians ||
+                        std::fabs(jogDelta[0]) > EndpointCartesianKeyboardJogYMaxXDriftMeters ||
+                        std::fabs(jogDelta[2]) > EndpointCartesianKeyboardJogYMaxZDriftMeters ||
+                        baseDriftUserUnits > EndpointCartesianKeyboardJogYMaxBaseDriftUserUnits ||
+                        wristYawDriftUserUnits > EndpointCartesianKeyboardJogYMaxWristYawDriftUserUnits)
+                    {
+                        std::cout << "Smooth Cartesian keyboard jog Y drift guard stopping "
+                                  << directionName(activeDirection)
+                                  << ": delta tcp=("
+                                  << std::fixed << std::setprecision(6)
+                                  << jogDelta[0] << ", " << jogDelta[1] << ", " << jogDelta[2]
+                                  << ", " << jogDelta[3] << ", " << jogDelta[4] << ", " << jogDelta[5]
+                                  << "). H-home remains available; tune Y after this guarded stop.\n";
+
+                        stopCartesianVelocityJog("Y drift guard");
+                        activeDirection.fill(0.0);
+                        requestedDirection.fill(0.0);
+                        ++cartesianJogTransitions;
+                    }
+                }
+
+                std::cout << "cartesian_keyboard_jog"
+                          << " dir=" << directionName(activeDirection)
+                          << " transitions=" << cartesianJogTransitions
+                          << " active=" << boolText(cartesianVelocityJogActive || armedSessionCartesianJogActive_.load())
+                          << " velocityMode=" << boolText(cartesianVelocityJogActive)
+                          << " jointVelMax=" << maxAbsJointValue(lastCartesianVelocityCommand)
+                          << " multiAmp=" << boolText(multiAxis_ && multiAxis_->AmpEnableGet())
+                          << " done=" << boolText(multiAxis_ && multiAxis_->MotionDoneGet())
+                          << " tcp=(" << std::fixed << std::setprecision(6)
+                          << pose[0] << ", " << pose[1] << ", " << pose[2]
+                          << ", " << pose[3] << ", " << pose[4] << ", " << pose[5] << ")"
+                          << "\n";
+
+                nextTelemetry = now + std::chrono::milliseconds(EndpointCartesianKeyboardJogTelemetryPeriodMs);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(EndpointCartesianKeyboardJogIdleSleepMs));
+        }
+
+        stopCartesianVelocityJog("keyboard Cartesian shutdown");
+        if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+        {
+            stopArmedSessionCartesianJog("keyboard Cartesian shutdown");
+        }
+
+        std::cout << "Keyboard Cartesian jog exiting from current pose. H-home is manual only and is not run on Q/Esc.\n";
+
+        std::cout << "Endpoint-only Cartesian keyboard jog exiting. Disabling amps and clearing faults.\n";
+        shutdownArmedSession();
+    }
+    catch (...)
+    {
+        try
+        {
+            if (multiAxis_)
+            {
+                multiAxis_->TriggeredModify();
+            }
+        }
+        catch (...)
+        {
+        }
+        stopArmedSessionCartesianJog("keyboard Cartesian exception cleanup");
+        shutdownArmedSession();
+        throw;
+    }
+#endif
 }
 
 void Racer3BasicMotion::stopArmedSessionMotion()
@@ -2551,6 +4337,13 @@ void Racer3BasicMotion::stopArmedSessionMotion()
     if (!multiAxis_)
     {
         std::cout << "  MultiAxis is not initialized; no stop action was required.\n";
+        return;
+    }
+
+    if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+    {
+        stopArmedSessionCartesianJog("Stop Motion command");
+        printDiagnosticSnapshot("After armed-session Cartesian jog stop request", false);
         return;
     }
 
@@ -2590,6 +4383,11 @@ void Racer3BasicMotion::startArmedSessionAxis6VelocityJog(double velocityUserUni
     if (ArmedSessionTraceExecutionEnabled)
     {
         throw std::runtime_error("Axis 6 velocity jog is rejected while a session trace is active.");
+    }
+
+    if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+    {
+        throw std::runtime_error("Axis 6 velocity jog is rejected while a backend Cartesian jog is active.");
     }
 
     if (velocityUserUnitsPerSecond == 0.0)
@@ -2682,9 +4480,6 @@ void Racer3BasicMotion::stopArmedSessionAxis6VelocityJog(const char* reason)
     std::cout << "  Sending MultiAxis::TriggeredModify to decelerate the velocity jog to zero without Abort or amp disable.\n";
     multiAxis_->TriggeredModify();
 
-    armedSessionAxis6VelocityJogActive_ = false;
-    armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
-
     const bool multiAxisAmpEnabled = multiAxis_->AmpEnableGet();
     const bool axis6AmpEnabled = axes_[Axis6Index] && axes_[Axis6Index]->AmpEnableGet();
     std::cout << "  TriggeredModify sent. Amp validation after jog stop: MultiAxis AmpEnableGet="
@@ -2694,10 +4489,742 @@ void Racer3BasicMotion::stopArmedSessionAxis6VelocityJog(const char* reason)
               << "\n";
     printArmedSessionPositionSnapshot("Immediately after backend Axis 6 velocity jog stop command");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    printArmedSessionPositionSnapshot("250 ms after backend Axis 6 velocity jog stop command");
+    std::cout << "  Waiting up to "
+              << ArmedSessionJogStopMotionDoneWaitMs
+              << " ms for MultiAxis motion done after Axis 6 jog stop.\n";
+    try
+    {
+        const int32_t elapsedMilliseconds = multiAxis_->MotionDoneWait(ArmedSessionJogStopMotionDoneWaitMs);
+        std::cout << "  Axis 6 jog stop MotionDoneWait returned after "
+                  << elapsedMilliseconds
+                  << " ms.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "  Axis 6 jog stop MotionDoneWait RapidCode warning: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Stop command was already sent and amps remain enabled.\n";
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Axis 6 jog stop MotionDoneWait warning: "
+                  << error.what()
+                  << ". Stop command was already sent and amps remain enabled.\n";
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(ArmedSessionJogStopPostSampleMs));
+    printArmedSessionPositionSnapshot("After backend Axis 6 velocity jog stop settle wait");
+
+    armedSessionAxis6VelocityJogActive_ = false;
+    armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_ = 0.0;
 }
 
+
+
+void Racer3BasicMotion::prepareArmedSessionCartesianJogErrorLimitActions()
+{
+    if (armedSessionCartesianJogErrorLimitActionsChanged_)
+    {
+        std::cout << "  Cartesian jog ErrorLimitAction override is already active.\n";
+        return;
+    }
+
+    std::cout << "  Temporarily setting all axes position ErrorLimitAction to RSIActionNONE for backend Cartesian jog.\n";
+    std::cout << "  This matches the existing endpoint-only Cartesian-vector live motion path. Amp fault and hardware limit actions are not changed.\n";
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Cannot prepare Cartesian jog ErrorLimitAction: Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        const RR::RSIAction originalAction = axes_[index]->ErrorLimitActionGet();
+        armedSessionCartesianJogOriginalErrorLimitActions_[index] = static_cast<int>(originalAction);
+
+        std::cout << "    Axis " << (index + 1)
+                  << " original ErrorLimitAction="
+                  << actionName(originalAction)
+                  << " -> RSIActionNONE\n";
+
+        axes_[index]->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+    }
+
+    armedSessionCartesianJogErrorLimitActionsChanged_ = true;
+}
+
+void Racer3BasicMotion::restoreArmedSessionCartesianJogErrorLimitActions(const char* context) noexcept
+{
+    if (!armedSessionCartesianJogErrorLimitActionsChanged_)
+    {
+        return;
+    }
+
+    const char* restoreContext = context ? context : "unspecified context";
+    std::cout << "  Restoring Cartesian jog ErrorLimitAction values after "
+              << restoreContext
+              << ".\n";
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        try
+        {
+            if (!axes_[index])
+            {
+                std::cout << "    Axis " << (index + 1)
+                          << " is not initialized; cannot restore ErrorLimitAction.\n";
+                continue;
+            }
+
+            const RR::RSIAction originalAction =
+                static_cast<RR::RSIAction>(armedSessionCartesianJogOriginalErrorLimitActions_[index]);
+
+            axes_[index]->ErrorLimitActionSet(originalAction);
+
+            std::cout << "    Axis " << (index + 1)
+                      << " ErrorLimitAction restored to "
+                      << actionName(originalAction)
+                      << ".\n";
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "    Warning: Axis " << (index + 1)
+                      << " ErrorLimitAction restore failed with RapidCode error: "
+                      << error.text
+                      << " ("
+                      << error.functionName
+                      << ").\n";
+        }
+        catch (const std::exception& error)
+        {
+            std::cout << "    Warning: Axis " << (index + 1)
+                      << " ErrorLimitAction restore failed: "
+                      << error.what()
+                      << ".\n";
+        }
+        catch (...)
+        {
+            std::cout << "    Warning: Axis " << (index + 1)
+                      << " ErrorLimitAction restore failed with unknown exception.\n";
+        }
+    }
+
+    armedSessionCartesianJogErrorLimitActionsChanged_ = false;
+}
+
+void Racer3BasicMotion::startArmedSessionCartesianJog(
+    const std::array<double, AxisCount>& direction,
+    double speedMetersPerSecond)
+{
+    if (!controller_ || !multiAxis_)
+    {
+        throw std::runtime_error("Persistent armed session is not initialized.");
+    }
+
+    if (ArmedSessionTraceExecutionEnabled)
+    {
+        throw std::runtime_error("Cartesian jog is rejected while a session trace is active.");
+    }
+
+    if (armedSessionAxis6VelocityJogActive_)
+    {
+        throw std::runtime_error("Cartesian jog is rejected while the Axis 6 velocity diagnostic jog is active.");
+    }
+
+    if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+    {
+        throw std::runtime_error("Cartesian jog is already active; send jog_cartesian_stop before changing direction or speed.");
+    }
+
+    if (speedMetersPerSecond <= 0.0 || speedMetersPerSecond > ArmedSessionCartesianJogMaxSpeedMetersPerSecond)
+    {
+        std::ostringstream message;
+        message << "Cartesian jog speed requires 0 < speed <= "
+                << ArmedSessionCartesianJogMaxSpeedMetersPerSecond
+                << " meters/sec.";
+        throw std::runtime_error(message.str());
+    }
+
+    double directionMagnitude = 0.0;
+    for (double component : direction)
+    {
+        if (!std::isfinite(component))
+        {
+            throw std::runtime_error("Cartesian jog direction contains a non-finite component.");
+        }
+
+        directionMagnitude += component * component;
+    }
+
+    directionMagnitude = std::sqrt(directionMagnitude);
+    if (directionMagnitude <= 1e-9)
+    {
+        throw std::runtime_error("Cartesian jog direction is zero.");
+    }
+
+    if (directionMagnitude > 1.05)
+    {
+        std::ostringstream message;
+        message << "Cartesian jog direction magnitude "
+                << directionMagnitude
+                << " exceeds 1.05. Keyboard/controller callers should normalize combined directions before starting the jog.";
+        throw std::runtime_error(message.str());
+    }
+
+    const std::string directionLabel = cartesianJogDirectionName(direction);
+
+    printArmedSessionPositionSnapshot("Before backend-owned Cartesian jog loop start");
+
+    const bool multiAxisAmpEnabled = multiAxis_->AmpEnableGet();
+    const bool multiAxisMotionDone = multiAxis_->MotionDoneGet();
+    bool allAxisAmpsEnabled = multiAxisAmpEnabled;
+    bool allAxisMotionDone = multiAxisMotionDone;
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index] || !axes_[index]->AmpEnableGet())
+        {
+            allAxisAmpsEnabled = false;
+        }
+
+        if (!axes_[index] || !axes_[index]->MotionDoneGet())
+        {
+            allAxisMotionDone = false;
+        }
+    }
+
+    std::cout << "Backend Cartesian jog start requested. This is backend-owned endpoint-only Cartesian "
+              << directionLabel
+              << " stable non-append PVT smoothing-span jog v14.\n";
+    std::cout << "  Requested TCP speed=" << speedMetersPerSecond
+              << " m/sec. Direction=" << directionLabel << ". Default UI validation speed is 0.003 m/sec; backend limit is "
+              << ArmedSessionCartesianJogMaxSpeedMetersPerSecond
+              << " m/sec.\n";
+    std::cout << "  Smoothing span=" << ArmedSessionCartesianJogLoopPeriodMs
+              << " ms with " << ArmedSessionCartesianJogPvtWaypointCount
+              << " PVT points.\n";
+    std::cout << "  v14 intentionally disables the rolling APPEND experiment because v13 produced RapidCode path error 3856 and dropped amps.\n"
+              << "  Each backend cycle plans one endpoint-only Cartesian-vector smoothing span from current joint feedback,\n"
+              << "  streams one coordinated MultiAxis::MovePVT span, and waits for MotionDone before planning the next span.\n"
+              << "  On release, normal jog stop waits for the current short PVT span to finish naturally; it does not use TriggeredModify, Abort, or amp disable.\n"
+              << "  This is the current safe fallback while true smoothing moves to a dedicated buffered/RTTask-style implementation.\n";
+    std::cout << "  This path does not run rsiconfig, AxisAdd/remap, ClearFaults, AmpEnableSet, Abort, or session reinitialization.\n";
+    std::cout << "  It temporarily sets axis position ErrorLimitAction to RSIActionNONE, matching the existing endpoint-only Cartesian-vector execution path.\n";
+    std::cout << "  Amp validation before Cartesian jog: MultiAxis AmpEnableGet="
+              << boolText(multiAxisAmpEnabled)
+              << ", all individual Axis AmpEnableGet="
+              << boolText(allAxisAmpsEnabled)
+              << "\n";
+    std::cout << "  Motion-idle validation before Cartesian jog: MultiAxis MotionDoneGet="
+              << boolText(multiAxisMotionDone)
+              << ", all individual Axis MotionDoneGet="
+              << boolText(allAxisMotionDone)
+              << "\n";
+
+    if (!multiAxisAmpEnabled || !allAxisAmpsEnabled)
+    {
+        throw std::runtime_error("Cartesian jog rejected because all amps are not enabled in the armed session.");
+    }
+
+    if (!multiAxisMotionDone || !allAxisMotionDone)
+    {
+        throw std::runtime_error("Cartesian jog rejected because the previous jog/motion has not fully settled yet. Wait for session_jog_cartesian_stopped and status State=IDLE/Done=true before starting another jog.");
+    }
+
+    prepareArmedSessionCartesianJogErrorLimitActions();
+
+    try
+    {
+        armedSessionCartesianJogSpeedMetersPerSecond_ = speedMetersPerSecond;
+        armedSessionCartesianJogDirection_ = direction;
+        armedSessionCartesianJogJointVelocityUserUnitsPerSecond_.fill(0.0);
+        armedSessionCartesianJogLastError_.clear();
+        armedSessionCartesianJogStopRequested_.store(false);
+        armedSessionCartesianJogActive_.store(true);
+
+        armedSessionCartesianJogThread_ = std::thread(
+            &Racer3BasicMotion::runArmedSessionCartesianJogLoop,
+            this,
+            direction,
+            speedMetersPerSecond);
+    }
+    catch (...)
+    {
+        armedSessionCartesianJogActive_.store(false);
+        armedSessionCartesianJogStopRequested_.store(false);
+        restoreArmedSessionCartesianJogErrorLimitActions("Cartesian jog start failure");
+        throw;
+    }
+
+    std::cout << "  Backend Cartesian jog loop thread started. Endpoint-only non-append PVT smoothing spans continue until jog_cartesian_stop.\n";
+    std::cout << "  Amps remain enabled for the persistent armed session.\n";
+}
+
+void Racer3BasicMotion::stopArmedSessionCartesianJog(const char* reason)
+{
+    const char* stopReason = reason ? reason : "unspecified";
+    std::cout << "Backend Cartesian jog stop requested. Reason: " << stopReason << "\n";
+
+    if (!armedSessionCartesianJogActive_.load() && !armedSessionCartesianJogThread_.joinable())
+    {
+        std::cout << "  No backend Cartesian jog is active; stop is a no-op. Amps remain enabled.\n";
+        restoreArmedSessionCartesianJogErrorLimitActions("Cartesian jog stop no-op cleanup");
+        return;
+    }
+
+    armedSessionCartesianJogStopRequested_.store(true);
+    armedSessionCartesianJogStopCv_.notify_all();
+
+    if (multiAxis_)
+    {
+        try
+        {
+            if (!multiAxis_->MotionDoneGet())
+            {
+                std::cout << "  MultiAxis is still moving; v14 normal jog stop waits for the current short PVT smoothing span to finish naturally.\n";
+                std::cout << "  APPEND and TriggeredModify are intentionally not used for normal Cartesian jog release.\n";
+            }
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cout << "  Cartesian jog stop MotionDoneGet warning: "
+                      << error.text
+                      << " ("
+                      << error.functionName
+                      << "). Jog thread will continue stop/settle handling.\n";
+        }
+        catch (const std::exception& error)
+        {
+            std::cout << "  Cartesian jog stop MotionDoneGet warning: "
+                      << error.what()
+                      << ". Jog thread will continue stop/settle handling.\n";
+        }
+        catch (...)
+        {
+            std::cout << "  Cartesian jog stop MotionDoneGet warning: unknown exception. Jog thread will continue stop/settle handling.\n";
+        }
+    }
+
+    joinArmedSessionCartesianJogThread();
+
+    if (!armedSessionCartesianJogLastError_.empty())
+    {
+        std::cout << "  Cartesian jog loop reported: " << armedSessionCartesianJogLastError_ << "\n";
+    }
+
+    printArmedSessionPositionSnapshot("After backend-owned Cartesian jog loop stop");
+}
+
+void Racer3BasicMotion::joinArmedSessionCartesianJogThread() noexcept
+{
+    try
+    {
+        armedSessionCartesianJogStopRequested_.store(true);
+        armedSessionCartesianJogStopCv_.notify_all();
+
+        if (armedSessionCartesianJogThread_.joinable())
+        {
+            armedSessionCartesianJogThread_.join();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Cartesian jog thread join warning: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Cartesian jog thread join warning: unknown exception.\n";
+    }
+}
+
+void Racer3BasicMotion::runArmedSessionCartesianJogLoop(
+    std::array<double, AxisCount> direction,
+    double speedMetersPerSecond) noexcept
+{
+    bool pvtCommandIssued = false;
+    int tick = 0;
+    int consecutiveAmpCheckFailures = 0;
+
+    auto finishState = [&]() noexcept {
+        armedSessionCartesianJogActive_.store(false);
+        armedSessionCartesianJogStopRequested_.store(false);
+        armedSessionCartesianJogSpeedMetersPerSecond_ = 0.0;
+        armedSessionCartesianJogDirection_.fill(0.0);
+        armedSessionCartesianJogJointVelocityUserUnitsPerSecond_.fill(0.0);
+        restoreArmedSessionCartesianJogErrorLimitActions("backend-owned Cartesian jog loop exit");
+    };
+
+
+    try
+    {
+        const double samplePeriodSeconds = samplePeriodSecondsFromController(controller_);
+        std::cout << "Backend-owned Cartesian jog loop entering. Controller sample period approximately "
+                  << std::fixed << std::setprecision(6)
+                  << samplePeriodSeconds
+                  << " sec. This version uses endpoint-only MultiAxis::MovePVT non-append smoothing spans, not continuous MoveVelocity.\n";
+
+        configureMultiAxisMotionAttributes("before backend-owned Cartesian jog non-append PVT loop");
+        multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskAPPEND);
+        multiAxis_->MotionAttributeMaskOffSet(RR::RSIMotionAttrMask::RSIMotionAttrMaskNO_WAIT);
+
+        while (!armedSessionCartesianJogStopRequested_.load())
+        {
+            ++tick;
+
+            const bool multiAxisAmpEnabled = multiAxis_ && multiAxis_->AmpEnableGet();
+            bool allAxisAmpsEnabled = multiAxisAmpEnabled;
+
+            JointVector actualUserUnits{};
+            JointVector actualRadians{};
+
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                if (!axes_[index])
+                {
+                    throw std::runtime_error("Cartesian jog loop found an uninitialized Axis object.");
+                }
+
+                if (!axes_[index]->AmpEnableGet())
+                {
+                    allAxisAmpsEnabled = false;
+                }
+
+                actualUserUnits[index] = axes_[index]->ActualPositionGet();
+                actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+            }
+
+            if (!multiAxisAmpEnabled || !allAxisAmpsEnabled)
+            {
+                ++consecutiveAmpCheckFailures;
+                std::cout << "  Cartesian jog PVT loop amp/state check failure "
+                          << consecutiveAmpCheckFailures
+                          << "/"
+                          << ArmedSessionCartesianJogRequiredConsecutiveAmpFailures
+                          << " on tick "
+                          << tick
+                          << ": MultiAxis AmpEnableGet="
+                          << boolText(multiAxisAmpEnabled)
+                          << ", all individual Axis AmpEnableGet="
+                          << boolText(allAxisAmpsEnabled)
+                          << ". Detailed state follows before deciding whether to stop.\n";
+                printArmedSessionPositionSnapshot("Cartesian jog PVT loop amp/state diagnostic snapshot");
+
+                if (consecutiveAmpCheckFailures >= ArmedSessionCartesianJogRequiredConsecutiveAmpFailures)
+                {
+                    throw std::runtime_error("Cartesian jog PVT loop detected repeated disabled-amp/state checks; stopping jog loop after diagnostics.");
+                }
+
+                std::unique_lock<std::mutex> lock(armedSessionCartesianJogMutex_);
+                armedSessionCartesianJogStopCv_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(ArmedSessionCartesianJogLoopPeriodMs),
+                    [this]() { return armedSessionCartesianJogStopRequested_.load(); });
+                continue;
+            }
+
+            consecutiveAmpCheckFailures = 0;
+
+            JointVector planningStartUserUnits = actualUserUnits;
+
+            JointVector planningStartRadians{};
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                planningStartRadians[index] = planningStartUserUnits[index] * RevolutionsToRadians;
+            }
+
+            CartesianVector tickDelta{};
+            for (int index = 0; index < AxisCount; ++index)
+            {
+                tickDelta[index] = direction[index] * speedMetersPerSecond * ArmedSessionCartesianJogLoopPeriodSeconds;
+            }
+
+            CartesianSegmentPlan plan = buildSegmentedCartesianPlan(
+                planningStartRadians,
+                tickDelta,
+                true /* preferContinuitySeed for live jog ticks */);
+            if (!plan.accepted)
+            {
+                std::ostringstream message;
+                message << "Cartesian jog PVT loop endpoint-only plan rejected on tick "
+                        << tick
+                        << ": "
+                        << plan.rejectionReason;
+                throw std::runtime_error(message.str());
+            }
+
+            const std::vector<JointVector> relativeSequence = makeOutboundSequenceFromSegmentPlan(plan);
+            JointVector commandDeltaUserUnits{};
+            double maxSegmentDeltaDegrees = 0.0;
+            std::ostringstream ikSeedSummary;
+            bool firstSeedSummaryEntry = true;
+            for (const CartesianSegmentCandidate& segment : plan.segments)
+            {
+                maxSegmentDeltaDegrees = std::max(maxSegmentDeltaDegrees, segment.maxCommandDeltaDegrees);
+                if (!firstSeedSummaryEntry)
+                {
+                    ikSeedSummary << ", ";
+                }
+                firstSeedSummaryEntry = false;
+                ikSeedSummary << "S" << segment.segmentNumber << "=" << segment.candidate.seedName;
+            }
+
+            for (const JointVector& step : relativeSequence)
+            {
+                for (int axis = 0; axis < AxisCount; ++axis)
+                {
+                    commandDeltaUserUnits[axis] += step[axis];
+                }
+            }
+
+            JointVector jointVelocityUserUnitsPerSecond{};
+            JointVector targetUserUnits = planningStartUserUnits;
+            for (int axis = 0; axis < AxisCount; ++axis)
+            {
+                targetUserUnits[axis] += commandDeltaUserUnits[axis];
+                jointVelocityUserUnitsPerSecond[axis] =
+                    commandDeltaUserUnits[axis] / ArmedSessionCartesianJogLoopPeriodSeconds;
+            }
+
+            const double maxJointVelocity = maxAbsJointValue(jointVelocityUserUnitsPerSecond);
+            if (maxJointVelocity <= 1e-9)
+            {
+                throw std::runtime_error("Cartesian jog PVT loop produced a near-zero joint delta.");
+            }
+
+            if (maxJointVelocity > ArmedSessionCartesianJogMaxJointVelocity)
+            {
+                std::ostringstream message;
+                message << "Cartesian jog PVT loop produced max implied joint velocity "
+                        << maxJointVelocity
+                        << " user-units/sec, exceeding conservative limit "
+                        << ArmedSessionCartesianJogMaxJointVelocity
+                        << ". IK seeds=["
+                        << ikSeedSummary.str()
+                        << "], max segment delta="
+                        << maxSegmentDeltaDegrees
+                        << " deg. This should be rare with the continuity-biased jog IK planner.";
+                throw std::runtime_error(message.str());
+            }
+
+            const JointTrajectoryBlock trajectory =
+                makeRollingJogPvtBlock(
+                    planningStartUserUnits,
+                    targetUserUnits,
+                    samplePeriodSeconds,
+                    ArmedSessionCartesianJogLoopPeriodSeconds);
+            const std::vector<double> flatPositions = flattenJointTrajectoryPoints(trajectory.positions);
+            const std::vector<double> flatVelocities = flattenJointTrajectoryPoints(trajectory.velocities);
+
+            if (tick == 1 || tick % ArmedSessionCartesianJogLoopLogEveryTicks == 0)
+            {
+                const CartesianVector currentPose = poseVectorFromJoints(planningStartRadians);
+                std::cout << "  Cartesian jog PVT loop tick "
+                          << tick
+                          << ": TCP X="
+                          << currentPose[0]
+                          << " Y="
+                          << currentPose[1]
+                          << " Z="
+                          << currentPose[2]
+                          << ", smoothing-span endpoint delta XYZ=("
+                          << tickDelta[0]
+                          << ", "
+                          << tickDelta[1]
+                          << ", "
+                          << tickDelta[2]
+                          << ") m, segments="
+                          << plan.segmentCount
+                          << ", PVT points="
+                          << trajectory.positions.size()
+                          << ", totalSeconds="
+                          << trajectory.totalSeconds
+                          << ", max implied joint velocity="
+                          << maxJointVelocity
+                          << " user-units/sec ("
+                          << toDegrees(maxJointVelocity)
+                          << " deg/sec), max segment delta="
+                          << maxSegmentDeltaDegrees
+                          << " deg, IK seeds=["
+                          << ikSeedSummary.str()
+                          << "].\n";
+                std::cout << "  Cartesian jog PVT loop target delta [J1..J6] user-units: ";
+                printJointVector(commandDeltaUserUnits);
+                std::cout << "  Cartesian jog PVT loop implied joint velocity [J1..J6] user-units/sec: ";
+                printJointVector(jointVelocityUserUnitsPerSecond);
+            }
+
+            if (armedSessionCartesianJogStopRequested_.load())
+            {
+                std::cout << "  Cartesian jog stop was requested before the next smoothing PVT span was issued; exiting without queueing another MovePVT.\n";
+                break;
+            }
+
+
+            multiAxis_->MovePVT(
+                flatPositions.data(),
+                flatVelocities.data(),
+                trajectory.times.data(),
+                static_cast<int32_t>(trajectory.positions.size()),
+                TrajectoryPvtEmptyCount,
+                false,
+                true);
+
+            pvtCommandIssued = true;
+            armedSessionCartesianJogJointVelocityUserUnitsPerSecond_ = jointVelocityUserUnitsPerSecond;
+
+            if (tick == 1)
+            {
+                printArmedSessionPositionSnapshot("Immediately after first backend-owned Cartesian jog non-append PVT smoothing-span command");
+            }
+
+            const int32_t elapsedMilliseconds =
+                multiAxis_->MotionDoneWait(ArmedSessionCartesianJogTickMotionDoneWaitMs);
+
+            if (tick == 1 || tick % ArmedSessionCartesianJogLoopLogEveryTicks == 0)
+            {
+                std::cout << "  Cartesian jog PVT loop tick "
+                          << tick
+                          << " MotionDoneWait returned after "
+                          << elapsedMilliseconds
+                          << " ms.\n";
+            }
+
+            if (tick == 1)
+            {
+                printArmedSessionPositionSnapshot("After first backend-owned Cartesian jog non-append PVT smoothing-span MotionDoneWait");
+            }
+        }
+
+        std::cout << "Backend-owned Cartesian jog non-append PVT loop stop flag observed after "
+                  << tick
+                  << " tick(s). Last smoothing PVT span is complete or settling; no APPEND/TriggeredModify/Abort is used on normal release.\n";
+
+        if (pvtCommandIssued && multiAxis_)
+        {
+            try
+            {
+                const bool motionDone = multiAxis_->MotionDoneGet();
+                if (!motionDone)
+                {
+                    std::cout << "  MultiAxis still reports moving after loop exit; waiting for current non-append PVT span to settle naturally.\n";
+                    const int32_t elapsedMilliseconds =
+                        multiAxis_->MotionDoneWait(ArmedSessionCartesianJogFinalMotionDoneWaitMs);
+                    std::cout << "  Cartesian jog final MotionDoneWait returned after "
+                              << elapsedMilliseconds
+                              << " ms.\n";
+                }
+            }
+            catch (const RR::RsiError& error)
+            {
+                std::cout << "  Cartesian jog final MotionDoneWait RapidCode warning: "
+                          << error.text
+                          << " ("
+                          << error.functionName
+                          << "). No TriggeredModify is attempted on normal release.\n";
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(ArmedSessionJogStopPostSampleMs));
+        printArmedSessionPositionSnapshot("After backend-owned Cartesian jog PVT loop stop settle wait");
+
+        std::cout << "Backend-owned Cartesian jog PVT loop exited cleanly. Amps remain enabled for the persistent armed session.\n";
+        finishState();
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::ostringstream message;
+        message << "RapidCode error in backend-owned Cartesian jog PVT loop: "
+                << error.text
+                << " ("
+                << error.functionName
+                << ")";
+        armedSessionCartesianJogLastError_ = message.str();
+        std::cout << "  " << armedSessionCartesianJogLastError_ << "\n";
+
+        if (pvtCommandIssued && multiAxis_)
+        {
+            try
+            {
+                std::cout << "  Attempting TriggeredModify after Cartesian jog PVT loop RapidCode error.\n";
+                multiAxis_->TriggeredModify();
+            }
+            catch (...)
+            {
+                std::cout << "  TriggeredModify after Cartesian jog PVT loop error also failed.\n";
+            }
+        }
+
+        finishState();
+    }
+    catch (const std::exception& error)
+    {
+        armedSessionCartesianJogLastError_ = error.what();
+        std::cout << "  Cartesian jog PVT loop error: " << armedSessionCartesianJogLastError_ << "\n";
+
+        if (pvtCommandIssued && multiAxis_)
+        {
+            try
+            {
+                std::cout << "  Attempting TriggeredModify after Cartesian jog PVT loop error.\n";
+                multiAxis_->TriggeredModify();
+            }
+            catch (...)
+            {
+                std::cout << "  TriggeredModify after Cartesian jog PVT loop error also failed.\n";
+            }
+        }
+
+        finishState();
+    }
+    catch (...)
+    {
+        armedSessionCartesianJogLastError_ = "Unknown error in backend-owned Cartesian jog PVT loop.";
+        std::cout << "  " << armedSessionCartesianJogLastError_ << "\n";
+
+        if (pvtCommandIssued && multiAxis_)
+        {
+            try
+            {
+                std::cout << "  Attempting TriggeredModify after unknown Cartesian jog PVT loop error.\n";
+                multiAxis_->TriggeredModify();
+            }
+            catch (...)
+            {
+                std::cout << "  TriggeredModify after unknown Cartesian jog PVT loop error also failed.\n";
+            }
+        }
+
+        finishState();
+    }
+}
+
+
+bool Racer3BasicMotion::areArmedSessionAmpsEnabled() const noexcept
+{
+    try
+    {
+        if (!multiAxis_ || !multiAxis_->AmpEnableGet())
+        {
+            return false;
+        }
+
+        for (int index = 0; index < AxisCount; ++index)
+        {
+            if (!axes_[index] || !axes_[index]->AmpEnableGet())
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
 
 void Racer3BasicMotion::printArmedSessionPositionSnapshot(const char* label)
 {
@@ -2785,6 +5312,11 @@ void Racer3BasicMotion::runArmedSessionTrace(
         throw std::runtime_error("Persistent armed session trace rejected because backend Axis 6 velocity jog is active. Send jog_velocity_stop first.");
     }
 
+    if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+    {
+        throw std::runtime_error("Persistent armed session trace rejected because backend Cartesian jog is active. Send jog_cartesian_stop first.");
+    }
+
     if (waypoints.empty())
     {
         throw std::runtime_error("Persistent armed session trace requires at least one waypoint.");
@@ -2823,14 +5355,355 @@ void Racer3BasicMotion::runArmedSessionTrace(
     ArmedSessionTraceReturnToZero = true;
 }
 
+
+void Racer3BasicMotion::ensureRtTaskProbeState()
+{
+    if (!rttaskProbe_)
+    {
+        rttaskProbe_ = std::make_unique<Racer3RtTaskProbeState>();
+    }
+}
+
+void Racer3BasicMotion::startArmedSessionRtTaskProbe(
+    const std::string& libraryDirectory,
+    const std::string& rttaskDirectory,
+    const std::string& managerPlatform,
+    int statusPeriodMilliseconds,
+    int intentPeriodMilliseconds)
+{
+    if (!controller_ || !multiAxis_)
+    {
+        throw std::runtime_error("Persistent armed session is not initialized; start the armed session before RTTask probe.");
+    }
+
+    ensureRtTaskProbeState();
+
+    if (rttaskProbe_->running)
+    {
+        throw std::runtime_error("Racer3 RTTask probe is already running; stop it before starting another probe.");
+    }
+
+    const std::string effectiveLibraryDirectory = libraryDirectory.empty()
+        ? ArmedSessionRtTaskDefaultLibraryDirectory
+        : libraryDirectory;
+    const std::string effectiveRtTaskDirectory = rttaskDirectory.empty()
+        ? ArmedSessionRtTaskDefaultRmpInstallPath
+        : rttaskDirectory;
+    std::string effectiveManagerPlatform = managerPlatform.empty()
+        ? ArmedSessionRtTaskDefaultManagerPlatform
+        : managerPlatform;
+    std::transform(effectiveManagerPlatform.begin(), effectiveManagerPlatform.end(), effectiveManagerPlatform.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const int effectiveStatusPeriod = std::max(1, statusPeriodMilliseconds <= 0
+        ? ArmedSessionRtTaskDefaultStatusPeriodMs
+        : statusPeriodMilliseconds);
+    const int effectiveIntentPeriod = std::max(1, intentPeriodMilliseconds <= 0
+        ? ArmedSessionRtTaskDefaultIntentPeriodMs
+        : intentPeriodMilliseconds);
+
+    std::cout << "Starting Racer3 RTTask probe. This is a no-motion bridge test.\n";
+    std::cout << "  LibraryName=" << ArmedSessionRtTaskDefaultLibraryName << "\n";
+    std::cout << "  RTTaskDirectory=" << effectiveRtTaskDirectory << "\n";
+    std::cout << "  LibraryDirectory=" << (effectiveLibraryDirectory.empty() ? "<empty; use RTTaskDirectory>" : effectiveLibraryDirectory) << "\n";
+    std::cout << "  ManagerPlatform=" << effectiveManagerPlatform << "\n";
+    std::cout << "  Laser-demo compatibility note: the laser settings XML deploys RTTaskFunctions into RTTaskDirectory and leaves per-task LibraryDirectory empty.\n";
+    std::cout << "  v20 returns to the laser-style/default real RTTask path: Platform=INtime, NodeName=NodeA, RTTaskDirectory set to the RMP install, and per-task LibraryDirectory empty. Use managerPlatform='native' only for host-DLL diagnostics.\n";
+    std::cout << "  StatusSampler period=" << effectiveStatusPeriod << " ms\n";
+    std::cout << "  JogIntentMonitor period=" << effectiveIntentPeriod << " ms\n";
+    std::cout << "  This probe follows the laser-demo RTTask pattern: initialize once, then run cyclic tasks against shared globals.\n";
+    std::cout << "  No motion commands, amp-enable, fault-clear, AxisAdd/remap, Abort, rsiconfig, or session setup are run by this probe.\n";
+
+    RT::RTTaskManagerCreationParameters managerParameters;
+    copyRtTaskText(
+        managerParameters.RTTaskDirectory,
+        sizeof(managerParameters.RTTaskDirectory),
+        effectiveRtTaskDirectory);
+#if defined(_WIN32)
+    if (effectiveManagerPlatform == "intime" || effectiveManagerPlatform == "in-time")
+    {
+        managerParameters.Platform = RT::PlatformType::INtime;
+        copyRtTaskText(managerParameters.NodeName, sizeof(managerParameters.NodeName), "NodeA");
+        std::cout << "  Using INtime RTTask manager mode (NodeName=NodeA), matching the RSI helper and laser-demo production pattern.\n";
+    }
+    else
+    {
+        // Leave Platform/NodeName at RapidCode defaults.  This native mode is not
+        // the final real-time jog target, but it matches the MSVC DLL we are
+        // currently building and proves task export/global dispatch before we
+        // introduce an INtime .rsl build.
+        std::cout << "  Using native RTTask manager mode for this no-motion probe.\n";
+    }
+#endif
+
+    rttaskProbe_->manager = RT::RTTaskManager::Create(managerParameters);
+    if (!rttaskProbe_->manager.has_value())
+    {
+        throw std::runtime_error("RTTaskManager::Create returned no manager.");
+    }
+
+    RT::RTTaskManager& manager = rttaskProbe_->manager.value();
+
+    std::cout << "  Submitting official-sample-compatible Increment RTTask first. This task only increments the shared global 'counter'.\n";
+    RT::RTTaskCreationParameters incrementParameters = makeRacer3RtTaskParameters(
+        "Increment",
+        "Increment",
+        effectiveLibraryDirectory,
+        effectiveStatusPeriod,
+        RT::RTTaskCreationParameters::RepeatForever);
+    rttaskProbe_->incrementTask = manager.TaskSubmit(incrementParameters);
+    rttaskProbe_->incrementTask->ExecutionCountAbsoluteWait(3, ArmedSessionRtTaskHeartbeatWaitMs);
+
+    std::cout << "  Submitting cyclic Racer3BasicHeartbeat RTTask. This task does not touch RapidCode objects.\n";
+    RT::RTTaskCreationParameters basicHeartbeatParameters = makeRacer3RtTaskParameters(
+        "Racer3BasicHeartbeat",
+        "Racer3BasicHeartbeat",
+        effectiveLibraryDirectory,
+        effectiveStatusPeriod,
+        RT::RTTaskCreationParameters::RepeatForever);
+    rttaskProbe_->basicHeartbeatTask = manager.TaskSubmit(basicHeartbeatParameters);
+    rttaskProbe_->basicHeartbeatTask->ExecutionCountAbsoluteWait(3, ArmedSessionRtTaskHeartbeatWaitMs);
+
+    std::cout << "  Submitting one-shot Racer3Initialize RTTask after basic heartbeat dispatch is proven.\n";
+    RT::RTTaskCreationParameters initParameters = makeRacer3RtTaskParameters(
+        "Racer3Initialize",
+        "Racer3Initialize",
+        effectiveLibraryDirectory,
+        1,
+        RT::RTTaskCreationParameters::RepeatNone);
+    RT::RTTask initTask = manager.TaskSubmit(initParameters);
+    initTask.ExecutionCountAbsoluteWait(1, ArmedSessionRtTaskInitWaitMs);
+
+    std::cout << "  Submitting cyclic Racer3StatusSampler RTTask.\n";
+    RT::RTTaskCreationParameters statusParameters = makeRacer3RtTaskParameters(
+        "Racer3StatusSampler",
+        "Racer3StatusSampler",
+        effectiveLibraryDirectory,
+        effectiveStatusPeriod,
+        RT::RTTaskCreationParameters::RepeatForever);
+    rttaskProbe_->statusTask = manager.TaskSubmit(statusParameters);
+
+    std::cout << "  Submitting cyclic Racer3JogIntentMonitor RTTask.\n";
+    RT::RTTaskCreationParameters intentParameters = makeRacer3RtTaskParameters(
+        "Racer3JogIntentMonitor",
+        "Racer3JogIntentMonitor",
+        effectiveLibraryDirectory,
+        effectiveIntentPeriod,
+        RT::RTTaskCreationParameters::RepeatForever);
+    rttaskProbe_->intentTask = manager.TaskSubmit(intentParameters);
+
+    rttaskProbe_->statusTask->ExecutionCountAbsoluteWait(5, ArmedSessionRtTaskHeartbeatWaitMs);
+
+    rttaskProbe_->libraryDirectory = effectiveLibraryDirectory;
+    rttaskProbe_->rttaskDirectory = effectiveRtTaskDirectory;
+    rttaskProbe_->managerPlatform = effectiveManagerPlatform;
+    rttaskProbe_->statusPeriodMilliseconds = effectiveStatusPeriod;
+    rttaskProbe_->intentPeriodMilliseconds = effectiveIntentPeriod;
+    rttaskProbe_->running = true;
+
+    std::cout << "  Racer3 RTTask probe started. Use rttask_probe_status to read heartbeat/sample globals.\n";
+}
+
+std::string Racer3BasicMotion::getArmedSessionRtTaskProbeStatusJson()
+{
+    ensureRtTaskProbeState();
+
+    if (!rttaskProbe_->running || !rttaskProbe_->manager.has_value())
+    {
+        return "{\"type\":\"session_rttask_probe_status\",\"state\":\"armed_idle\",\"armed\":true,\"rttaskProbeRunning\":false,\"message\":\"Racer3 RTTask probe is not running.\"}";
+    }
+
+    RT::RTTaskManager& manager = rttaskProbe_->manager.value();
+
+    const int64_t counter = getRtTaskInt64Global(manager, "counter");
+    const int64_t basicHeartbeat = getRtTaskInt64Global(manager, "basicHeartbeat");
+    const int64_t heartbeat = getRtTaskInt64Global(manager, "heartbeat");
+    const int64_t initializationCount = getRtTaskInt64Global(manager, "initializationCount");
+    const int64_t lastSampleCounter = getRtTaskInt64Global(manager, "lastSampleCounter");
+    const int64_t lastNetworkCounter = getRtTaskInt64Global(manager, "lastNetworkCounter");
+    const int64_t jogIntentTransitions = getRtTaskInt64Global(manager, "jogIntentTransitions");
+    const int64_t taskErrorCount = getRtTaskInt64Global(manager, "taskErrorCount");
+    const double samplePeriodSeconds = getRtTaskDoubleGlobal(manager, "samplePeriodSeconds");
+    const double axis2CommandPosition = getRtTaskDoubleGlobal(manager, "axis2CommandPosition");
+    const double axis2ActualPosition = getRtTaskDoubleGlobal(manager, "axis2ActualPosition");
+
+    int64_t incrementExecutionCount = -1;
+    int64_t basicHeartbeatExecutionCount = -1;
+    int64_t statusExecutionCount = -1;
+    int64_t intentExecutionCount = -1;
+    int32_t incrementTaskState = -1;
+    int32_t basicHeartbeatTaskState = -1;
+    int32_t statusTaskState = -1;
+    int32_t intentTaskState = -1;
+
+    if (rttaskProbe_->incrementTask.has_value())
+    {
+        const RT::RTTaskStatus taskStatus = rttaskProbe_->incrementTask->StatusGet();
+        incrementExecutionCount = taskStatus.ExecutionCount;
+        incrementTaskState = static_cast<int32_t>(taskStatus.State);
+    }
+    if (rttaskProbe_->basicHeartbeatTask.has_value())
+    {
+        const RT::RTTaskStatus taskStatus = rttaskProbe_->basicHeartbeatTask->StatusGet();
+        basicHeartbeatExecutionCount = taskStatus.ExecutionCount;
+        basicHeartbeatTaskState = static_cast<int32_t>(taskStatus.State);
+    }
+    if (rttaskProbe_->statusTask.has_value())
+    {
+        const RT::RTTaskStatus taskStatus = rttaskProbe_->statusTask->StatusGet();
+        statusExecutionCount = taskStatus.ExecutionCount;
+        statusTaskState = static_cast<int32_t>(taskStatus.State);
+    }
+    if (rttaskProbe_->intentTask.has_value())
+    {
+        const RT::RTTaskStatus taskStatus = rttaskProbe_->intentTask->StatusGet();
+        intentExecutionCount = taskStatus.ExecutionCount;
+        intentTaskState = static_cast<int32_t>(taskStatus.State);
+    }
+
+    std::ostringstream json;
+    json << "{\"type\":\"session_rttask_probe_status\","
+         << "\"state\":\"armed_idle\","
+         << "\"armed\":true,"
+         << "\"rttaskProbeRunning\":true,"
+         << "\"managerPlatform\":\"" << escapeRtTaskJsonText(rttaskProbe_->managerPlatform) << "\","
+         << "\"rttaskDirectory\":\"" << escapeRtTaskJsonText(rttaskProbe_->rttaskDirectory) << "\","
+         << "\"libraryDirectory\":\"" << escapeRtTaskJsonText(rttaskProbe_->libraryDirectory) << "\","
+         << "\"counter\":" << counter << ','
+         << "\"basicHeartbeat\":" << basicHeartbeat << ','
+         << "\"heartbeat\":" << heartbeat << ','
+         << "\"initializationCount\":" << initializationCount << ','
+         << "\"incrementExecutionCount\":" << incrementExecutionCount << ','
+         << "\"basicHeartbeatExecutionCount\":" << basicHeartbeatExecutionCount << ','
+         << "\"statusExecutionCount\":" << statusExecutionCount << ','
+         << "\"intentExecutionCount\":" << intentExecutionCount << ','
+         << "\"incrementTaskState\":" << incrementTaskState << ','
+         << "\"basicHeartbeatTaskState\":" << basicHeartbeatTaskState << ','
+         << "\"statusTaskState\":" << statusTaskState << ','
+         << "\"intentTaskState\":" << intentTaskState << ','
+         << "\"lastSampleCounter\":" << lastSampleCounter << ','
+         << "\"lastNetworkCounter\":" << lastNetworkCounter << ','
+         << "\"samplePeriodSeconds\":" << std::fixed << std::setprecision(6) << samplePeriodSeconds << ','
+         << "\"axis2CommandPosition\":" << axis2CommandPosition << ','
+         << "\"axis2ActualPosition\":" << axis2ActualPosition << ','
+         << "\"jogIntentTransitions\":" << jogIntentTransitions << ','
+         << "\"taskErrorCount\":" << taskErrorCount << ','
+         << "\"message\":\"Racer3 RTTask probe is running. This is no-motion heartbeat/status only.\"}";
+    return json.str();
+}
+
+void Racer3BasicMotion::stopArmedSessionRtTaskProbe() noexcept
+{
+    if (!rttaskProbe_ || !rttaskProbe_->running)
+    {
+        return;
+    }
+
+    std::cout << "Stopping Racer3 RTTask probe. No motion commands are issued.\n";
+
+    try
+    {
+        if (rttaskProbe_->intentTask.has_value())
+        {
+            rttaskProbe_->intentTask->Stop();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Warning: stopping Racer3JogIntentMonitor RTTask failed: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Warning: stopping Racer3JogIntentMonitor RTTask failed with unknown exception.\n";
+    }
+
+    try
+    {
+        if (rttaskProbe_->statusTask.has_value())
+        {
+            rttaskProbe_->statusTask->Stop();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Warning: stopping Racer3StatusSampler RTTask failed: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Warning: stopping Racer3StatusSampler RTTask failed with unknown exception.\n";
+    }
+
+    try
+    {
+        if (rttaskProbe_->incrementTask.has_value())
+        {
+            rttaskProbe_->incrementTask->Stop();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Warning: stopping Increment RTTask failed: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Warning: stopping Increment RTTask failed with unknown exception.\n";
+    }
+
+    try
+    {
+        if (rttaskProbe_->basicHeartbeatTask.has_value())
+        {
+            rttaskProbe_->basicHeartbeatTask->Stop();
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cout << "  Warning: stopping Racer3BasicHeartbeat RTTask failed: " << error.what() << "\n";
+    }
+    catch (...)
+    {
+        std::cout << "  Warning: stopping Racer3BasicHeartbeat RTTask failed with unknown exception.\n";
+    }
+
+    rttaskProbe_->intentTask.reset();
+    rttaskProbe_->statusTask.reset();
+    rttaskProbe_->basicHeartbeatTask.reset();
+    rttaskProbe_->incrementTask.reset();
+    rttaskProbe_->manager.reset();
+    rttaskProbe_->running = false;
+}
+
 void Racer3BasicMotion::shutdownArmedSession() noexcept
 {
     std::cout << "Shutting down persistent armed session. Disabling amps and clearing faults.\n";
+
+    stopArmedSessionRtTaskProbe();
 
     try
     {
         if (multiAxis_)
         {
+            if (armedSessionCartesianJogActive_.load() || armedSessionCartesianJogThread_.joinable())
+            {
+                try
+                {
+                    stopArmedSessionCartesianJog("persistent armed session shutdown");
+                }
+                catch (const RR::RsiError& error)
+                {
+                    std::cout << "  Cartesian jog stop during shutdown threw RapidCode error: "
+                              << error.text
+                              << " ("
+                              << error.functionName
+                              << ")\n";
+                }
+                catch (const std::exception& error)
+                {
+                    std::cout << "  Cartesian jog stop during shutdown threw exception: "
+                              << error.what()
+                              << "\n";
+                }
+            }
+
             if (armedSessionAxis6VelocityJogActive_)
             {
                 try
@@ -3631,9 +6504,122 @@ void Racer3BasicMotion::clearFaultsAfterCompletedMotion(const char* context) noe
     std::cout << "Post-motion fault clear complete"
               << (warning ? " with warnings.\n" : ".\n");
 }
+
+void Racer3BasicMotion::prepareAxisForBottomToTopAmpEnable(int axisIndex)
+{
+    if (axisIndex < 0 || axisIndex >= AxisCount || !axes_[axisIndex])
+    {
+        throw std::runtime_error("Axis is not initialized for bottom-to-top pre-enable preparation.");
+    }
+
+    auto* axis = axes_[axisIndex];
+    const int operatorAxis = axisIndex + 1;
+    const std::string axisLabel = "Axis " + std::to_string(operatorAxis);
+
+    std::cout << "  Preparing " << axisLabel
+              << " before bottom-to-top amp enable: clear faults, align software position,"
+              << " relax Home/ErrorLimit actions, and set/check position-error threshold.\n";
+
+    try
+    {
+        axis->MotionAttributeMaskDefaultSet();
+        axis->MotionDelaySet(0.0);
+        axis->FeedRateSet(1.0);
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Warning: " << axisLabel
+                  << " motion attribute reset before amp enable threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Continuing with pre-enable sequence.\n";
+    }
+
+    try
+    {
+        axis->HomeActionSet(RR::RSIAction::RSIActionNONE);
+        std::cout << "    " << axisLabel
+                  << " HomeActionSet(RSIActionNONE) applied for startup enable.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Warning: " << axisLabel
+                  << " HomeActionSet(NONE) before amp enable threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Continuing so the explicit enable result remains visible.\n";
+    }
+
+    try
+    {
+        axis->ErrorLimitActionSet(RR::RSIAction::RSIActionNONE);
+        std::cout << "    " << axisLabel
+                  << " ErrorLimitActionSet(RSIActionNONE) applied for startup enable.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Warning: " << axisLabel
+                  << " ErrorLimitActionSet(NONE) before amp enable threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Continuing so the explicit enable result remains visible.\n";
+    }
+
+    try
+    {
+        const double actualPosition = axis->ActualPositionGet();
+        axis->PositionSet(actualPosition);
+        std::cout << "    " << axisLabel
+                  << " software command position aligned to current actual position: "
+                  << actualPosition
+                  << ".\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Warning: " << axisLabel
+                  << " PositionSet(ActualPositionGet()) before amp enable threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Continuing so the explicit enable result remains visible.\n";
+    }
+
+    try
+    {
+        // Keep this C++17-compatible: RapidCode headers across RMP releases do
+        // not expose a consistently named position-error-limit setter. Apply
+        // the manual pre-arm value as the software tolerance window while
+        // ErrorLimitAction is relaxed during startup enable.
+        axis->PositionToleranceFineSet(BottomToTopPreEnablePositionErrorLimitUserUnits);
+        axis->PositionToleranceCoarseSet(BottomToTopPreEnablePositionErrorLimitUserUnits);
+        std::cout << "    " << axisLabel
+                  << " PositionToleranceFine/Coarse set to "
+                  << BottomToTopPreEnablePositionErrorLimitUserUnits
+                  << " user units for startup pre-arm.\n";
+    }
+    catch (const RR::RsiError& error)
+    {
+        std::cout << "    Warning: " << axisLabel
+                  << " position-error/tolerance pre-arm setup threw RapidCode error: "
+                  << error.text
+                  << " ("
+                  << error.functionName
+                  << "). Continuing so the explicit enable result remains visible.\n";
+    }
+
+    axis->ClearFaults();
+    std::this_thread::sleep_for(std::chrono::milliseconds(BottomToTopPreEnableSettleMs));
+}
+
 void Racer3BasicMotion::enableAmplifiers()
 {
     std::cout << "Enabling amplifiers bottom-to-top through individual Axis 1..6 objects, then verifying MultiAxis 6...\n";
+    std::cout << "Each axis is pre-armed before enable: ClearFaults, HomeAction NONE,"
+              << " ErrorLimitAction NONE, software position aligned to actual position,"
+              << " and a 0.05 user-unit position-error/tolerance setup when supported.\n";
 
     if (!multiAxis_)
     {
@@ -3666,8 +6652,7 @@ void Racer3BasicMotion::enableAmplifiers()
 
         try
         {
-            axes_[index]->ClearFaults();
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            prepareAxisForBottomToTopAmpEnable(index);
 
             const int result = axes_[index]->AmpEnableSet(
                 true,
@@ -7583,6 +10568,9 @@ void Racer3BasicMotion::waitForAxis6MotionDone(int timeoutMilliseconds)
 
 void Racer3BasicMotion::safeShutdown() noexcept
 {
+    stopArmedSessionRtTaskProbe();
+    joinArmedSessionCartesianJogThread();
+
     try
     {
         if (controller_)
@@ -7625,6 +10613,10 @@ void Racer3BasicMotion::safeShutdown() noexcept
         // Best effort cleanup; do not throw from destructor.
     }
 }
+
+
+
+
 
 
 

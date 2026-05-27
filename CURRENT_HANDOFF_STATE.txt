@@ -1,0 +1,74 @@
+Racer3 current handoff state
+Updated: 2026-05-27
+
+Current best working baseline:
+- Backend-owned keyboard Cartesian jog in src/Racer3BasicMotion.cpp.
+- A/D = direct base rotate / aim robot base.
+- W/S = X reach/retract in the current base-facing vertical plane.
+- R/F = Z up/down.
+- I/K, J/L, U/O = wrist/tool orientation controls.
+- H = return to the run-start joint pose while keeping jog mode alive.
+- Q/Esc = exit, disable amps, clear faults.
+
+Do not regress:
+- W/S locks J1/J4/J6.
+- W/S allows J5 as a pitch/orientation compensator.
+- R/F vertical jog allows J5.
+- Stronger X Z-lock remains active.
+- End effector orientation stays stable during X reach.
+- Release-stop sends a clean zero MoveVelocitySCurve command and keeps amps enabled.
+- H-home returns to the run-start joint pose and leaves jog mode alive.
+
+Known good run command:
+
+cd C:\Users\JP\racer3-rmp-basic-motion
+
+Write-Host "`n== Stop old Racer/RMP/RapidServer processes =="
+Get-Process racer3-basic-motion,rapidserver,rsiconfig,RMPNetwork,RMP,rttaskmanager -ErrorAction SilentlyContinue |
+  Stop-Process -Force -ErrorAction SilentlyContinue
+
+Start-Sleep -Seconds 3
+
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
+
+Write-Host "`n== Start RMP with rsiconfig =="
+cd .\config
+& C:\RSI\11.0.5\rsiconfig.exe .\racer3-settings.xml --verbose
+if ($LASTEXITCODE -ne 0) {
+  throw "rsiconfig failed with exit code $LASTEXITCODE"
+}
+cd ..
+
+Write-Host "`n== Wait for RMP shared memory to settle =="
+Start-Sleep -Seconds 8
+
+Write-Host "`n== Start current validated jog test =="
+.\build-vs2022\Release\racer3-basic-motion.exe `
+  --keyboard-cartesian-jog-endpoint-only `
+  --cartesian-jog-linear-speed 0.024 `
+  --keyboard-base-rotate-speed 0.026 `
+  --cartesian-jog-angular-speed 0.10 `
+  --cartesian-jog-gain-x 6.5 `
+  --cartesian-jog-gain-y 0.80 `
+  --cartesian-jog-gain-z 0.85 `
+  --cartesian-jog-max-joint-velocity 0.060 `
+  --keyboard-startup-delay-seconds 15 `
+  --confirm-keyboard-cartesian-jog
+
+Write-Host "`nJog process exited with code: $LASTEXITCODE"
+
+Current smoke sequence:
+1. F short hold, release.
+2. L or J short hold to point tool.
+3. W 0.3 sec, release.
+4. S 0.3 sec, release.
+5. W 0.6 sec, release.
+6. S 0.6 sec, release.
+7. H.
+8. Q.
+
+Cleanup state:
+- Root session logs moved to archive/logs/.
+- config/rttaskapi.log moved to archive/logs/config/.
+- Old src/*.bak-* snapshots moved to archive/old-backups/.
+- docs/current-keyboard-jog.md is the detailed jog-mode reference.

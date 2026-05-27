@@ -78,10 +78,10 @@ if ($Mode -eq "cartesian-vector" -or $Mode -eq "cartesian-trace") { Write-Host "
 Write-Host "Diag:      $Diagnostics"
 Write-Host "Dry run:   $DryRun"
 
-$env:PATH = "C:\RSI\11.0.0;$env:PATH"
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
 
 if (-not (Get-Command rsiconfig -ErrorAction SilentlyContinue)) {
-    throw "rsiconfig.exe was not found. Confirm C:\RSI\11.0.0 is installed and on PATH."
+    throw "rsiconfig.exe was not found. Confirm C:\RSI\11.0.5 is installed and on PATH."
 }
 
 if ($Build) {

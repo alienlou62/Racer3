@@ -3,7 +3,7 @@
   "launcherScript": ".\\scripts\\start-racer3-rmp-and-run.ps1",
   "powerShellPath": "powershell",
   "sessionExecutablePath": ".\\build-vs2022\\Release\\racer3-basic-motion.exe",
-  "rsiRuntimePath": "C:\\RSI\\11.0.0",
+  "rsiRuntimePath": "C:\\RSI\\11.0.5",
   "sessionRunRsiconfig": true,
   "sessionReadyTimeoutSeconds": 90,
   "sessionMotionTimeoutSeconds": 120,

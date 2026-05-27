@@ -1,0 +1,57 @@
+<!--
+  Experimental Racer3 RTTask manager fragment.
+
+  This is a reference fragment only. Do not replace config/racer3-settings.xml
+  with this file. The current stable startup path still uses rsiconfig once and
+  the persistent C++ session to configure the network, clear the startup home
+  fault, and enable amps.
+
+  When the RTTask bridge is ready, copy this RTTaskManagers block into a cloned
+  settings XML and point LibraryDirectory/RTTaskDirectory at the folder that
+  contains RTTaskFunctions.rsl/dll. The laser-style Windows RTTask path should use an INtime .rsl with Platform=INtime and NodeName=NodeA.
+-->
+<RTTaskManagers>
+  <RTTaskManager>
+    <RTTaskDirectory>C:\RSI\11.0.5</RTTaskDirectory>
+    <Platform>INtime</Platform>
+    <NodeName>NodeA</NodeName>
+    <CpuCore>2</CpuCore>
+    <UserLabel>Racer3Jog</UserLabel>
+    <NoRmp>false</NoRmp>
+    <RTTasks>
+      <RTTask>
+        <FunctionName>Racer3Initialize</FunctionName>
+        <LibraryName>RTTaskFunctions</LibraryName>
+        <LibraryDirectory />
+        <UserLabel>Racer3Initialize</UserLabel>
+        <Priority>Lowest</Priority>
+        <Repeats>0</Repeats>
+        <Period>1</Period>
+        <Phase>0</Phase>
+        <EnableTiming>true</EnableTiming>
+      </RTTask>
+      <RTTask>
+        <FunctionName>Racer3StatusSampler</FunctionName>
+        <LibraryName>RTTaskFunctions</LibraryName>
+        <LibraryDirectory />
+        <UserLabel>Racer3StatusSampler</UserLabel>
+        <Priority>High</Priority>
+        <Repeats>-1</Repeats>
+        <Period>5</Period>
+        <Phase>0</Phase>
+        <EnableTiming>true</EnableTiming>
+      </RTTask>
+      <RTTask>
+        <FunctionName>Racer3JogIntentMonitor</FunctionName>
+        <LibraryName>RTTaskFunctions</LibraryName>
+        <LibraryDirectory />
+        <UserLabel>Racer3JogIntentMonitor</UserLabel>
+        <Priority>Highest</Priority>
+        <Repeats>-1</Repeats>
+        <Period>1</Period>
+        <Phase>0</Phase>
+        <EnableTiming>true</EnableTiming>
+      </RTTask>
+    </RTTasks>
+  </RTTaskManager>
+</RTTaskManagers>

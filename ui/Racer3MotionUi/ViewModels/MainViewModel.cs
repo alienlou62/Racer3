@@ -62,7 +62,10 @@ public sealed class MainViewModel : ObservableObject
     private bool _returnToZeroAfterCommand;
     private bool _isJogModeEnabled;
     private double _jogStepMeters = 0.005;
-    private double _jogVelocity = 0.025;
+    private double _jogVelocity = 0.003;
+    private bool _isBackendJogActive;
+    private string _activeJogDirection = string.Empty;
+    private readonly SemaphoreSlim _jogCommandSemaphore = new(1, 1);
 
     public MainViewModel(
         IShapePathPlanner shapePathPlanner,
@@ -118,6 +121,8 @@ public sealed class MainViewModel : ObservableObject
     public IAsyncRelayCommand StopSessionMotionCommand { get; }
 
     public IAsyncRelayCommand RunSessionShapeCommand { get; }
+
+    public bool CanUseBackendJogControls => IsJogModeEnabled && _robotSessionService.IsRunning && !IsProcessActive;
 
     public string Title => "Racer3 Shape Trace Demo";
 
@@ -223,6 +228,7 @@ public sealed class MainViewModel : ObservableObject
                 }
 
                 OnPropertyChanged(nameof(IsConfirmMotionEnabled));
+                OnPropertyChanged(nameof(CanUseBackendJogControls));
                 RefreshModeState();
                 RefreshPlanAndPreview();
             }
@@ -253,6 +259,7 @@ public sealed class MainViewModel : ObservableObject
             if (SetProperty(ref _isProcessActive, value))
             {
                 OnPropertyChanged(nameof(IsConfirmMotionEnabled));
+                OnPropertyChanged(nameof(CanUseBackendJogControls));
                 if (IsProcessActive && ConfirmMotion)
                 {
                     ConfirmMotion = false;
@@ -383,7 +390,18 @@ public sealed class MainViewModel : ObservableObject
     public bool IsJogModeEnabled
     {
         get => _isJogModeEnabled;
-        set => SetProperty(ref _isJogModeEnabled, value);
+        set
+        {
+            if (SetProperty(ref _isJogModeEnabled, value))
+            {
+                OnPropertyChanged(nameof(CanUseBackendJogControls));
+
+                if (!value && IsBackendJogActive)
+                {
+                    _ = StopBackendCartesianJogAsync("jog mode disabled");
+                }
+            }
+        }
     }
 
     public double JogStepMeters
@@ -395,7 +413,26 @@ public sealed class MainViewModel : ObservableObject
     public double JogVelocity
     {
         get => _jogVelocity;
-        set => SetProperty(ref _jogVelocity, Math.Clamp(value, 0.005, 0.05));
+        set => SetProperty(ref _jogVelocity, Math.Clamp(value, 0.0001, 0.004));
+    }
+
+    public bool IsBackendJogActive
+    {
+        get => _isBackendJogActive;
+        private set
+        {
+            if (SetProperty(ref _isBackendJogActive, value))
+            {
+                OnPropertyChanged(nameof(CanUseBackendJogControls));
+                RunSessionShapeCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
+
+    public string ActiveJogDirection
+    {
+        get => _activeJogDirection;
+        private set => SetProperty(ref _activeJogDirection, value);
     }
 
     private void SelectShape(string? shapeName)
@@ -671,6 +708,7 @@ public sealed class MainViewModel : ObservableObject
     {
         return !IsProcessActive &&
                _robotSessionService.IsRunning &&
+               !IsBackendJogActive &&
                !IsDryRun &&
                ConfirmMotion &&
                Velocity > 0.0 &&
@@ -741,14 +779,14 @@ public sealed class MainViewModel : ObservableObject
     private async Task StartArmedSessionAsync()
     {
         RobotSessionStatus = "Starting armed session...";
-        AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, enables amps once, and can run validated session traces.");
+        AppendLog("ui", "Start Armed Session requested. This phase runs rsiconfig once, starts the persistent C++ session, connects RMP, enables amps once, and can run validated session traces and backend-owned Cartesian jog commands.");
 
         try
         {
             var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
             await _robotSessionService.StartAsync(progress, CancellationToken.None);
             RobotSessionStatus = "Armed session ready - amps enabled";
-            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; backend Axis 6 velocity jog proof commands are available through the session protocol.");
+            AppendLog("ui", "Persistent armed session is ready. Amps remain enabled until Shutdown Session. Session trace commands are available; backend-owned Cartesian Z- jog is available through UI hold controls when Jog Mode is enabled.");
         }
         catch (Exception exception)
         {
@@ -761,6 +799,7 @@ public sealed class MainViewModel : ObservableObject
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
             RunSessionShapeCommand.NotifyCanExecuteChanged();
+            OnPropertyChanged(nameof(CanUseBackendJogControls));
         }
     }
 
@@ -773,6 +812,8 @@ public sealed class MainViewModel : ObservableObject
         {
             await _robotSessionService.ShutdownAsync(CancellationToken.None);
             RobotSessionStatus = "Not connected - armed session stopped.";
+            IsBackendJogActive = false;
+            ActiveJogDirection = string.Empty;
             AppendLog("ui", "Persistent session process shutdown complete.");
         }
         catch (Exception exception)
@@ -786,7 +827,122 @@ public sealed class MainViewModel : ObservableObject
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
             RunSessionShapeCommand.NotifyCanExecuteChanged();
+            OnPropertyChanged(nameof(CanUseBackendJogControls));
         }
+    }
+
+    public async Task StartBackendCartesianJogAsync(string direction, string reason)
+    {
+        var normalizedDirection = NormalizeJogDirection(direction);
+        if (normalizedDirection != "Z-")
+        {
+            AppendLog("ui", $"Backend Cartesian jog direction '{direction}' is not wired in the UI yet. Z- is the first validated direction.");
+            return;
+        }
+
+        if (!CanUseBackendJogControls)
+        {
+            AppendLog("ui", "Backend Cartesian jog start rejected by UI. Start Armed Session first and enable Jog Mode. No motion command was sent.");
+            return;
+        }
+
+        await _jogCommandSemaphore.WaitAsync();
+        try
+        {
+            if (IsBackendJogActive)
+            {
+                if (string.Equals(ActiveJogDirection, normalizedDirection, StringComparison.OrdinalIgnoreCase))
+                {
+                    AppendLog("ui", $"Ignoring duplicate jog start for {normalizedDirection}; backend jog is already active.");
+                    return;
+                }
+
+                AppendLog("ui", $"New jog direction {normalizedDirection} requested while {ActiveJogDirection} is active. Stopping active jog first.");
+                await _robotSessionService.StopCartesianJogAsync("new jog direction requested", CancellationToken.None);
+                IsBackendJogActive = false;
+                ActiveJogDirection = string.Empty;
+            }
+
+            var speed = Math.Clamp(JogVelocity, 0.0001, 0.004);
+            AppendLog("ui", $"UI backend jog start requested direction={normalizedDirection} speed={speed.ToString("0.######", CultureInfo.InvariantCulture)} reason={reason}. One start command only; backend owns endpoint-only PVT jog loop. v14 disables the unsafe rolling APPEND experiment and uses stable 500 ms non-append PVT smoothing spans.");
+            RobotSessionStatus = $"Backend Cartesian jog {normalizedDirection} starting...";
+            LastRunStatus = "Jog starting";
+            LastRunDetail = $"Backend-owned endpoint-only Cartesian {normalizedDirection} jog requested at {speed.ToString("0.######", CultureInfo.InvariantCulture)} m/s. Default UI validation speed is 0.003 m/s; 0.004 m/s is the current guarded max.";
+
+            await _robotSessionService.StartCartesianJogAsync(normalizedDirection, speed, CancellationToken.None);
+
+            ActiveJogDirection = normalizedDirection;
+            IsBackendJogActive = true;
+            RobotSessionStatus = $"Backend Cartesian jog {normalizedDirection} active";
+            LastRunStatus = "Jog running";
+            LastRunDetail = $"Hold is active for backend-owned Cartesian {normalizedDirection}. Release, Space, Escape, or lost focus sends one jog stop.";
+        }
+        catch (Exception exception)
+        {
+            AppendLog("err", $"Backend Cartesian jog start failed: {exception.Message}");
+            RobotSessionStatus = "Backend Cartesian jog start failed";
+            LastRunStatus = "Jog start failed";
+            LastRunDetail = exception.Message;
+            IsBackendJogActive = false;
+            ActiveJogDirection = string.Empty;
+        }
+        finally
+        {
+            _jogCommandSemaphore.Release();
+        }
+    }
+
+    public async Task StopBackendCartesianJogAsync(string reason)
+    {
+        await _jogCommandSemaphore.WaitAsync();
+        try
+        {
+            if (!IsBackendJogActive)
+            {
+                return;
+            }
+
+            var stoppedDirection = ActiveJogDirection;
+            AppendLog("ui", $"UI backend jog stop requested reason={reason} activeDirection={stoppedDirection}. One stop command only; backend should decelerate/settle and keep amps enabled.");
+            RobotSessionStatus = $"Stopping backend Cartesian jog {stoppedDirection}...";
+            LastRunStatus = "Jog stopping";
+
+            await _robotSessionService.StopCartesianJogAsync(reason, CancellationToken.None);
+
+            IsBackendJogActive = false;
+            ActiveJogDirection = string.Empty;
+            RobotSessionStatus = "Armed session ready - amps should remain enabled after jog";
+            LastRunStatus = "Jog stopped";
+            LastRunDetail = $"Backend-owned Cartesian jog stopped by {reason}. Requesting status so logs show amp state.";
+
+            await _robotSessionService.RequestStatusAsync(CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            AppendLog("err", $"Backend Cartesian jog stop failed: {exception.Message}");
+            RobotSessionStatus = "Backend Cartesian jog stop failed";
+            LastRunStatus = "Jog stop failed";
+            LastRunDetail = exception.Message;
+        }
+        finally
+        {
+            _jogCommandSemaphore.Release();
+        }
+    }
+
+    private static string NormalizeJogDirection(string direction)
+    {
+        var normalized = direction.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            "Z-" or "-Z" or "NEGATIVE_Z" or "ZNEGATIVE" => "Z-",
+            "Z+" or "+Z" or "POSITIVE_Z" or "ZPOSITIVE" => "Z+",
+            "X+" or "+X" or "POSITIVE_X" or "XPOSITIVE" => "X+",
+            "X-" or "-X" or "NEGATIVE_X" or "XNEGATIVE" => "X-",
+            "Y+" or "+Y" or "POSITIVE_Y" or "YPOSITIVE" => "Y+",
+            "Y-" or "-Y" or "NEGATIVE_Y" or "YNEGATIVE" => "Y-",
+            _ => normalized
+        };
     }
 
     private async Task StopSessionMotionAsync()
@@ -809,6 +965,7 @@ public sealed class MainViewModel : ObservableObject
             ShutdownSessionCommand.NotifyCanExecuteChanged();
             StopSessionMotionCommand.NotifyCanExecuteChanged();
             RunSessionShapeCommand.NotifyCanExecuteChanged();
+            OnPropertyChanged(nameof(CanUseBackendJogControls));
         }
     }
 

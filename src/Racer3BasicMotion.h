@@ -1,6 +1,12 @@
-﻿#pragma once
+#pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace RSI
@@ -13,6 +19,8 @@ class MultiAxis;
 class RapidCodeMotion;
 }
 }
+
+struct Racer3RtTaskProbeState;
 
 struct Racer3RunOptions
 {
@@ -57,12 +65,35 @@ public:
     void stopArmedSessionMotion();
     void startArmedSessionAxis6VelocityJog(double velocityUserUnitsPerSecond);
     void stopArmedSessionAxis6VelocityJog(const char* reason);
+    void startArmedSessionCartesianJog(const std::array<double, AxisCount>& direction, double speedMetersPerSecond);
+    void stopArmedSessionCartesianJog(const char* reason);
+    bool areArmedSessionAmpsEnabled() const noexcept;
+    void startArmedSessionRtTaskProbe(const std::string& libraryDirectory, const std::string& rttaskDirectory, const std::string& managerPlatform, int statusPeriodMilliseconds, int intentPeriodMilliseconds);
+    std::string getArmedSessionRtTaskProbeStatusJson();
+    void stopArmedSessionRtTaskProbe() noexcept;
     void printArmedSessionPositionSnapshot(const char* label);
     void runArmedSessionTrace(
         const std::vector<std::array<double, AxisCount>>& waypoints,
         double velocityUserUnitsPerSecond,
         bool returnToZero);
     void shutdownArmedSession() noexcept;
+    void runEndpointOnlyKeyboardJog(
+        int operatorAxis,
+        double velocityUserUnitsPerSecond,
+        double loopPeriodSeconds,
+        bool motionConfirmed,
+        bool diagnostics);
+    void runEndpointOnlyCartesianKeyboardJog(
+        double linearSpeedMetersPerSecond,
+        double angularSpeedRadiansPerSecond,
+        double loopPeriodSeconds,
+        bool motionConfirmed,
+        bool diagnostics,
+        double gainX,
+        double gainY,
+        double gainZ,
+        double maxJointVelocityUserUnitsPerSecond,
+        double baseRotateVelocityUserUnitsPerSecond);
 
 private:
     void connectController();
@@ -77,6 +108,7 @@ private:
     void isolateAllAxesForAllMotion();
     void clearFaults();
     void clearFaultsAfterCompletedMotion(const char* context) noexcept;
+    void prepareAxisForBottomToTopAmpEnable(int axisIndex);
     void enableAmplifiers();
     void enableOnlyTest();
     void runTinyMotion();
@@ -108,6 +140,11 @@ private:
     void disableAmplifiers();
     void waitForMotionDone(int timeoutMilliseconds);
     void waitForAxis6MotionDone(int timeoutMilliseconds);
+    void runArmedSessionCartesianJogLoop(std::array<double, AxisCount> direction, double speedMetersPerSecond) noexcept;
+    void joinArmedSessionCartesianJogThread() noexcept;
+    void prepareArmedSessionCartesianJogErrorLimitActions();
+    void restoreArmedSessionCartesianJogErrorLimitActions(const char* context) noexcept;
+    void ensureRtTaskProbeState();
     void safeShutdown() noexcept;
 
     RSI::RapidCode::MotionController* controller_;
@@ -115,6 +152,18 @@ private:
     std::array<RSI::RapidCode::Axis*, AxisCount> axes_;
     bool armedSessionAxis6VelocityJogActive_;
     double armedSessionAxis6VelocityJogCommandUserUnitsPerSecond_;
+    std::atomic<bool> armedSessionCartesianJogActive_;
+    std::atomic<bool> armedSessionCartesianJogStopRequested_;
+    double armedSessionCartesianJogSpeedMetersPerSecond_;
+    std::array<double, AxisCount> armedSessionCartesianJogDirection_;
+    std::array<double, AxisCount> armedSessionCartesianJogJointVelocityUserUnitsPerSecond_;
+    std::thread armedSessionCartesianJogThread_;
+    std::mutex armedSessionCartesianJogMutex_;
+    std::condition_variable armedSessionCartesianJogStopCv_;
+    std::string armedSessionCartesianJogLastError_;
+    std::array<int, AxisCount> armedSessionCartesianJogOriginalErrorLimitActions_;
+    bool armedSessionCartesianJogErrorLimitActionsChanged_;
+    std::unique_ptr<Racer3RtTaskProbeState> rttaskProbe_;
 };
 
 

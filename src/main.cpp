@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <iostream>
 #include <rsi.h>
 #include <stdexcept>
@@ -22,9 +24,15 @@ constexpr double DefaultReturnWarnToleranceUserUnits = 0.00025;
 constexpr double DefaultReturnFailToleranceUserUnits = 0.00100;
 constexpr double DefaultAxis6JogVelocityUserUnitsPerSecond = 0.005;
 constexpr double MaxAxis6JogVelocityUserUnitsPerSecond = 0.010;
+constexpr double DefaultCartesianJogSpeedMetersPerSecond = 0.003;
+constexpr double MaxCartesianJogSpeedMetersPerSecond = 0.004;
 constexpr double MaxRecommendedStepUserUnits = 0.25;
 constexpr int AxisCount = 6;
 constexpr double MaxRecommendedJointVectorUserUnits = 0.25;
+constexpr double DefaultKeyboardJogVelocityUserUnitsPerSecond = 0.002;
+constexpr double DefaultKeyboardJogLoopPeriodMilliseconds = 20.0;
+constexpr double DefaultCartesianKeyboardJogSpeedMetersPerSecond = 0.003;
+constexpr double DefaultCartesianKeyboardJogAngularSpeedRadiansPerSecond = 0.15;
 
 void printUsage()
 {
@@ -42,7 +50,10 @@ void printUsage()
         << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
         << "  racer3-basic-motion --cartesian-vector [--position-only] [--compact-motion] [--trajectory-motion] [--endpoint-only] [--segment-goal] [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
         << "  racer3-basic-motion --cartesian-trace --position-only --endpoint-only [--compact-motion] [--confirm-motion] --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\" [--velocity 0.02] [--diagnostics]\n"
-        << "  racer3-basic-motion --session-server\n\n"
+        << "  racer3-basic-motion --session-server\n"
+        << "  racer3-basic-motion --prearm-hold [--velocity 0.002] [--diagnostics]\n"
+        << "  racer3-basic-motion --keyboard-jog-endpoint-only --jog-axis 6 [--velocity 0.002] [--confirm-keyboard-jog] [--diagnostics]\n"
+        << "  racer3-basic-motion --keyboard-cartesian-jog-endpoint-only [--cartesian-jog-linear-speed 0.006] [--keyboard-base-rotate-speed 0.015] [--cartesian-jog-gain-x 1.0] [--cartesian-jog-gain-z 0.65] [--cartesian-jog-max-joint-velocity 0.030] [--confirm-keyboard-cartesian-jog] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -55,7 +66,10 @@ void printUsage()
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
-        << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, trace, and backend-owned Axis 6 velocity jog commands.\n"
+        << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, trace, backend-owned Axis 6 velocity diagnostics, backend-owned Cartesian X+/Z- jog commands, and no-motion RTTask probe commands.\n"
+        << "  --prearm-hold Start the same bottom-to-top all-axis pre-arm/enable path, print prearm_ready, hold amps enabled, and wait for shutdown on stdin. Used by RTTask jog proof.\n"
+        << "  --keyboard-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ keyboard loop for endpoint-only Axis 6/J6 jog pulses.\n"
+        << "  --keyboard-cartesian-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ operator-friendly keyboard loop: W/S endpoint X, R/F endpoint Z, A/D direct base rotate, H home, Q/Esc exit.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -63,6 +77,18 @@ void printUsage()
         << "  --endpoint-only  Experimental: solve one final XYZ target and run smooth joint-space PVT. Not a straight Cartesian TCP path.\n"
         << "  --segment-goal  Experimental: use segmented IK only to find final goal, then run smooth joint-space PVT.\n"
         << "  --confirm-motion   Required safety acknowledgement for any real motion.\n"
+        << "  --confirm-keyboard-jog Required before --keyboard-jog-endpoint-only will issue jog pulses. Without it, keys are observed but motion is blocked.\n"
+        << "  --confirm-keyboard-cartesian-jog Required before --keyboard-cartesian-jog-endpoint-only will issue Cartesian jog spans. Without it, keys are observed but motion is blocked.\n"
+        << "  --jog-axis <1-6> Operator-facing axis for --keyboard-jog-endpoint-only. First implementation supports Axis 6/J6 only.\n"
+        << "  --cartesian-jog-speed <value> Backward-compatible scalar for both linear and angular Cartesian keyboard jog speeds. Default 0.003.\n"
+        << "  --cartesian-jog-linear-speed <value> Endpoint keyboard jog linear speed in meters/sec for X/Z. Overrides --cartesian-jog-speed for X/Z. Default 0.003.\n"
+        << "  --cartesian-jog-angular-speed <value> Cartesian keyboard jog angular speed in radians/sec for roll/pitch/yaw. Overrides --cartesian-jog-speed for RPY. Default 0.10.\n"
+        << "  --cartesian-jog-gain-x <value> Multiplier for X jog target speed. Default 1.0.\n"
+        << "  --cartesian-jog-gain-y <value> Legacy/unused for operator-friendly keyboard mode; A/D now use direct base rotate. Default 1.25.\n"
+        << "  --keyboard-base-rotate-speed <value> Direct J1/base rotate speed for A/D in user-units/sec. Default 0.015.\n"
+        << "  --cartesian-jog-gain-z <value> Multiplier for Z jog target speed. Default 0.65.\n"
+        << "  --cartesian-jog-max-joint-velocity <value> Max absolute joint velocity for Cartesian keyboard jog in user-units/sec. Default 0.030.\n"
+        << "  --keyboard-jog-period-ms <value> Pulse loop period for endpoint-only keyboard jog. Default 20 ms.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
         << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
         << "  --joints <list>    Six comma-separated user-unit deltas for --joint-vector, e.g. 0,0,0,0,0.005,0.005.\n"
@@ -440,7 +466,7 @@ int runSessionServer()
     try
     {
         sessionMotion.startArmedSession(DefaultVelocityUserUnitsPerSecond, false);
-        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands and backend Axis 6 velocity jog proof commands are available.\"}");
+        writeSessionEvent("{\"type\":\"session_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session ready. Amps are enabled and will stay enabled until Shutdown Session. Trace commands, backend Axis 6 velocity jog proof commands, backend-owned Cartesian X+/Z- jog-loop commands, and no-motion RTTask probe commands are available.\"}");
     }
     catch (const RR::RsiError& error)
     {
@@ -479,10 +505,184 @@ int runSessionServer()
             return 0;
         }
 
+        if (command.find("rttask_probe_start") != std::string::npos)
+        {
+            const std::string libraryDirectory = jsonStringField(line, "libraryDirectory").empty()
+                ? jsonStringField(line, "libraryDir")
+                : jsonStringField(line, "libraryDirectory");
+            const std::string rttaskDirectory = jsonStringField(line, "rttaskDirectory").empty()
+                ? jsonStringField(line, "rtTaskDirectory")
+                : jsonStringField(line, "rttaskDirectory");
+            std::string managerPlatform = jsonStringField(line, "managerPlatform").empty()
+                ? jsonStringField(line, "platform")
+                : jsonStringField(line, "managerPlatform");
+            const int statusPeriodMilliseconds = static_cast<int>(jsonNumberField(line, "statusPeriodMs", 10.0));
+            const int intentPeriodMilliseconds = static_cast<int>(jsonNumberField(line, "intentPeriodMs", 10.0));
+
+            try
+            {
+                writeSessionEvent("{\"type\":\"session_rttask_probe_starting\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Starting no-motion Racer3 RTTask heartbeat/status probe. This does not command motion.\"}");
+                sessionMotion.startArmedSessionRtTaskProbe(libraryDirectory, rttaskDirectory, managerPlatform, statusPeriodMilliseconds, intentPeriodMilliseconds);
+                writeSessionEvent(sessionMotion.getArmedSessionRtTaskProbeStatusJson());
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_rttask_probe_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (sessionMotion.areArmedSessionAmpsEnabled() ? "true" : "false") +
+                    ",\"message\":\"RTTask probe RapidCode error: " + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + ").\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_rttask_probe_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (sessionMotion.areArmedSessionAmpsEnabled() ? "true" : "false") +
+                    ",\"message\":\"RTTask probe failed: " + escapeJsonText(error.what()) + ".\"}");
+            }
+
+            continue;
+        }
+
+        if (command.find("rttask_probe_status") != std::string::npos)
+        {
+            try
+            {
+                writeSessionEvent(sessionMotion.getArmedSessionRtTaskProbeStatusJson());
+            }
+            catch (const RR::RsiError& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_rttask_probe_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (sessionMotion.areArmedSessionAmpsEnabled() ? "true" : "false") +
+                    ",\"message\":\"RTTask probe status RapidCode error: " + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + ").\"}");
+            }
+            catch (const std::exception& error)
+            {
+                writeSessionEvent(std::string("{\"type\":\"session_rttask_probe_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (sessionMotion.areArmedSessionAmpsEnabled() ? "true" : "false") +
+                    ",\"message\":\"RTTask probe status failed: " + escapeJsonText(error.what()) + ".\"}");
+            }
+
+            continue;
+        }
+
+        if (command.find("rttask_probe_stop") != std::string::npos)
+        {
+            sessionMotion.stopArmedSessionRtTaskProbe();
+            writeSessionEvent(std::string("{\"type\":\"session_rttask_probe_stopped\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                (sessionMotion.areArmedSessionAmpsEnabled() ? "true" : "false") +
+                ",\"message\":\"Racer3 RTTask probe stopped. No motion commands were issued.\"}");
+            continue;
+        }
+
         if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
         {
             sessionMotion.printArmedSessionPositionSnapshot("Session status position snapshot");
-            writeSessionEvent("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Persistent armed session is alive. Amps are enabled. Position snapshot was printed to backend stdout. Trace commands and backend Axis 6 velocity jog proof commands are available.\"}");
+            const bool ampsEnabled = sessionMotion.areArmedSessionAmpsEnabled();
+            writeSessionEvent(std::string("{\"type\":\"session_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                (ampsEnabled ? "true" : "false") +
+                ",\"message\":\"Persistent armed session is alive. Position snapshot was printed to backend stdout. Trace commands, backend Axis 6 velocity jog proof commands, backend-owned Cartesian X+/Z- jog-loop commands, and no-motion RTTask probe commands are available.\"}");
+            continue;
+        }
+
+        if (command.find("jog_cartesian_start") != std::string::npos)
+        {
+            const std::string requestedAxis = normalizeSessionCommand(jsonStringField(line, "axis"));
+            const std::string direction = normalizeSessionCommand(jsonStringField(line, "direction"));
+            const double requestedSpeed = jsonNumberField(
+                line,
+                "speedMetersPerSecond",
+                jsonNumberField(line, "speed", DefaultCartesianJogSpeedMetersPerSecond));
+
+            try
+            {
+                if (requestedSpeed <= 0.0 || requestedSpeed > MaxCartesianJogSpeedMetersPerSecond)
+                {
+                    std::ostringstream message;
+                    message << "backend Cartesian jog requires 0 < speed <= "
+                            << MaxCartesianJogSpeedMetersPerSecond
+                            << " meters/sec.";
+                    throw std::runtime_error(message.str());
+                }
+
+                const bool xPositive =
+                    direction == "x+" ||
+                    direction == "+x" ||
+                    direction == "positive_x" ||
+                    direction == "xpositive" ||
+                    (requestedAxis == "x" && (direction.empty() || direction == "+" || direction == "positive"));
+
+                const bool zNegative =
+                    direction == "z-" ||
+                    direction == "-z" ||
+                    direction == "negative_z" ||
+                    direction == "znegative" ||
+                    (requestedAxis == "z" && (direction == "-" || direction == "negative"));
+
+                if (!xPositive && !zNegative)
+                {
+                    throw std::runtime_error("backend Cartesian jog v2 accepts X+ and Z-. Recommended first test: {\"type\":\"jog_cartesian_start\",\"direction\":\"Z-\",\"speed\":0.003}.");
+                }
+
+                std::array<double, AxisCount> cartesianDirection{};
+                const char* directionLabel = xPositive ? "X+" : "Z-";
+                if (xPositive)
+                {
+                    cartesianDirection[0] = 1.0;
+                }
+                else
+                {
+                    cartesianDirection[2] = -1.0;
+                }
+
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_starting\",\"state\":\"jog_running\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Cartesian ") + directionLabel + " jog command accepted. Backend-owned endpoint-only IK jog loop will generate motion until stop.\"}");
+                sessionMotion.startArmedSessionCartesianJog(cartesianDirection, requestedSpeed);
+                const bool ampsEnabledAfterStart = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_started\",\"state\":\"jog_running\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabledAfterStart ? "true" : "false") +
+                    ",\"message\":\"Backend-owned Cartesian " + directionLabel + " jog loop is active. Send jog_cartesian_stop to stop/decelerate and keep amps enabled.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                const bool ampsEnabled = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabled ? "true" : "false") +
+                    ",\"message\":\"Cartesian jog RapidCode error: " + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Check backend snapshot before sending another jog start.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                const bool ampsEnabled = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabled ? "true" : "false") +
+                    ",\"message\":\"Cartesian jog failed: " + escapeJsonText(error.what()) + ". Check backend snapshot before sending another jog start.\"}");
+            }
+
+            continue;
+        }
+
+        if (command.find("jog_cartesian_stop") != std::string::npos)
+        {
+            try
+            {
+                writeSessionEvent("{\"type\":\"session_jog_cartesian_stopping\",\"state\":\"jog_stopping\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Cartesian jog stop requested. v14 waits for the current short non-append PVT smoothing span to finish naturally; no Abort, TriggeredModify, APPEND, or amp disable on normal release.\"}");
+                sessionMotion.stopArmedSessionCartesianJog("jog_cartesian_stop command");
+                const bool ampsEnabledAfterStop = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_stopped\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabledAfterStop ? "true" : "false") +
+                    ",\"message\":\"Backend Cartesian jog stop completed MotionDoneWait/settle check. Check ampsEnabled and backend snapshot before additional jog commands.\"}");
+            }
+            catch (const RR::RsiError& error)
+            {
+                const bool ampsEnabled = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabled ? "true" : "false") +
+                    ",\"message\":\"Cartesian jog stop RapidCode error: " + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Check backend snapshot before additional motion.\"}");
+            }
+            catch (const std::exception& error)
+            {
+                const bool ampsEnabled = sessionMotion.areArmedSessionAmpsEnabled();
+                writeSessionEvent(std::string("{\"type\":\"session_jog_cartesian_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                    (ampsEnabled ? "true" : "false") +
+                    ",\"message\":\"Cartesian jog stop failed: " + escapeJsonText(error.what()) + ". Check backend snapshot before additional motion.\"}");
+            }
+
             continue;
         }
 
@@ -540,7 +740,7 @@ int runSessionServer()
             {
                 writeSessionEvent("{\"type\":\"session_jog_velocity_stopping\",\"state\":\"jog_stopping\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog stop requested. Using TriggeredModify, not Abort or amp disable.\"}");
                 sessionMotion.stopArmedSessionAxis6VelocityJog("jog_velocity_stop command");
-                writeSessionEvent("{\"type\":\"session_jog_velocity_stopped\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog stop command sent. Amps remain enabled for additional session commands.\"}");
+                writeSessionEvent("{\"type\":\"session_jog_velocity_stopped\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Backend Axis 6 velocity jog stop completed MotionDoneWait/settle check. Amps remain enabled for additional session commands.\"}");
             }
             catch (const RR::RsiError& error)
             {
@@ -559,7 +759,7 @@ int runSessionServer()
             try
             {
                 sessionMotion.stopArmedSessionMotion();
-                writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop acknowledged. Active backend velocity jog is decelerated with TriggeredModify; otherwise legacy trace/general motion stop uses Abort. Amps remain enabled for the armed session.\"}");
+                writeSessionEvent("{\"type\":\"session_stop_ack\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Stop acknowledged. Active backend Cartesian or Axis 6 velocity jog is decelerated with TriggeredModify; otherwise legacy trace/general motion stop uses Abort. Amps remain enabled for the armed session.\"}");
             }
             catch (const std::exception& error)
             {
@@ -605,15 +805,107 @@ int runSessionServer()
 
         if (command.find("cartesian_jog") != std::string::npos || command.find("jog") != std::string::npos)
         {
-            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unsupported jog command. This patch intentionally supports only backend jog_velocity_start / jog_velocity_stop for Axis 6 joint-space velocity proof motion.\"}");
+            writeSessionEvent("{\"type\":\"session_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unsupported jog command. Supported backend jog commands: jog_cartesian_start / jog_cartesian_stop for the backend-owned Cartesian X+/Z- jog loop, jog_velocity_start / jog_velocity_stop for Axis 6 diagnostic proof motion, and rttask_probe_start/status/stop for no-motion RTTask validation.\"}");
             continue;
         }
 
-        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, jog_velocity_start, jog_velocity_stop, stop, shutdown.\"}");
+        writeSessionEvent("{\"type\":\"session_error\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unknown armed session command. Supported now: hello, status, trace, rttask_probe_start/status/stop, jog_cartesian_start, jog_cartesian_stop, jog_velocity_start, jog_velocity_stop, stop, shutdown.\"}");
     }
 
     writeSessionEvent("{\"type\":\"session_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Session input closed. Disabling amps and exiting.\"}");
     sessionMotion.shutdownArmedSession();
+    return 0;
+}
+
+
+int runPrearmHold(const std::vector<std::string>& args)
+{
+    const double velocityUserUnitsPerSecond = getDoubleOption(args, "--velocity", 0.002);
+    const double prearmHoldSeconds = getDoubleOption(args, "--prearm-hold-seconds", 0.0);
+    const bool diagnostics = hasArg(args, "--diagnostics");
+
+    if (velocityUserUnitsPerSecond <= 0.0)
+    {
+        writeSessionEvent("{\"type\":\"prearm_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"--velocity must be greater than zero.\"}");
+        return 2;
+    }
+
+    writeSessionEvent("{\"type\":\"prearm_starting\",\"state\":\"starting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Bottom-to-top endpoint pre-arm hold starting. This clears faults, relaxes startup Home/ErrorLimit actions, enables Axis 1 through Axis 6, then holds amps enabled until shutdown.\"}");
+
+    Racer3BasicMotion prearmMotion;
+
+    try
+    {
+        prearmMotion.startArmedSession(velocityUserUnitsPerSecond, diagnostics);
+        const bool ampsEnabled = prearmMotion.areArmedSessionAmpsEnabled();
+        if (!ampsEnabled)
+        {
+            throw std::runtime_error("Pre-arm hold completed startup but amp verification is false.");
+        }
+
+        writeSessionEvent("{\"type\":\"prearm_ready\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Bottom-to-top endpoint pre-arm hold is ready. All axes and MultiAxis are expected to remain amp-enabled until shutdown. RTTask jog proof may now run.\"}");
+
+        if (prearmHoldSeconds > 0.0)
+        {
+            writeSessionEvent("{\"type\":\"prearm_timed_hold\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Timed pre-arm hold active. Amps remain enabled until the hold timer expires.\"}");
+            std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(prearmHoldSeconds * 1000.0)));
+            writeSessionEvent("{\"type\":\"prearm_timed_shutdown_starting\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Timed pre-arm hold expired. Disabling amps and releasing controller.\"}");
+            prearmMotion.shutdownArmedSession();
+            writeSessionEvent("{\"type\":\"prearm_shutdown\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Bottom-to-top endpoint pre-arm hold shut down after timed hold. Amps disabled and controller released.\"}");
+            return 0;
+        }
+    }
+    catch (const RR::RsiError& error)
+    {
+        writeSessionEvent(std::string("{\"type\":\"prearm_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start pre-arm hold RapidCode error: ") + escapeJsonText(error.text) + " (" + escapeJsonText(error.functionName) + "). Shutdown attempted.\"}");
+        prearmMotion.shutdownArmedSession();
+        return 1;
+    }
+    catch (const std::exception& error)
+    {
+        writeSessionEvent(std::string("{\"type\":\"prearm_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start pre-arm hold: ") + escapeJsonText(error.what()) + ". Shutdown attempted.\"}");
+        prearmMotion.shutdownArmedSession();
+        return 1;
+    }
+    catch (...)
+    {
+        writeSessionEvent("{\"type\":\"prearm_error\",\"state\":\"faulted\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Failed to start pre-arm hold with unknown exception. Shutdown attempted.\"}");
+        prearmMotion.shutdownArmedSession();
+        return 1;
+    }
+
+    std::string line;
+    while (std::getline(std::cin, line))
+    {
+        const std::string command = normalizeSessionCommand(line);
+        if (command.empty())
+        {
+            continue;
+        }
+
+        if (command.find("shutdown") != std::string::npos)
+        {
+            writeSessionEvent("{\"type\":\"prearm_shutdown_starting\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Shutdown requested. Disabling amps and releasing controller.\"}");
+            prearmMotion.shutdownArmedSession();
+            writeSessionEvent("{\"type\":\"prearm_shutdown\",\"state\":\"exiting\",\"armed\":false,\"ampsEnabled\":false,\"message\":\"Bottom-to-top endpoint pre-arm hold shut down. Amps disabled and controller released.\"}");
+            return 0;
+        }
+
+        if (command.find("status") != std::string::npos || command.find("hello") != std::string::npos)
+        {
+            prearmMotion.printArmedSessionPositionSnapshot("Pre-arm hold status position snapshot");
+            const bool ampsEnabled = prearmMotion.areArmedSessionAmpsEnabled();
+            writeSessionEvent(std::string("{\"type\":\"prearm_status\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":") +
+                (ampsEnabled ? "true" : "false") +
+                ",\"message\":\"Bottom-to-top endpoint pre-arm hold is alive. Amps remain enabled until shutdown.\"}");
+            continue;
+        }
+
+        writeSessionEvent("{\"type\":\"prearm_reject\",\"state\":\"armed_idle\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Unsupported pre-arm hold command. Supported commands: hello, status, shutdown.\"}");
+    }
+
+    writeSessionEvent("{\"type\":\"prearm_input_closed\",\"state\":\"shutting_down\",\"armed\":true,\"ampsEnabled\":true,\"message\":\"Pre-arm hold input closed. Disabling amps and exiting.\"}");
+    prearmMotion.shutdownArmedSession();
     return 0;
 }
 
@@ -681,6 +973,109 @@ int main(int argc, char* argv[])
     if (hasArg(args, "--session-server"))
     {
         return runSessionServer();
+    }
+
+    if (hasArg(args, "--prearm-hold"))
+    {
+        return runPrearmHold(args);
+    }
+
+    if (hasArg(args, "--keyboard-cartesian-jog-endpoint-only"))
+    {
+        try
+        {
+            const double legacySpeed = getDoubleOption(args, "--cartesian-jog-speed", DefaultCartesianKeyboardJogSpeedMetersPerSecond);
+            const double linearSpeed = getDoubleOption(args, "--cartesian-jog-linear-speed", legacySpeed);
+            const double angularSpeed = getDoubleOption(args, "--cartesian-jog-angular-speed", 0.10);
+            const double gainX = getDoubleOption(args, "--cartesian-jog-gain-x", 1.0);
+            const double gainY = getDoubleOption(args, "--cartesian-jog-gain-y", 1.25);
+            const double gainZ = getDoubleOption(args, "--cartesian-jog-gain-z", 0.65);
+            const double maxJointVelocity = getDoubleOption(args, "--cartesian-jog-max-joint-velocity", 0.030);
+            const double baseRotateSpeed = getDoubleOption(args, "--keyboard-base-rotate-speed", 0.015);
+            const double loopPeriodMs = getDoubleOption(args, "--keyboard-jog-period-ms", DefaultKeyboardJogLoopPeriodMilliseconds);
+            const bool confirmed = hasArg(args, "--confirm-keyboard-cartesian-jog");
+            const bool diagnostics = hasArg(args, "--diagnostics");
+
+            const double startupDelaySeconds = getDoubleOption(args, "--keyboard-startup-delay-seconds", 8.0);
+            if (startupDelaySeconds > 0.0)
+            {
+                std::cout << "Cartesian keyboard jog startup delay: waiting "
+                          << startupDelaySeconds
+                          << " seconds for RMP shared memory/status to settle after rsiconfig.\n";
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(static_cast<int>(startupDelaySeconds * 1000.0)));
+            }
+
+            Racer3BasicMotion motion;
+            motion.runEndpointOnlyCartesianKeyboardJog(
+                linearSpeed,
+                angularSpeed,
+                loopPeriodMs / 1000.0,
+                confirmed,
+                diagnostics,
+                gainX,
+                gainY,
+                gainZ,
+                maxJointVelocity,
+                baseRotateSpeed);
+            return 0;
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cerr << "RapidCode error: "
+                      << error.text
+                      << " ("
+                      << error.functionName
+                      << ")"
+                      << "\n";
+            return 1;
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << "Error: " << error.what() << "\n";
+            return 1;
+        }
+    }
+
+    if (hasArg(args, "--keyboard-jog-endpoint-only"))
+    {
+        try
+        {
+            const int operatorAxis = static_cast<int>(getDoubleOption(args, "--jog-axis", 6.0));
+            const double velocity = getDoubleOption(args, "--velocity", DefaultKeyboardJogVelocityUserUnitsPerSecond);
+            const double loopPeriodMs = getDoubleOption(args, "--keyboard-jog-period-ms", DefaultKeyboardJogLoopPeriodMilliseconds);
+            const bool confirmed = hasArg(args, "--confirm-keyboard-jog");
+            const bool diagnostics = hasArg(args, "--diagnostics");
+
+            const double startupDelaySeconds = getDoubleOption(args, "--keyboard-startup-delay-seconds", 8.0);
+            if (startupDelaySeconds > 0.0)
+            {
+                std::cout << "Keyboard jog startup delay: waiting "
+                          << startupDelaySeconds
+                          << " seconds for RMP shared memory/status to settle after rsiconfig.\n";
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(static_cast<int>(startupDelaySeconds * 1000.0)));
+            }
+            
+            Racer3BasicMotion motion;
+            motion.runEndpointOnlyKeyboardJog(
+                operatorAxis,
+                velocity,
+                loopPeriodMs / 1000.0,
+                confirmed,
+                diagnostics);
+            return 0;
+        }
+        catch (const RR::RsiError& error)
+        {
+            std::cerr << "RapidCode error: " << error.text << " (" << error.functionName << ")\n";
+            return 1;
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << "Error: " << error.what() << "\n";
+            return 1;
+        }
     }
 
     try
@@ -911,3 +1306,5 @@ int main(int argc, char* argv[])
         return 1;
     }
 }
+
+

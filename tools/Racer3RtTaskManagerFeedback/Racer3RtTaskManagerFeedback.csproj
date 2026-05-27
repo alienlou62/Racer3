@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RSIProtoPath Condition="'$(RSIProtoPath)' == '' and Exists('C:\\repos\\jpRapidSoftware\\RapidStuff\\protos')">C:\repos\jpRapidSoftware\RapidStuff\protos</RSIProtoPath>
+    <RSIProtoPath Condition="'$(RSIProtoPath)' == '' and Exists('C:\\RSI\\11.0.5\\protos')">C:\RSI\11.0.5\protos</RSIProtoPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.31.1" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(RSIProtoPath)' != ''">
+    <Protobuf Include="$(RSIProtoPath)\rapidcode.proto" GrpcServices="Client" />
+    <Protobuf Include="$(RSIProtoPath)\rapidgrpc.proto" GrpcServices="Client" />
+    <Protobuf Include="$(RSIProtoPath)\rsienums.proto" GrpcServices="Client" />
+  </ItemGroup>
+</Project>

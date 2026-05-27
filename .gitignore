@@ -1,10 +1,40 @@
-build/
-.vscode/
-*.user
-*.log
-*.csv
-bin/
-obj/
+# Build outputs
 build/
 build-vs2022/
+build-vs2022-rttask/
+bin/
+obj/
+.vs/
+.vscode/
+
+# User/local IDE state
+*.user
+
+# Logs and probe outputs
+*.log
+*.err.log
+*.out.log
+*.binlog
+*.csv
+
+# Native build artifacts
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.obj
+*.cache
+*.tmp
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Archives/staging and local cleanup holding areas
+*.zip
+*.7z
+artifacts/
+racer3-zip-stage-*/
+archive/logs/
+src/*.bak-*
 

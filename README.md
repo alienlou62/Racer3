@@ -1,59 +1,58 @@
-# Racer3 RMP Basic Motion Demo
+# Racer3 RMP Basic Motion
 
-Basic RMP/RapidCode project for moving the Comau Racer 3 through a simple all-axis motion demo.
+RMP/RapidCode control project for the Comau Racer 3 robot. The repo currently contains the C++ backend, RMP/axis configuration, live keyboard jog scripts, RTTASK investigation notes, and an Avalonia UI prototype.
 
-## What this does
+The current best working live baseline is the backend-owned keyboard Cartesian jog mode documented in [docs/current-keyboard-jog.md](docs/current-keyboard-jog.md).
 
-- Connects to the RSI RMP controller
-- Clears faults
-- Enables amplifiers
-- Creates a six-axis MultiAxis group for joint-space motion
-- Executes a small low-speed relative joint motion sequence
-- Returns the robot to its starting pose
-- Disables amplifiers safely
+## Current Focus
+
+- Preserve the working keyboard Cartesian jog behavior in `src/Racer3BasicMotion.cpp`.
+- Keep live robot startup scripts and configuration easy to find.
+- Keep generated logs, build outputs, and one-off backups out of the repo root.
+- Keep hardware testing opt-in and explicitly confirmed.
 
 ## Prerequisites
 
 - Windows development machine
-- RSI RapidCode SDK installed (tested with `C:\RSI\11.0.0`)
+- RSI RapidCode SDK installed (tested with `C:\RSI\11.0.5`)
 - Physical or simulated Comau Racer 3 robot controller available on the RMP network
 - A safe robot environment and E-stop ready
 
 ## Build
 
 ```powershell
-mkdir build
-cd build
-cmake .. -DRSI_SDK_ROOT="C:/RSI/11.0.0"
-cmake --build . --config Release
+cd C:\Users\JP\racer3-rmp-basic-motion
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
+cmake --build .\build-vs2022 --config Release --target racer3-basic-motion
 ```
 
-If the SDK is installed in a different location, set `RSI_SDK_ROOT` to the SDK root directory.
+The expected binary is `build-vs2022\Release\racer3-basic-motion.exe`.
 
 ## Run
 
-```powershell
-cd build
-.\Release\racer3-basic-motion.exe
-```
+For the validated keyboard jog command and smoke sequence, see [docs/current-keyboard-jog.md](docs/current-keyboard-jog.md).
 
-The program prints a safety warning and waits for Enter before sending motion commands.
+Default and diagnostic modes remain intentionally conservative. Real robot motion should use explicit confirmation flags and a safe test envelope.
 
-## Project structure
+## Project Structure
 
-- `src/main.cpp` — simple application entry point and top-level error handling
-- `src/Racer3BasicMotion.h` / `src/Racer3BasicMotion.cpp` — RSI-specific motion logic
-- `config/axes.json` — conservative axis mapping and demo motion settings
-- `docs/safety.md` — safety guidance for physical robot testing
-- `CMakeLists.txt` — build configuration for RSI RapidCode
+- `src/`: C++ backend and Racer 3 motion logic.
+- `config/`: RMP axis, MultiAxis, kinematics, and RTTASK-related XML/JSON configuration.
+- `scripts/`: startup, smoke-test, jog-test, and probe scripts.
+- `docs/`: safety, current keyboard jog, RTTASK notes, and architecture notes.
+- `ui/`: Avalonia motion UI prototype.
+- `rttasks/`: RTTASK source experiments.
+- `tools/`: helper tools, including RTTASK manager feedback utilities.
+- `cmake/`: CMake helper modules for RSI/RapidSoftware/INtime integration.
+- `archive/`: local cleanup holding area for old logs and source backups.
 
 ## Notes
 
-- Motion uses very small relative joint offsets (±5°) for safety.
-- `config/axes.json` now includes conservative Racer3 joint limits and historical hardware parameters from the legacy RapidRobot test driver.
-- The current implementation does not yet parse `config/axes.json`; it provides the starter configuration for later milestones.
 - Always keep the robot under manual control while testing.
-## Safe test commands
+- Do not change the current W/S, J5 compensation, Z-lock, H-home, or release-stop behavior without an explicit live-test reason.
+- Root logs and source backup snapshots belong under `archive/`, not at the repo root.
+
+## Safe Test Commands
 
 Dry run only, no RMP connection:
 

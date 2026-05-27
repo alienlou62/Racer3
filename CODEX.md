@@ -24,7 +24,7 @@ The focus is on safe joint-space motion for six axes using a minimal and conserv
 
 ## RMP / RapidCode API
 
-The implementation is based on the installed RSI SDK headers from `C:\RSI\11.0.0`.
+The implementation is based on the installed RSI SDK headers from `C:\RSI\11.0.5`.
 It uses:
 
 - `RSI::RapidCode::MotionController::Create()` to create the controller object.

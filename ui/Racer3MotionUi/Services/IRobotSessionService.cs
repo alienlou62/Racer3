@@ -15,6 +15,10 @@ public interface IRobotSessionService
 
     Task StopMotionAsync(CancellationToken cancellationToken);
 
+    Task StartCartesianJogAsync(string direction, double speedMetersPerSecond, CancellationToken cancellationToken);
+
+    Task StopCartesianJogAsync(string reason, CancellationToken cancellationToken);
+
     Task<MotionExecutionResult> TraceShapeAsync(
         ShapeTracePlan plan,
         RobotMotionOptions options,

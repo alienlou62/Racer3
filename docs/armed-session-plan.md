@@ -230,7 +230,7 @@ session process starts
 The first live armed-session milestone keeps the session command loop simple but changes startup ownership:
 
 - `Start Armed Session` runs `rsiconfig` once from the UI service.
-- The UI starts `racer3-basic-motion --session-server` with `C:\RSI\11.0.0` prepended to PATH so RapidCode runtime DLLs are available.
+- The UI starts `racer3-basic-motion --session-server` with `C:\RSI\11.0.5` prepended to PATH so RapidCode runtime DLLs are available.
 - The C++ session process connects `MotionController` once, maps/configures axes once, clears faults, enables all six amps once, isolates the six-axis MultiAxis group, then reports `session_ready` with `armed=true` and `ampsEnabled=true`.
 - `status` reports that the session is armed and amps are enabled.
 - `stop` aborts active MultiAxis motion if any but keeps amps enabled.

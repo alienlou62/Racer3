@@ -1,6 +1,10 @@
 ﻿<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             x:Class="Racer3MotionUi.Views.MainView">
+             x:Class="Racer3MotionUi.Views.MainView"
+             Focusable="True"
+             KeyDown="OnKeyDown"
+             KeyUp="OnKeyUp"
+             LostFocus="OnLostFocus">
     <UserControl.Styles>
         <Style Selector="TextBlock.Label">
             <Setter Property="Foreground" Value="#8FA3B8"/>
@@ -244,22 +248,29 @@
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="Keyboard Jog (planned)" Classes="PanelTitle"/>
+                        <TextBlock Text="Backend Cartesian Jog" Classes="PanelTitle"/>
                         <CheckBox Content="Enable Jog Mode" IsChecked="{Binding IsJogModeEnabled}"/>
                         <Grid ColumnDefinitions="*,*">
                             <StackPanel Spacing="6">
-                                <TextBlock Text="Step m" Classes="Label"/>
-                                <TextBox Text="{Binding JogStepMeters, Mode=TwoWay}" Watermark="0.005"/>
+                                <TextBlock Text="Jog speed m/s (0.003 default, max 0.004)" Classes="Label"/>
+                                <TextBox Text="{Binding JogVelocity, Mode=TwoWay}" Watermark="0.003"/>
                             </StackPanel>
                             <StackPanel Grid.Column="1" Spacing="6" Margin="12,0,0,0">
-                                <TextBlock Text="Velocity" Classes="Label"/>
-                                <TextBox Text="{Binding JogVelocity, Mode=TwoWay}" Watermark="0.025"/>
+                                <TextBlock Text="Active direction" Classes="Label"/>
+                                <TextBlock Text="{Binding ActiveJogDirection}" Foreground="#DCE6F2"/>
                             </StackPanel>
                         </Grid>
-                        <TextBlock Text="W/S: Z up/down   A/D: Y left/right   Q/E: X forward/back   Arrow keys: Y/Z plane   Space: stop"
+                        <Button Content="Hold Z- Jog (tested)"
+                                Classes="Primary"
+                                IsEnabled="{Binding CanUseBackendJogControls}"
+                                PointerPressed="OnJogZMinusPointerPressed"
+                                PointerReleased="OnJogPointerReleased"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"/>
+                        <TextBlock Text="Keyboard: hold S or Down Arrow for Z-. Release stops. Space/Escape/lost focus also send one jog stop. Default is now 0.003 m/s after 0.002 m/s was smooth but still a little slow."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
-                        <TextBlock Text="Jog keys are documentation-only until the persistent armed session backend supports validated cartesian_jog commands. Session trace commands are available first."
+                        <TextBlock Text="UI sends only jog_start/jog_stop intent. The backend owns endpoint-only PVT smoothing-burst jogging; X/Y/Z+ are intentionally not wired yet."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
                     </StackPanel>

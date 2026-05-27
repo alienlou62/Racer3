@@ -18,7 +18,7 @@ function Write-Log {
 }
 
 Set-Location $RepoRoot
-$env:PATH = "C:\RSI\11.0.0;$env:PATH"
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
 
 $script:LogPath = Join-Path $RepoRoot "axis6-jog-test.log"
 Remove-Item $script:LogPath -ErrorAction SilentlyContinue
@@ -30,7 +30,7 @@ if (-not (Test-Path $exe)) {
     throw "Backend executable not found: $exe"
 }
 if (-not (Get-Command rsiconfig -ErrorAction SilentlyContinue)) {
-    throw "rsiconfig.exe was not found. Expected C:\RSI\11.0.0 on PATH."
+    throw "rsiconfig.exe was not found. Expected C:\RSI\11.0.5 on PATH."
 }
 if (-not (Test-Path $settings)) {
     throw "Missing settings file: $settings"

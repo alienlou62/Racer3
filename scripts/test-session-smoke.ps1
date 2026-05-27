@@ -1,7 +1,7 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 cd "C:\Users\JP\racer3-rmp-basic-motion"
-$env:PATH = "C:\RSI\11.0.0;$env:PATH"
+$env:PATH = "C:\RSI\11.0.5;$env:PATH"
 
 $log = "session-smoke-test.log"
 Remove-Item $log -ErrorAction SilentlyContinue
