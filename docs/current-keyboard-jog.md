@@ -86,6 +86,7 @@ Run this with the robot in a safe test envelope and an E-stop ready:
 - Do not run live robot tests from a stale process tree; stop old Racer/RMP/RapidServer processes first.
 - Do not regress release-stop behavior: normal key release should stop motion cleanly while keeping amps enabled.
 - Do not regress `H` behavior: H-home should return to the run-start joint pose and keep jog mode active.
+- Live jog now has a conservative software soft-limit guard based on the OpenRAVE XML joint limits with a 5-degree reserve. Jog commands are scaled/stopped before modeled limits, while motion away from a limit remains allowed.
 - Do not require robot hardware for documentation or cleanup validation. Live hardware testing is separate.
 
 ## Optional Xbox 360 controller test mode

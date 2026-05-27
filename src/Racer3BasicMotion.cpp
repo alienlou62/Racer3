@@ -1,4 +1,4 @@
-﻿#include "Racer3BasicMotion.h"
+#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -192,6 +192,31 @@ static constexpr double EndpointCartesianKeyboardJogJointAccelerationUserUnitsPe
 static constexpr double EndpointCartesianKeyboardJogJerkPercent = 5.0;
 static constexpr int EndpointCartesianKeyboardJogVelocityStopSettleMs = 150;
 static constexpr int EndpointCartesianKeyboardJogVelocityStopDoneWaitMs = 1500;
+
+// Conservative software soft limits for live keyboard/Xbox jogging. Values are
+// based on config/racer3-kinematics-openrave.json XML joint limits, with a
+// 5-degree reserve so operator jogging stops before the modeled hard limits.
+// Units here are RMP user-units/revolutions because all six axes are configured
+// as 1.0 user unit = one physical joint revolution in the armed session.
+static constexpr double EndpointCartesianJogSoftLimitReserveDegrees = 5.0;
+static constexpr double EndpointCartesianJogSoftLimitLookaheadSeconds = 0.40;
+static constexpr double EndpointCartesianJogSoftLimitNearZeroVelocityUserUnitsPerSecond = 1e-6;
+static constexpr std::array<double, Racer3BasicMotion::AxisCount> EndpointCartesianJogSoftMinUserUnits = {
+    (-150.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-75.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-155.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-180.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-105.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-720.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+};
+static constexpr std::array<double, Racer3BasicMotion::AxisCount> EndpointCartesianJogSoftMaxUserUnits = {
+    (150.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (115.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (90.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (180.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (105.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (720.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+};
 
 static bool DiagnosticsEnabled = false;
 static bool DualMotionEnabled = false;
@@ -3462,6 +3487,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             std::cout << "Xbox controller mode is active. If no controller is connected, keyboard controls remain available and the loop will keep waiting.\n";
         }
         std::cout << "Smooth mode: W/S reach with J1/J4/J6 held and J5 allowed for tool-pitch compensation; R/F vertical jog with J1/J4/J6 held and J5 allowed; A/D direct base/J1 velocity. No repeated PVT chunks while held.\n";
+        std::cout << "Soft-limit guard active: live jog commands are scaled/stopped "
+                  << EndpointCartesianJogSoftLimitReserveDegrees
+                  << " deg before modeled joint limits; motion away from a limit remains allowed.\n";
 
         bool cartesianVelocityJogActive = false;
         std::string cartesianVelocityJogLabel = "idle";
@@ -3551,6 +3579,121 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             lastCartesianVelocityCommand.fill(0.0);
         };
 
+        auto applyJogSoftLimitGuard = [&](JointVector& velocity,
+                                           const JointVector& actualUserUnits,
+                                           const std::string& commandLabel) -> bool
+        {
+            static const char* const jointLabels[AxisCount] = {"J1", "J2", "J3", "J4", "J5", "J6"};
+
+            double velocityScale = 1.0;
+            int limitingAxis = -1;
+            const char* limitingSide = "";
+
+            for (int axis = 0; axis < AxisCount; ++axis)
+            {
+                const double jointVelocity = velocity[axis];
+                if (std::fabs(jointVelocity) <= EndpointCartesianJogSoftLimitNearZeroVelocityUserUnitsPerSecond)
+                {
+                    continue;
+                }
+
+                if (jointVelocity > 0.0)
+                {
+                    const double remaining = EndpointCartesianJogSoftMaxUserUnits[axis] - actualUserUnits[axis];
+                    const double axisScale = remaining <= 0.0
+                        ? 0.0
+                        : std::min(1.0, remaining / (jointVelocity * EndpointCartesianJogSoftLimitLookaheadSeconds));
+
+                    if (axisScale < velocityScale)
+                    {
+                        velocityScale = axisScale;
+                        limitingAxis = axis;
+                        limitingSide = "positive";
+                    }
+                }
+                else
+                {
+                    const double remaining = actualUserUnits[axis] - EndpointCartesianJogSoftMinUserUnits[axis];
+                    const double axisScale = remaining <= 0.0
+                        ? 0.0
+                        : std::min(1.0, remaining / ((-jointVelocity) * EndpointCartesianJogSoftLimitLookaheadSeconds));
+
+                    if (axisScale < velocityScale)
+                    {
+                        velocityScale = axisScale;
+                        limitingAxis = axis;
+                        limitingSide = "negative";
+                    }
+                }
+            }
+
+            if (limitingAxis < 0 || velocityScale >= 0.999999)
+            {
+                return true;
+            }
+
+            if (velocityScale <= 0.0)
+            {
+                std::cout << "Soft-limit guard stopped "
+                          << commandLabel
+                          << ": "
+                          << jointLabels[limitingAxis]
+                          << " is at/over the "
+                          << limitingSide
+                          << " soft limit. actual="
+                          << actualUserUnits[limitingAxis]
+                          << " softRange=["
+                          << EndpointCartesianJogSoftMinUserUnits[limitingAxis]
+                          << ", "
+                          << EndpointCartesianJogSoftMaxUserUnits[limitingAxis]
+                          << "] user-units. Move the opposite direction or press H-home.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("soft joint limit guard");
+                }
+
+                return false;
+            }
+
+            std::cout << "Soft-limit guard scaled "
+                      << commandLabel
+                      << " by "
+                      << velocityScale
+                      << " because "
+                      << jointLabels[limitingAxis]
+                      << " is approaching the "
+                      << limitingSide
+                      << " soft limit. actual="
+                      << actualUserUnits[limitingAxis]
+                      << " softRange=["
+                      << EndpointCartesianJogSoftMinUserUnits[limitingAxis]
+                      << ", "
+                      << EndpointCartesianJogSoftMaxUserUnits[limitingAxis]
+                      << "] user-units.\n";
+
+            for (double& value : velocity)
+            {
+                value *= velocityScale;
+            }
+
+            if (maxAbsJointValue(velocity) <= EndpointCartesianJogSoftLimitNearZeroVelocityUserUnitsPerSecond)
+            {
+                std::cout << "Soft-limit guard reduced "
+                          << commandLabel
+                          << " to near-zero velocity; treating as no-op. Move the opposite direction or press H-home.\n";
+
+                if (cartesianVelocityJogActive)
+                {
+                    stopCartesianVelocityJog("soft joint limit guard near-zero scale");
+                }
+
+                return false;
+            }
+
+            return true;
+        };
+
         auto startCartesianVelocityJog = [&](const CartesianVector& direction)
         {
             JointVector actualUserUnits{};
@@ -3605,6 +3748,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 }
 
                 const std::string newDirectionName = directionName(direction);
+                if (!applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName))
+                {
+                    return;
+                }
+
                 const bool continuingSameVelocityJog =
                     cartesianVelocityJogActive &&
                     cartesianVelocityJogLabel == newDirectionName;
@@ -3686,6 +3834,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 }
 
                 const std::string newDirectionName = directionName(direction);
+                if (!applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName))
+                {
+                    return;
+                }
+
                 const bool continuingSameVelocityJog =
                     cartesianVelocityJogActive &&
                     cartesianVelocityJogLabel == newDirectionName;
@@ -3778,7 +3931,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 targetTwist[index] = direction[index] * angularSpeedRadiansPerSecond;
             }
 
-            std::array<std::array<double, AxisCount>, AxisCount> jacobian{};
+            std::array<std::array<double, Racer3BasicMotion::AxisCount>, AxisCount> jacobian{};
             for (int joint = 0; joint < AxisCount; ++joint)
             {
                 JointVector perturbedRadians = actualRadians;
@@ -3825,7 +3978,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 std::fabs(direction[4]) <= 1e-9 &&
                 std::fabs(direction[5]) <= 1e-9;
 
-            std::array<double, AxisCount> taskWeights{};
+            std::array<double, Racer3BasicMotion::AxisCount> taskWeights{};
             for (int index = 0; index < AxisCount; ++index)
             {
                 if (linearOnlyJog)
@@ -3878,8 +4031,8 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                     ? EndpointCartesianKeyboardJogTranslationPriorityDamping
                     : EndpointCartesianKeyboardJogJacobianDamping);
 
-            std::array<std::array<double, AxisCount>, AxisCount> normal{};
-            std::array<double, AxisCount> rhs{};
+            std::array<std::array<double, Racer3BasicMotion::AxisCount>, AxisCount> normal{};
+            std::array<double, Racer3BasicMotion::AxisCount> rhs{};
 
             for (int row = 0; row < AxisCount; ++row)
             {
@@ -3907,7 +4060,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 rhs[row] = rhsValue;
             }
 
-            std::array<double, AxisCount> jointVelocityRadiansPerSecond{};
+            std::array<double, Racer3BasicMotion::AxisCount> jointVelocityRadiansPerSecond{};
             if (!solveLinearSystem6x6(normal, rhs, jointVelocityRadiansPerSecond))
             {
                 std::cout << "Smooth Cartesian keyboard jog Jacobian/DLS solve was singular; treating this as an idle/no-op command instead of faulting the keyboard jog.\n";
@@ -3972,6 +4125,13 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
 
                 maxJointVelocity = maxAbsJointValue(velocity);
             }
+
+            if (!applyJogSoftLimitGuard(velocity, actualUserUnits, requestedDirectionName))
+            {
+                return;
+            }
+
+            maxJointVelocity = maxAbsJointValue(velocity);
 
             CartesianVector predictedTwist{};
             for (int row = 0; row < AxisCount; ++row)
@@ -4099,7 +4259,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             JointVector acceleration{};
             JointVector deceleration{};
             JointVector jerk{};
-            std::array<double, AxisCount> startingCommandPositions{};
+            std::array<double, Racer3BasicMotion::AxisCount> startingCommandPositions{};
 
             double maxReturnDistance = 0.0;
             for (int index = 0; index < AxisCount; ++index)
@@ -4842,7 +5002,7 @@ void Racer3BasicMotion::restoreArmedSessionCartesianJogErrorLimitActions(const c
 }
 
 void Racer3BasicMotion::startArmedSessionCartesianJog(
-    const std::array<double, AxisCount>& direction,
+    const std::array<double, Racer3BasicMotion::AxisCount>& direction,
     double speedMetersPerSecond)
 {
     if (!controller_ || !multiAxis_)
@@ -5067,7 +5227,7 @@ void Racer3BasicMotion::joinArmedSessionCartesianJogThread() noexcept
 }
 
 void Racer3BasicMotion::runArmedSessionCartesianJogLoop(
-    std::array<double, AxisCount> direction,
+    std::array<double, Racer3BasicMotion::AxisCount> direction,
     double speedMetersPerSecond) noexcept
 {
     bool pvtCommandIssued = false;
@@ -5525,7 +5685,7 @@ void Racer3BasicMotion::printArmedSessionPositionSnapshot(const char* label)
 }
 
 void Racer3BasicMotion::runArmedSessionTrace(
-    const std::vector<std::array<double, AxisCount>>& waypoints,
+    const std::vector<std::array<double, Racer3BasicMotion::AxisCount>>& waypoints,
     double velocityUserUnitsPerSecond,
     bool returnToZero)
 {
@@ -7349,7 +7509,7 @@ void Racer3BasicMotion::runAllAxisMotion()
             printAllAxisMotionStatus("All axes before all-axis MoveRelative");
 
             const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
-            std::array<double, AxisCount> startingCommandPositions{};
+            std::array<double, Racer3BasicMotion::AxisCount> startingCommandPositions{};
 
             for (int index = 0; index < AxisCount; ++index)
             {
@@ -7517,7 +7677,7 @@ void Racer3BasicMotion::runJointVectorMotion()
             printAllAxisMotionStatus("All axes before joint-vector MoveRelative");
 
             const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
-            std::array<double, AxisCount> startingCommandPositions{};
+            std::array<double, Racer3BasicMotion::AxisCount> startingCommandPositions{};
 
             for (int index = 0; index < AxisCount; ++index)
             {
@@ -8930,7 +9090,7 @@ void Racer3BasicMotion::runCartesianVectorMotion()
             }
 
             auto readAllAxisCommandPositions = [&]() {
-                std::array<double, AxisCount> commandPositions{};
+                std::array<double, Racer3BasicMotion::AxisCount> commandPositions{};
 
                 for (int index = 0; index < AxisCount; ++index)
                 {
@@ -8966,7 +9126,7 @@ void Racer3BasicMotion::runCartesianVectorMotion()
                     printAllAxisMotionStatus("All axes before queued segmented Cartesian-vector phase");
                 }
 
-                const std::array<double, AxisCount> startingCommandPositions =
+                const std::array<double, Racer3BasicMotion::AxisCount> startingCommandPositions =
                     readAllAxisCommandPositions();
 
                 for (size_t stepIndex = 0; stepIndex < phaseSequence.size(); ++stepIndex)
@@ -9144,7 +9304,7 @@ void Racer3BasicMotion::runCartesianVectorMotion()
             }
 
             const uint16_t commandedMotionId = multiAxis_->MotionIdGet();
-            std::array<double, AxisCount> startingCommandPositions{};
+            std::array<double, Racer3BasicMotion::AxisCount> startingCommandPositions{};
 
             for (int index = 0; index < AxisCount; ++index)
             {
@@ -10623,7 +10783,7 @@ void Racer3BasicMotion::waitForDualAxisMotionStart(
 
 void Racer3BasicMotion::waitForAllAxisMotionStart(
     const char* label,
-    const std::array<double, AxisCount>& startingCommandPositions)
+    const std::array<double, Racer3BasicMotion::AxisCount>& startingCommandPositions)
 {
     if (!multiAxis_)
     {
