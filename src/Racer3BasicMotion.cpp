@@ -30,6 +30,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <Xinput.h>
 #ifdef min
 #undef min
 #endif
@@ -147,6 +148,10 @@ static constexpr int EndpointKeyboardJogTelemetryPeriodMs = 100;
 static constexpr int EndpointKeyboardJogIdleSleepMs = 5;
 static constexpr int EndpointCartesianKeyboardJogTelemetryPeriodMs = 200;
 static constexpr int EndpointCartesianKeyboardJogIdleSleepMs = 10;
+static constexpr double EndpointCartesianXboxStickDeadzone = 0.22;
+static constexpr double EndpointCartesianXboxTriggerDeadzone = 0.15;
+static constexpr double EndpointCartesianXboxDirectionChangeThreshold = 0.08;
+static constexpr double EndpointCartesianXboxQuantizationStep = 0.05;
 static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.025;
 static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
 // Smooth keyboard Cartesian jog now uses a finite-difference Jacobian velocity solve
@@ -3245,7 +3250,8 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     double gainY,
     double gainZ,
     double maxJointVelocityUserUnitsPerSecond,
-    double baseRotateVelocityUserUnitsPerSecond)
+    double baseRotateVelocityUserUnitsPerSecond,
+    bool xboxControllerEnabled)
 {
 #ifndef _WIN32
     (void)linearSpeedMetersPerSecond;
@@ -3258,6 +3264,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     (void)gainZ;
     (void)maxJointVelocityUserUnitsPerSecond;
     (void)baseRotateVelocityUserUnitsPerSecond;
+    (void)xboxControllerEnabled;
     throw std::runtime_error("Endpoint-only Cartesian keyboard jog currently requires the Windows console backend build.");
 #else
     if (linearSpeedMetersPerSecond <= 0.0)
@@ -3342,6 +3349,13 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     std::cout << "  Base rotate speed: " << baseRotateVelocityUserUnitsPerSecond << " J1 user-units/sec.\n";
     std::cout << "  Loop poll period: " << (loopPeriodSeconds * 1000.0) << " ms.\n";
     std::cout << "  Controls:\n";
+    if (xboxControllerEnabled)
+    {
+        std::cout << "    Xbox 360 controller enabled with deadzone "
+                  << EndpointCartesianXboxStickDeadzone
+                  << ": left stick Y = X reach/retract, left stick X = base rotate, right stick Y = Z up/down\n";
+        std::cout << "    Xbox buttons: A = smooth stop, Y = H-home, B/Back = exit. LB/RB = roll, LT/RT = pitch, right stick X = yaw. Use one major stick direction at a time for first tests.\n";
+    }
     std::cout << "    W/S = endpoint forward/back in the current base-facing vertical plane while holding the current tool orientation\n";
     std::cout << "    A/D = base rotate left/right (direct J1 velocity, no Cartesian Y IK)\n";
     std::cout << "    R/F = endpoint up/down in that same vertical plane while allowing wrist pitch/J5 for usable vertical motion\n";
@@ -3366,6 +3380,36 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     auto keyDown = [](int virtualKey) -> bool
     {
         return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    };
+
+    auto normalizeXboxThumb = [](SHORT rawValue) -> double
+    {
+        const double denominator = rawValue >= 0 ? 32767.0 : 32768.0;
+        double value = static_cast<double>(rawValue) / denominator;
+        value = std::max(-1.0, std::min(1.0, value));
+        const double magnitude = std::fabs(value);
+        if (magnitude <= EndpointCartesianXboxStickDeadzone)
+        {
+            return 0.0;
+        }
+        const double scaled = (magnitude - EndpointCartesianXboxStickDeadzone) /
+            (1.0 - EndpointCartesianXboxStickDeadzone);
+        const double signedScaled = std::copysign(std::min(1.0, scaled), value);
+        return std::round(signedScaled / EndpointCartesianXboxQuantizationStep) *
+            EndpointCartesianXboxQuantizationStep;
+    };
+
+    auto normalizeXboxTrigger = [](BYTE rawValue) -> double
+    {
+        const double value = static_cast<double>(rawValue) / 255.0;
+        if (value <= EndpointCartesianXboxTriggerDeadzone)
+        {
+            return 0.0;
+        }
+        const double scaled = (value - EndpointCartesianXboxTriggerDeadzone) /
+            (1.0 - EndpointCartesianXboxTriggerDeadzone);
+        return std::round(std::min(1.0, scaled) / EndpointCartesianXboxQuantizationStep) *
+            EndpointCartesianXboxQuantizationStep;
     };
 
     auto directionName = [](const CartesianVector& direction) -> std::string
@@ -3409,7 +3453,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             }
         }
 
-        std::cout << "Endpoint-only Cartesian keyboard jog ready. Hold keys to jog; release keys to decelerate. Press H to return to run-start pose. Press Q or Esc to exit.\n";
+        std::cout << "Endpoint-only Cartesian keyboard jog ready. Hold keys to jog; release keys/sticks to decelerate. Press H or Xbox Y to return to run-start pose. Press Q/Esc or Xbox B/Back to exit.\n";
+        if (xboxControllerEnabled)
+        {
+            std::cout << "Xbox controller mode is active. If no controller is connected, keyboard controls remain available and the loop will keep waiting.\n";
+        }
         std::cout << "Smooth mode: W/S reach with J1/J4/J6 held and J5 allowed for tool-pitch compensation; R/F vertical jog with J1/J4/J6 held and J5 allowed; A/D direct base/J1 velocity. No repeated PVT chunks while held.\n";
 
         bool cartesianVelocityJogActive = false;
@@ -4030,11 +4078,17 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
         auto nextYVelocityRefresh = std::chrono::steady_clock::now();
         bool exitRequested = false;
         bool hKeyWasDown = false;
+        bool xboxHomeButtonWasDown = false;
+        bool xboxWasConnected = false;
         int cartesianJogTransitions = 0;
 
         while (!exitRequested)
         {
             requestedDirection.fill(0.0);
+            bool analogControllerDirection = false;
+            bool xboxStopButtonDown = false;
+            bool xboxHomeButtonDown = false;
+            bool xboxExitButtonDown = false;
 
             if (keyDown('W'))
             {
@@ -4085,7 +4139,89 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 requestedDirection[5] -= 1.0;
             }
 
-            if (keyDown(VK_SPACE))
+            if (xboxControllerEnabled)
+            {
+                XINPUT_STATE xboxState{};
+                const DWORD xboxResult = XInputGetState(0, &xboxState);
+                const bool xboxConnected = xboxResult == ERROR_SUCCESS;
+                if (xboxConnected && !xboxWasConnected)
+                {
+                    std::cout << "Xbox controller connected on XInput slot 0.\n";
+                }
+                else if (!xboxConnected && xboxWasConnected)
+                {
+                    std::cout << "Xbox controller disconnected; keyboard controls remain active.\n";
+                }
+                xboxWasConnected = xboxConnected;
+
+                if (xboxConnected)
+                {
+                    const XINPUT_GAMEPAD& pad = xboxState.Gamepad;
+                    const double leftX = normalizeXboxThumb(pad.sThumbLX);
+                    const double leftY = normalizeXboxThumb(pad.sThumbLY);
+                    const double rightX = normalizeXboxThumb(pad.sThumbRX);
+                    const double rightY = normalizeXboxThumb(pad.sThumbRY);
+                    const double leftTrigger = normalizeXboxTrigger(pad.bLeftTrigger);
+                    const double rightTrigger = normalizeXboxTrigger(pad.bRightTrigger);
+
+                    xboxStopButtonDown = (pad.wButtons & XINPUT_GAMEPAD_A) != 0;
+                    xboxHomeButtonDown = (pad.wButtons & XINPUT_GAMEPAD_Y) != 0;
+                    xboxExitButtonDown =
+                        (pad.wButtons & XINPUT_GAMEPAD_B) != 0 ||
+                        (pad.wButtons & XINPUT_GAMEPAD_BACK) != 0;
+
+                    const double absXReach = std::fabs(leftY);
+                    const double absBase = std::fabs(leftX);
+                    const double absZ = std::fabs(rightY);
+
+                    // First controller pass intentionally chooses one dominant
+                    // translational/base command at a time. This prevents a
+                    // diagonal stick from accidentally turning direct base
+                    // rotate into the Cartesian Y path, and keeps the first
+                    // Xbox tests close to the validated keyboard behavior.
+                    if (absXReach >= absBase && absXReach >= absZ && absXReach > 0.0)
+                    {
+                        requestedDirection[0] += leftY;
+                        analogControllerDirection = true;
+                    }
+                    else if (absBase >= absXReach && absBase >= absZ && absBase > 0.0)
+                    {
+                        requestedDirection[1] += leftX;
+                        analogControllerDirection = true;
+                    }
+                    else if (absZ > 0.0)
+                    {
+                        requestedDirection[2] += rightY;
+                        analogControllerDirection = true;
+                    }
+
+                    if ((pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0)
+                    {
+                        requestedDirection[3] += 1.0;
+                    }
+                    if ((pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0)
+                    {
+                        requestedDirection[3] -= 1.0;
+                    }
+                    if (rightTrigger > 0.0)
+                    {
+                        requestedDirection[4] += rightTrigger;
+                        analogControllerDirection = true;
+                    }
+                    if (leftTrigger > 0.0)
+                    {
+                        requestedDirection[4] -= leftTrigger;
+                        analogControllerDirection = true;
+                    }
+                    if (std::fabs(rightX) > 0.0 && absZ <= 0.0)
+                    {
+                        requestedDirection[5] += rightX;
+                        analogControllerDirection = true;
+                    }
+                }
+            }
+
+            if (keyDown(VK_SPACE) || xboxStopButtonDown)
             {
                 requestedDirection.fill(0.0);
                 stopCartesianVelocityJog("keyboard Cartesian Space stop");
@@ -4096,7 +4232,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             }
 
             const bool hKeyDown = keyDown('H');
-            if (hKeyDown && !hKeyWasDown)
+            const bool homeRequested = (hKeyDown && !hKeyWasDown) ||
+                (xboxHomeButtonDown && !xboxHomeButtonWasDown);
+            if (homeRequested)
             {
                 requestedDirection.fill(0.0);
                 stopCartesianVelocityJog("keyboard Cartesian H-home");
@@ -4116,8 +4254,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 nextYVelocityRefresh = std::chrono::steady_clock::now();
             }
             hKeyWasDown = hKeyDown;
+            xboxHomeButtonWasDown = xboxHomeButtonDown;
 
-            if (keyDown('Q') || keyDown(VK_ESCAPE))
+            if (keyDown('Q') || keyDown(VK_ESCAPE) || xboxExitButtonDown)
             {
                 exitRequested = true;
                 requestedDirection.fill(0.0);
@@ -4130,21 +4269,26 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             }
             magnitude = std::sqrt(magnitude);
 
-            if (magnitude > 1e-9)
+            if (magnitude > 1e-9 && !analogControllerDirection)
             {
                 for (double& component : requestedDirection)
                 {
                     component /= magnitude;
                 }
+                magnitude = 1.0;
             }
 
+            const double directionChangeThreshold = analogControllerDirection
+                ? EndpointCartesianXboxDirectionChangeThreshold
+                : 1e-9;
             const bool directionChanged =
-                std::fabs(requestedDirection[0] - activeDirection[0]) > 1e-9 ||
-                std::fabs(requestedDirection[1] - activeDirection[1]) > 1e-9 ||
-                std::fabs(requestedDirection[2] - activeDirection[2]) > 1e-9 ||
-                std::fabs(requestedDirection[3] - activeDirection[3]) > 1e-9 ||
-                std::fabs(requestedDirection[4] - activeDirection[4]) > 1e-9 ||
-                std::fabs(requestedDirection[5] - activeDirection[5]) > 1e-9;
+                std::fabs(requestedDirection[0] - activeDirection[0]) > directionChangeThreshold ||
+                std::fabs(requestedDirection[1] - activeDirection[1]) > directionChangeThreshold ||
+                std::fabs(requestedDirection[2] - activeDirection[2]) > directionChangeThreshold ||
+                std::fabs(requestedDirection[3] - activeDirection[3]) > directionChangeThreshold ||
+                std::fabs(requestedDirection[4] - activeDirection[4]) > directionChangeThreshold ||
+                std::fabs(requestedDirection[5] - activeDirection[5]) > directionChangeThreshold ||
+                (magnitude <= 1e-9 && (std::fabs(activeDirection[0]) > 1e-9 || std::fabs(activeDirection[1]) > 1e-9 || std::fabs(activeDirection[2]) > 1e-9 || std::fabs(activeDirection[3]) > 1e-9 || std::fabs(activeDirection[4]) > 1e-9 || std::fabs(activeDirection[5]) > 1e-9));
 
             if (directionChanged)
             {

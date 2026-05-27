@@ -87,3 +87,42 @@ Run this with the robot in a safe test envelope and an E-stop ready:
 - Do not regress release-stop behavior: normal key release should stop motion cleanly while keeping amps enabled.
 - Do not regress `H` behavior: H-home should return to the run-start joint pose and keep jog mode active.
 - Do not require robot hardware for documentation or cleanup validation. Live hardware testing is separate.
+
+## Optional Xbox 360 controller test mode
+
+The keyboard jog mode can also poll an Xbox 360-compatible controller through XInput when launched with `--xbox-controller`.
+Keyboard controls remain active in this mode.
+
+Initial controller mapping:
+
+- Left stick Y: X reach/retract in the current base-facing vertical plane.
+- Left stick X: direct base/J1 rotate.
+- Right stick Y: Z up/down.
+- Right stick X: yaw.
+- LB/RB: roll.
+- LT/RT: pitch.
+- A: smooth stop / idle.
+- Y: H-home return to the run-start joint pose.
+- B or Back: exit jog mode safely.
+
+The first controller pass intentionally chooses one dominant translation/base command at a time from the two sticks.
+This keeps the joystick path close to the validated keyboard behavior and avoids diagonal stick input accidentally entering the old Cartesian Y path.
+
+Recommended first controller test command:
+
+```powershell
+.\build-vs2022\Release\racer3-basic-motion.exe `
+  --keyboard-cartesian-jog-endpoint-only `
+  --xbox-controller `
+  --cartesian-jog-linear-speed 0.016 `
+  --keyboard-base-rotate-speed 0.018 `
+  --cartesian-jog-angular-speed 0.08 `
+  --cartesian-jog-gain-x 4.5 `
+  --cartesian-jog-gain-y 0.80 `
+  --cartesian-jog-gain-z 0.85 `
+  --cartesian-jog-max-joint-velocity 0.045 `
+  --keyboard-startup-delay-seconds 15 `
+  --confirm-keyboard-cartesian-jog
+```
+
+Start slower than the validated keyboard profile, confirm there is no stick drift at center, then increase toward the keyboard profile after the mapping is verified.

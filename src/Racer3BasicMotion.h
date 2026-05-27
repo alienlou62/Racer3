@@ -93,7 +93,8 @@ public:
         double gainY,
         double gainZ,
         double maxJointVelocityUserUnitsPerSecond,
-        double baseRotateVelocityUserUnitsPerSecond);
+        double baseRotateVelocityUserUnitsPerSecond,
+        bool xboxControllerEnabled);
 
 private:
     void connectController();

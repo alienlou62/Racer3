@@ -46,7 +46,7 @@ if(NOT RACER3_INTIME_ONLY_BUILD)
     target_link_libraries(racer3-basic-motion PRIVATE ${RSI_LIBRARY})
 
     if(WIN32)
-        target_link_libraries(racer3-basic-motion PRIVATE ws2_32)
+        target_link_libraries(racer3-basic-motion PRIVATE ws2_32 Xinput)
     endif()
 endif()
 

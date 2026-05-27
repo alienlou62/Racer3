@@ -53,7 +53,7 @@ void printUsage()
         << "  racer3-basic-motion --session-server\n"
         << "  racer3-basic-motion --prearm-hold [--velocity 0.002] [--diagnostics]\n"
         << "  racer3-basic-motion --keyboard-jog-endpoint-only --jog-axis 6 [--velocity 0.002] [--confirm-keyboard-jog] [--diagnostics]\n"
-        << "  racer3-basic-motion --keyboard-cartesian-jog-endpoint-only [--cartesian-jog-linear-speed 0.006] [--keyboard-base-rotate-speed 0.015] [--cartesian-jog-gain-x 1.0] [--cartesian-jog-gain-z 0.65] [--cartesian-jog-max-joint-velocity 0.030] [--confirm-keyboard-cartesian-jog] [--diagnostics]\n\n"
+        << "  racer3-basic-motion --keyboard-cartesian-jog-endpoint-only [--xbox-controller] [--cartesian-jog-linear-speed 0.006] [--keyboard-base-rotate-speed 0.015] [--cartesian-jog-gain-x 1.0] [--cartesian-jog-gain-z 0.65] [--cartesian-jog-max-joint-velocity 0.030] [--confirm-keyboard-cartesian-jog] [--diagnostics]\n\n"
         << "Modes:\n"
         << "  --dry-run          Print the planned sequence only. No RMP connection.\n"
         << "  --enable-only      Connect, clear faults, enable, wait, disable. This is the default.\n"
@@ -70,6 +70,7 @@ void printUsage()
         << "  --prearm-hold Start the same bottom-to-top all-axis pre-arm/enable path, print prearm_ready, hold amps enabled, and wait for shutdown on stdin. Used by RTTask jog proof.\n"
         << "  --keyboard-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ keyboard loop for endpoint-only Axis 6/J6 jog pulses.\n"
         << "  --keyboard-cartesian-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ operator-friendly keyboard loop: W/S endpoint X, R/F endpoint Z, A/D direct base rotate, H home, Q/Esc exit.\n"
+        << "  --xbox-controller Also poll XInput slot 0 for an Xbox 360-compatible controller during --keyboard-cartesian-jog-endpoint-only. Left stick Y=X reach, left stick X=base, right stick Y=Z, Y=H-home, B/Back=exit. Keyboard stays active.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -995,6 +996,7 @@ int main(int argc, char* argv[])
             const double loopPeriodMs = getDoubleOption(args, "--keyboard-jog-period-ms", DefaultKeyboardJogLoopPeriodMilliseconds);
             const bool confirmed = hasArg(args, "--confirm-keyboard-cartesian-jog");
             const bool diagnostics = hasArg(args, "--diagnostics");
+            const bool xboxControllerEnabled = hasArg(args, "--xbox-controller") || hasArg(args, "--xbox-cartesian-jog");
 
             const double startupDelaySeconds = getDoubleOption(args, "--keyboard-startup-delay-seconds", 8.0);
             if (startupDelaySeconds > 0.0)
@@ -1017,7 +1019,8 @@ int main(int argc, char* argv[])
                 gainY,
                 gainZ,
                 maxJointVelocity,
-                baseRotateSpeed);
+                baseRotateSpeed,
+                xboxControllerEnabled);
             return 0;
         }
         catch (const RR::RsiError& error)
