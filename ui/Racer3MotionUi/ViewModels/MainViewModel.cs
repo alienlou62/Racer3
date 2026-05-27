@@ -64,7 +64,9 @@ public sealed class MainViewModel : ObservableObject
     private double _jogStepMeters = 0.005;
     private double _jogVelocity = 0.003;
     private bool _isBackendJogActive;
+    private bool _isXboxControllerJogActive;
     private string _activeJogDirection = string.Empty;
+    private string _xboxControllerStatus = "Xbox controller jog ready to launch";
     private readonly SemaphoreSlim _jogCommandSemaphore = new(1, 1);
 
     public MainViewModel(
@@ -98,6 +100,7 @@ public sealed class MainViewModel : ObservableObject
         ShutdownSessionCommand = new AsyncRelayCommand(ShutdownSessionAsync, CanUseSessionControls);
         StopSessionMotionCommand = new AsyncRelayCommand(StopSessionMotionAsync, CanUseSessionControls);
         RunSessionShapeCommand = new AsyncRelayCommand(RunSessionShapeAsync, CanRunSessionShape);
+        StartXboxControllerJogCommand = new AsyncRelayCommand(StartXboxControllerJogAsync, CanStartXboxControllerJog);
 
         RefreshMotionAssistantStatus();
         AppendAssistantLog("Assistant ready. Chat updates the plan preview only.");
@@ -121,6 +124,8 @@ public sealed class MainViewModel : ObservableObject
     public IAsyncRelayCommand StopSessionMotionCommand { get; }
 
     public IAsyncRelayCommand RunSessionShapeCommand { get; }
+
+    public IAsyncRelayCommand StartXboxControllerJogCommand { get; }
 
     public bool CanUseBackendJogControls => IsJogModeEnabled && _robotSessionService.IsRunning && !IsProcessActive;
 
@@ -435,6 +440,26 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _activeJogDirection, value);
     }
 
+    public bool IsXboxControllerJogActive
+    {
+        get => _isXboxControllerJogActive;
+        private set
+        {
+            if (SetProperty(ref _isXboxControllerJogActive, value))
+            {
+                StartXboxControllerJogCommand.NotifyCanExecuteChanged();
+            }
+        }
+    }
+
+    public string XboxControllerStatus
+    {
+        get => _xboxControllerStatus;
+        private set => SetProperty(ref _xboxControllerStatus, value);
+    }
+
+    public string XboxControllerMapping => "Left stick Y = X reach/retract; left stick X = base rotate; right stick Y = faster Z up/down; LT/RT = direct J5 pitch aim; LB/RB = direct J4 roll; right stick X = direct J6 yaw; Y = H-home; B/Back = exit.";
+
     private void SelectShape(string? shapeName)
     {
         if (Enum.TryParse<ShapeKind>(shapeName, out var shape))
@@ -621,6 +646,80 @@ public sealed class MainViewModel : ObservableObject
                Velocity > 0.0 &&
                ShapeSizeMeters > 0.0 &&
                (IsDryRun || ConfirmMotion);
+    }
+
+    private bool CanStartXboxControllerJog()
+    {
+        return !IsProcessActive && !_robotSessionService.IsRunning;
+    }
+
+    private async Task StartXboxControllerJogAsync()
+    {
+        if (_robotSessionService.IsRunning)
+        {
+            LastRunStatus = "Xbox jog blocked";
+            LastRunDetail = "Shutdown the persistent armed session before starting standalone Xbox Controller Jog.";
+            XboxControllerStatus = "Blocked: armed session is already running";
+            AppendLog("ui", "Xbox Controller Jog blocked because the persistent armed session is active. Shutdown Session first so the standalone controller process can own rsiconfig/RMP startup and shutdown.");
+            return;
+        }
+
+        LastRunStatus = "Xbox jog starting";
+        LastRunDetail = "Starting standalone Xbox Controller Jog with faster Z and direct wrist joint aiming.";
+        XboxControllerStatus = "Starting Xbox Controller Jog...";
+        ModeState = "Xbox controller jog running";
+        AppendLog("ui", "Xbox Controller Jog requested from UI. This launches the standalone backend mode with --xbox-controller and streams logs here.");
+        AppendLog("ui", XboxControllerMapping);
+
+        using var cancellation = new CancellationTokenSource();
+        _runCancellation = cancellation;
+        IsProcessActive = true;
+        IsXboxControllerJogActive = true;
+
+        try
+        {
+            var progress = new Progress<ProcessOutputLine>(line => AppendLog(line.Stream, line.Text));
+            var result = await _robotMotionService.RunXboxControllerJogAsync(progress, cancellation.Token);
+            AppendLog("ui", $"Xbox Controller Jog process exited with code {result.ExitCode}.");
+
+            if (result.Succeeded)
+            {
+                LastRunStatus = "Xbox jog complete";
+                LastRunDetail = "Controller jog exited cleanly. Backend disabled amps and cleared faults.";
+                XboxControllerStatus = "Xbox Controller Jog exited cleanly";
+                ModeState = "Xbox jog complete";
+            }
+            else
+            {
+                LastRunStatus = "Xbox jog failed";
+                LastRunDetail = $"Controller jog exited with code {result.ExitCode}. Check Process Log.";
+                XboxControllerStatus = "Xbox Controller Jog failed";
+                ModeState = "Xbox jog failed";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            LastRunStatus = "Xbox jog stopped";
+            LastRunDetail = "UI Stop cancelled the standalone controller jog process.";
+            XboxControllerStatus = "Xbox Controller Jog stopped by UI";
+            AppendLog("ui", "Xbox Controller Jog stopped by UI. The process runner killed the backend process tree; check robot state before restarting.");
+            ModeState = "Stopped";
+        }
+        catch (Exception exception)
+        {
+            LastRunStatus = "Xbox jog error";
+            LastRunDetail = exception.Message;
+            XboxControllerStatus = "Xbox Controller Jog error";
+            AppendLog("err", exception.Message);
+            ModeState = "Error";
+        }
+        finally
+        {
+            _runCancellation = null;
+            IsXboxControllerJogActive = false;
+            IsProcessActive = false;
+            RefreshModeState();
+        }
     }
 
     private async Task RunSelectedShapeAsync()

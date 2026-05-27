@@ -10,6 +10,12 @@ public interface IRobotMotionService
 {
     IReadOnlyList<MotionCommand> BuildTraceCommands(ShapeTracePlan plan, RobotMotionOptions options);
 
+    MotionCommand BuildXboxControllerJogCommand();
+
+    Task<MotionExecutionResult> RunXboxControllerJogAsync(
+        IProgress<ProcessOutputLine> output,
+        CancellationToken cancellationToken);
+
     Task<MotionExecutionResult> TraceShapeAsync(
         ShapeTracePlan plan,
         RobotMotionOptions options,

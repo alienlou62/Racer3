@@ -151,6 +151,7 @@ static constexpr int EndpointCartesianKeyboardJogIdleSleepMs = 10;
 static constexpr double EndpointCartesianXboxStickDeadzone = 0.22;
 static constexpr double EndpointCartesianXboxTriggerDeadzone = 0.15;
 static constexpr double EndpointCartesianXboxDirectionChangeThreshold = 0.08;
+static constexpr double EndpointCartesianXboxWristJointVelocityScale = 1.0;
 static constexpr double EndpointCartesianXboxQuantizationStep = 0.05;
 static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.025;
 static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
@@ -3354,7 +3355,8 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
         std::cout << "    Xbox 360 controller enabled with deadzone "
                   << EndpointCartesianXboxStickDeadzone
                   << ": left stick Y = X reach/retract, left stick X = base rotate, right stick Y = Z up/down\n";
-        std::cout << "    Xbox buttons: A = smooth stop, Y = H-home, B/Back = exit. LB/RB = roll, LT/RT = pitch, right stick X = yaw. Use one major stick direction at a time for first tests.\n";
+        std::cout << "    Xbox buttons: A = smooth stop, Y = H-home, B/Back = exit. LB/RB = direct J4 roll, LT/RT = direct J5 pitch, right stick X = direct J6 yaw.\n";
+        std::cout << "    Workflow: use LT/RT to aim the tool forward, release, then use left stick Y to reach while holding that tool orientation.\n";
     }
     std::cout << "    W/S = endpoint forward/back in the current base-facing vertical plane while holding the current tool orientation\n";
     std::cout << "    A/D = base rotate left/right (direct J1 velocity, no Cartesian Y IK)\n";
@@ -3366,6 +3368,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     std::cout << "    H = return to the run-start joint pose, then keep jogging\n";
     std::cout << "    Q or Esc = shutdown, disable amps, clear faults, exit\n";
     std::cout << "  This loop runs in the local C++ backend. W/S uses base-facing vertical-plane Jacobian/DLS endpoint velocity with J1/J4/J6 held and J5 allowed as a pitch/orientation compensator; R/F uses vertical-plane Z jog with J1/J4/J6 held and J5 allowed; A/D directly rotate J1 for operator-friendly aiming.\n";
+    std::cout << "  Manual wrist commands are direct joint jogs: J4 roll, J5 pitch, J6 yaw. Use them to aim the tool, then reach with X/Z while the solver preserves that orientation.\n";
     std::cout << "  Return-to-start on exit: disabled. Jog mode exits directly on Q/Esc.\n";
 
     if (!motionConfirmed)
@@ -3617,6 +3620,86 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                           << " at J1 velocity="
                           << velocity[0]
                           << " user-units/sec using direct MultiAxis::MoveVelocitySCurve. Joint velocity [J1..J6] user-units/sec: ";
+                printJointVector(velocity);
+
+                multiAxis_->MoveVelocitySCurve(
+                    velocity.data(),
+                    acceleration.data(),
+                    jerk.data());
+
+                cartesianVelocityJogActive = true;
+                cartesianVelocityJogLabel = newDirectionName;
+                lastCartesianVelocityCommand = velocity;
+                return;
+            }
+
+            const bool directWristJointJog =
+                std::fabs(direction[0]) <= 1e-9 &&
+                std::fabs(direction[1]) <= 1e-9 &&
+                std::fabs(direction[2]) <= 1e-9 &&
+                (std::fabs(direction[3]) > 1e-9 ||
+                 std::fabs(direction[4]) > 1e-9 ||
+                 std::fabs(direction[5]) > 1e-9);
+
+            if (directWristJointJog)
+            {
+                JointVector velocity{};
+                JointVector acceleration{};
+                JointVector jerk{};
+
+                const double wristVelocityUserUnitsPerSecond =
+                    (angularSpeedRadiansPerSecond / RevolutionsToRadians) *
+                    EndpointCartesianXboxWristJointVelocityScale;
+
+                // Direct joint jog for manual wrist aiming. This makes Xbox
+                // LT/RT feel like a predictable J5 pitch control instead of a
+                // Cartesian angular solve that may borrow shoulder/elbow motion.
+                // Once the user releases the wrist command, W/S and R/F continue
+                // through the Cartesian solver and hold the newly selected tool
+                // orientation in TCP/orientation space.
+                velocity[3] = direction[3] * wristVelocityUserUnitsPerSecond; // J4 roll
+                velocity[4] = direction[4] * wristVelocityUserUnitsPerSecond; // J5 pitch
+                velocity[5] = direction[5] * wristVelocityUserUnitsPerSecond; // J6 yaw
+
+                for (int axis = 0; axis < AxisCount; ++axis)
+                {
+                    acceleration[axis] = EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2;
+                    jerk[axis] = EndpointCartesianKeyboardJogJerkPercent;
+                }
+
+                double maxJointVelocity = maxAbsJointValue(velocity);
+                if (maxJointVelocity > maxJointVelocityUserUnitsPerSecond)
+                {
+                    const double velocityScale = maxJointVelocityUserUnitsPerSecond / maxJointVelocity;
+                    std::cout << "Smooth operator wrist joint jog clamp: requested max "
+                              << maxJointVelocity
+                              << " user-units/sec exceeds limit "
+                              << maxJointVelocityUserUnitsPerSecond
+                              << ". Scaling by "
+                              << velocityScale
+                              << ".\n";
+                    for (double& value : velocity)
+                    {
+                        value *= velocityScale;
+                    }
+                    maxJointVelocity = maxAbsJointValue(velocity);
+                }
+
+                const std::string newDirectionName = directionName(direction);
+                const bool continuingSameVelocityJog =
+                    cartesianVelocityJogActive &&
+                    cartesianVelocityJogLabel == newDirectionName;
+                if (!continuingSameVelocityJog)
+                {
+                    cartesianVelocityJogStartPose = currentPose;
+                    cartesianVelocityJogStartUserUnits = actualUserUnits;
+                }
+
+                std::cout << (continuingSameVelocityJog ? "Refreshing" : "Starting")
+                          << " smooth operator wrist joint jog direction "
+                          << newDirectionName
+                          << " using direct J4/J5/J6 MultiAxis::MoveVelocitySCurve. "
+                          << "Joint velocity [J1..J6] user-units/sec: ";
                 printJointVector(velocity);
 
                 multiAxis_->MoveVelocitySCurve(

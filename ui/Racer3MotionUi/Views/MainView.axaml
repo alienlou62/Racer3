@@ -248,6 +248,30 @@
 
                 <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
                     <StackPanel Spacing="8">
+                        <TextBlock Text="Xbox Controller Jog" Classes="PanelTitle"/>
+                        <TextBlock Text="Launches the validated standalone Xbox 360 controller mode and streams the backend logs into this panel."
+                                   Classes="Label"
+                                   TextWrapping="Wrap"/>
+                        <TextBlock Text="{Binding XboxControllerStatus}"
+                                   Foreground="#DCE6F2"
+                                   TextWrapping="Wrap"
+                                   FontSize="12"/>
+                        <TextBlock Text="{Binding XboxControllerMapping}"
+                                   Classes="Label"
+                                   TextWrapping="Wrap"/>
+                        <Button Content="Start Xbox Controller Jog"
+                                Classes="Primary"
+                                Command="{Binding StartXboxControllerJogCommand}"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"/>
+                        <TextBlock Text="Controls: keep sticks centered during startup. LT/RT aims J5 pitch so the tool can point forward, LB/RB jogs J4 roll, right stick X jogs J6 yaw. Left stick Y reaches/retracts while preserving that tool orientation; right stick Y jogs faster Z; Y returns home; B/Back exits. Use the UI Stop button only as an emergency process stop."
+                                   Classes="Label"
+                                   TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="#0C1219" BorderBrush="#253446" BorderThickness="1" Padding="12">
+                    <StackPanel Spacing="8">
                         <TextBlock Text="Backend Cartesian Jog" Classes="PanelTitle"/>
                         <CheckBox Content="Enable Jog Mode" IsChecked="{Binding IsJogModeEnabled}"/>
                         <Grid ColumnDefinitions="*,*">
@@ -267,10 +291,7 @@
                                 PointerReleased="OnJogPointerReleased"
                                 HorizontalAlignment="Stretch"
                                 HorizontalContentAlignment="Center"/>
-                        <TextBlock Text="Keyboard: hold S or Down Arrow for Z-. Release stops. Space/Escape/lost focus also send one jog stop. Default is now 0.003 m/s after 0.002 m/s was smooth but still a little slow."
-                                   Classes="Label"
-                                   TextWrapping="Wrap"/>
-                        <TextBlock Text="UI sends only jog_start/jog_stop intent. The backend owns endpoint-only PVT smoothing-burst jogging; X/Y/Z+ are intentionally not wired yet."
+                        <TextBlock Text="Legacy persistent-session jog controls remain available for backend hold-test work. The new Xbox controller path above is the preferred operator jog UI because it launches the validated --xbox-controller mode and streams full logs."
                                    Classes="Label"
                                    TextWrapping="Wrap"/>
                     </StackPanel>

@@ -59,7 +59,7 @@ Write-Host "`n== Start current validated jog test =="
   --cartesian-jog-angular-speed 0.10 `
   --cartesian-jog-gain-x 6.5 `
   --cartesian-jog-gain-y 0.80 `
-  --cartesian-jog-gain-z 0.85 `
+  --cartesian-jog-gain-z 1.20 `
   --cartesian-jog-max-joint-velocity 0.060 `
   --keyboard-startup-delay-seconds 15 `
   --confirm-keyboard-cartesian-jog
@@ -97,16 +97,16 @@ Initial controller mapping:
 
 - Left stick Y: X reach/retract in the current base-facing vertical plane.
 - Left stick X: direct base/J1 rotate.
-- Right stick Y: Z up/down.
-- Right stick X: yaw.
-- LB/RB: roll.
-- LT/RT: pitch.
+- Right stick Y: faster Z up/down.
+- Right stick X: direct J6 yaw aim.
+- LB/RB: direct J4 roll aim.
+- LT/RT: direct J5 pitch aim.
 - A: smooth stop / idle.
 - Y: H-home return to the run-start joint pose.
 - B or Back: exit jog mode safely.
 
 The first controller pass intentionally chooses one dominant translation/base command at a time from the two sticks.
-This keeps the joystick path close to the validated keyboard behavior and avoids diagonal stick input accidentally entering the old Cartesian Y path.
+This keeps the joystick path close to the validated keyboard behavior and avoids diagonal stick input accidentally entering the old Cartesian Y path. Manual wrist inputs are direct joint jogs for J4/J5/J6; use LT/RT to point the tool forward, release, then use left stick Y to reach while the Cartesian solver preserves the selected tool orientation.
 
 Recommended first controller test command:
 
@@ -114,13 +114,13 @@ Recommended first controller test command:
 .\build-vs2022\Release\racer3-basic-motion.exe `
   --keyboard-cartesian-jog-endpoint-only `
   --xbox-controller `
-  --cartesian-jog-linear-speed 0.016 `
-  --keyboard-base-rotate-speed 0.018 `
-  --cartesian-jog-angular-speed 0.08 `
-  --cartesian-jog-gain-x 4.5 `
+  --cartesian-jog-linear-speed 0.020 `
+  --keyboard-base-rotate-speed 0.022 `
+  --cartesian-jog-angular-speed 0.09 `
+  --cartesian-jog-gain-x 5.5 `
   --cartesian-jog-gain-y 0.80 `
-  --cartesian-jog-gain-z 0.85 `
-  --cartesian-jog-max-joint-velocity 0.045 `
+  --cartesian-jog-gain-z 1.20 `
+  --cartesian-jog-max-joint-velocity 0.060 `
   --keyboard-startup-delay-seconds 15 `
   --confirm-keyboard-cartesian-jog
 ```

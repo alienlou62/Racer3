@@ -70,7 +70,7 @@ void printUsage()
         << "  --prearm-hold Start the same bottom-to-top all-axis pre-arm/enable path, print prearm_ready, hold amps enabled, and wait for shutdown on stdin. Used by RTTask jog proof.\n"
         << "  --keyboard-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ keyboard loop for endpoint-only Axis 6/J6 jog pulses.\n"
         << "  --keyboard-cartesian-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ operator-friendly keyboard loop: W/S endpoint X, R/F endpoint Z, A/D direct base rotate, H home, Q/Esc exit.\n"
-        << "  --xbox-controller Also poll XInput slot 0 for an Xbox 360-compatible controller during --keyboard-cartesian-jog-endpoint-only. Left stick Y=X reach, left stick X=base, right stick Y=Z, Y=H-home, B/Back=exit. Keyboard stays active.\n"
+        << "  --xbox-controller Also poll XInput slot 0 for an Xbox 360-compatible controller during --keyboard-cartesian-jog-endpoint-only. Left stick Y=X reach, left stick X=base, right stick Y=Z, LT/RT=direct J5 pitch, LB/RB=direct J4 roll, right stick X=direct J6 yaw, Y=H-home, B/Back=exit. Keyboard stays active.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
