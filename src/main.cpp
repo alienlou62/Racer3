@@ -71,6 +71,8 @@ void printUsage()
         << "  --keyboard-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ keyboard loop for endpoint-only Axis 6/J6 jog pulses.\n"
         << "  --keyboard-cartesian-jog-endpoint-only Start the bottom-to-top all-axis pre-arm path, then run a local C++ operator-friendly keyboard loop: W/S endpoint X, R/F endpoint Z, A/D direct base rotate, H home, Q/Esc exit.\n"
         << "  --xbox-controller Also poll XInput slot 0 for an Xbox 360-compatible controller during --keyboard-cartesian-jog-endpoint-only. Left stick Y=X reach, left stick X=base, right stick Y=Z, LT/RT=direct J5 pitch, LB/RB=direct J4 roll, right stick X=direct J6 yaw, Y=H-home, B/Back=exit. Keyboard stays active.\n"
+        << "  --xbox-soft-limit-test-window Add a temporary narrow soft-limit window around the run-start wrist pose for J4/J5/J6. Use for guard testing before approaching real joint limits.\n"
+        << "  --xbox-soft-limit-near-full-range Use broader operator soft limits with conservative reserves for almost-full-range Xbox jog testing. Mutually exclusive with --xbox-soft-limit-test-window.\n"
         << "  --position-only   For --cartesian-vector, solve and validate only XYZ position. Roll/pitch/yaw residual is printed but not gated.\n"
         << "  --compact-motion For --cartesian-vector confirmed segmented motion, skip per-segment live samples/status dumps.\n"
         << "  --append-motion  Experimental: queue segmented MoveRelative commands with APPEND.\n"
@@ -997,6 +999,8 @@ int main(int argc, char* argv[])
             const bool confirmed = hasArg(args, "--confirm-keyboard-cartesian-jog");
             const bool diagnostics = hasArg(args, "--diagnostics");
             const bool xboxControllerEnabled = hasArg(args, "--xbox-controller") || hasArg(args, "--xbox-cartesian-jog");
+            const bool xboxSoftLimitTestWindowEnabled = hasArg(args, "--xbox-soft-limit-test-window");
+            const bool xboxSoftLimitNearFullRangeEnabled = hasArg(args, "--xbox-soft-limit-near-full-range");
 
             const double startupDelaySeconds = getDoubleOption(args, "--keyboard-startup-delay-seconds", 8.0);
             if (startupDelaySeconds > 0.0)
@@ -1020,7 +1024,9 @@ int main(int argc, char* argv[])
                 gainZ,
                 maxJointVelocity,
                 baseRotateSpeed,
-                xboxControllerEnabled);
+                xboxControllerEnabled,
+                xboxSoftLimitTestWindowEnabled,
+                xboxSoftLimitNearFullRangeEnabled);
             return 0;
         }
         catch (const RR::RsiError& error)

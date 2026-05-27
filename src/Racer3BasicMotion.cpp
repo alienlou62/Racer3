@@ -201,21 +201,28 @@ static constexpr int EndpointCartesianKeyboardJogVelocityStopDoneWaitMs = 1500;
 static constexpr double EndpointCartesianJogSoftLimitReserveDegrees = 5.0;
 static constexpr double EndpointCartesianJogSoftLimitLookaheadSeconds = 0.40;
 static constexpr double EndpointCartesianJogSoftLimitNearZeroVelocityUserUnitsPerSecond = 1e-6;
+static constexpr double EndpointCartesianJogWristGuardJ4LimitDegrees = 135.0;
+static constexpr double EndpointCartesianJogWristGuardJ5LimitDegrees = 95.0;
+static constexpr double EndpointCartesianJogTestWindowJ4Degrees = 20.0;
+static constexpr double EndpointCartesianJogTestWindowJ5Degrees = 20.0;
+static constexpr double EndpointCartesianJogTestWindowJ6Degrees = 30.0;
+static constexpr double EndpointCartesianJogNearFullRangeReserveDegrees = 10.0;
+static constexpr double EndpointCartesianJogNearFullJ4LimitDegrees = 120.0;
 static constexpr std::array<double, Racer3BasicMotion::AxisCount> EndpointCartesianJogSoftMinUserUnits = {
     (-150.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
     (-75.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
     (-155.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
-    (-180.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (-EndpointCartesianJogWristGuardJ4LimitDegrees) / 360.0,
     (-105.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
-    (-720.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    -std::numeric_limits<double>::infinity(),
 };
 static constexpr std::array<double, Racer3BasicMotion::AxisCount> EndpointCartesianJogSoftMaxUserUnits = {
     (150.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
     (115.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
     (90.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
-    (180.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    (EndpointCartesianJogWristGuardJ4LimitDegrees) / 360.0,
     (105.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
-    (720.0 - EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
+    std::numeric_limits<double>::infinity(),
 };
 
 static bool DiagnosticsEnabled = false;
@@ -3277,7 +3284,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     double gainZ,
     double maxJointVelocityUserUnitsPerSecond,
     double baseRotateVelocityUserUnitsPerSecond,
-    bool xboxControllerEnabled)
+    bool xboxControllerEnabled,
+    bool xboxSoftLimitTestWindowEnabled,
+    bool xboxSoftLimitNearFullRangeEnabled)
 {
 #ifndef _WIN32
     (void)linearSpeedMetersPerSecond;
@@ -3291,6 +3300,8 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     (void)maxJointVelocityUserUnitsPerSecond;
     (void)baseRotateVelocityUserUnitsPerSecond;
     (void)xboxControllerEnabled;
+    (void)xboxSoftLimitTestWindowEnabled;
+    (void)xboxSoftLimitNearFullRangeEnabled;
     throw std::runtime_error("Endpoint-only Cartesian keyboard jog currently requires the Windows console backend build.");
 #else
     if (linearSpeedMetersPerSecond <= 0.0)
@@ -3316,6 +3327,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     if (baseRotateVelocityUserUnitsPerSecond <= 0.0)
     {
         throw std::runtime_error("--keyboard-base-rotate-speed must be greater than zero.");
+    }
+
+    if (xboxSoftLimitTestWindowEnabled && xboxSoftLimitNearFullRangeEnabled)
+    {
+        throw std::runtime_error("Use only one soft-limit mode: --xbox-soft-limit-test-window or --xbox-soft-limit-near-full-range.");
     }
 
     if (baseRotateVelocityUserUnitsPerSecond > ArmedSessionCartesianJogMaxJointVelocity)
@@ -3489,13 +3505,32 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
         std::cout << "Smooth mode: W/S reach with J1/J4/J6 held and J5 allowed for tool-pitch compensation; R/F vertical jog with J1/J4/J6 held and J5 allowed; A/D direct base/J1 velocity. No repeated PVT chunks while held.\n";
         std::cout << "Soft-limit guard active: live jog commands are scaled/stopped "
                   << EndpointCartesianJogSoftLimitReserveDegrees
-                  << " deg before modeled joint limits; motion away from a limit remains allowed.\n";
+                  << " deg before modeled joint limits; direct J4 wrist jog is additionally capped at +/-"
+                  << EndpointCartesianJogWristGuardJ4LimitDegrees
+                  << " deg. J6/Yaw is treated as free-spinning/unlimited for operator jogs. Motion away from a limit remains allowed.\n";
+        if (xboxSoftLimitNearFullRangeEnabled)
+        {
+            std::cout << "Near-full Xbox soft-limit range active: operator jogs use broad practical limits with about "
+                      << EndpointCartesianJogNearFullRangeReserveDegrees
+                      << " deg reserve from modeled limits; J4/Roll is capped at +/-"
+                      << EndpointCartesianJogNearFullJ4LimitDegrees
+                      << " deg. J6/Yaw remains free-spinning/unlimited. Do not treat this as permission to hit physical hard limits.\n";
+        }
+        if (xboxSoftLimitTestWindowEnabled)
+        {
+            std::cout << "Temporary Xbox soft-limit TEST WINDOW active: direct wrist jogs are limited relative to the run-start pose "
+                      << "(J4 +/-" << EndpointCartesianJogTestWindowJ4Degrees
+                      << " deg, J5 +/-" << EndpointCartesianJogTestWindowJ5Degrees
+                      << " deg, J6 +/-" << EndpointCartesianJogTestWindowJ6Degrees
+                      << " deg). Use this to validate guard behavior without approaching real limits.\n";
+        }
 
         bool cartesianVelocityJogActive = false;
         std::string cartesianVelocityJogLabel = "idle";
         JointVector lastCartesianVelocityCommand{};
         CartesianVector cartesianVelocityJogStartPose{};
         JointVector cartesianVelocityJogStartUserUnits{};
+        JointVector keyboardJogStartUserUnits{};
 
         auto stopCartesianVelocityJog = [&](const char* reason)
         {
@@ -3585,6 +3620,108 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
         {
             static const char* const jointLabels[AxisCount] = {"J1", "J2", "J3", "J4", "J5", "J6"};
 
+            auto softMinForAxis = [&](int axis) -> double
+            {
+                double softMin = EndpointCartesianJogSoftMinUserUnits[axis];
+
+                // Direct wrist jogging revealed that the modeled J4 +/-180 deg
+                // range was too optimistic for the live RMP/drive configuration.
+                // Keep direct operator jogging comfortably inside a smaller J4
+                // range until the exact drive limit mapping is verified.
+                if (axis == 3)
+                {
+                    softMin = std::max(softMin, -EndpointCartesianJogWristGuardJ4LimitDegrees / 360.0);
+                }
+                if (axis == 4)
+                {
+                    softMin = std::max(softMin, -EndpointCartesianJogWristGuardJ5LimitDegrees / 360.0);
+                }
+                if (xboxSoftLimitNearFullRangeEnabled)
+                {
+                    switch (axis)
+                    {
+                    case 0:
+                        softMin = std::max(softMin, (-150.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 1:
+                        softMin = std::max(softMin, (-75.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 2:
+                        softMin = std::max(softMin, (-155.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 3:
+                        softMin = std::max(softMin, -EndpointCartesianJogNearFullJ4LimitDegrees / 360.0);
+                        break;
+                    case 4:
+                        softMin = std::max(softMin, (-105.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 5:
+                        // J6/Yaw is mechanically free-spinning on this robot, so do not apply
+                        // an operator soft stop in normal or near-full jog mode.
+                        break;
+                    }
+                }
+
+                if (xboxSoftLimitTestWindowEnabled && axis >= 3 && axis <= 5)
+                {
+                    const double windowDegrees = axis == 3
+                        ? EndpointCartesianJogTestWindowJ4Degrees
+                        : (axis == 4 ? EndpointCartesianJogTestWindowJ5Degrees : EndpointCartesianJogTestWindowJ6Degrees);
+                    softMin = std::max(softMin, keyboardJogStartUserUnits[axis] - windowDegrees / 360.0);
+                }
+
+                return softMin;
+            };
+
+            auto softMaxForAxis = [&](int axis) -> double
+            {
+                double softMax = EndpointCartesianJogSoftMaxUserUnits[axis];
+
+                if (axis == 3)
+                {
+                    softMax = std::min(softMax, EndpointCartesianJogWristGuardJ4LimitDegrees / 360.0);
+                }
+                if (axis == 4)
+                {
+                    softMax = std::min(softMax, EndpointCartesianJogWristGuardJ5LimitDegrees / 360.0);
+                }
+                if (xboxSoftLimitNearFullRangeEnabled)
+                {
+                    switch (axis)
+                    {
+                    case 0:
+                        softMax = std::min(softMax, (150.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 1:
+                        softMax = std::min(softMax, (115.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 2:
+                        softMax = std::min(softMax, (90.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 3:
+                        softMax = std::min(softMax, EndpointCartesianJogNearFullJ4LimitDegrees / 360.0);
+                        break;
+                    case 4:
+                        softMax = std::min(softMax, (105.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        break;
+                    case 5:
+                        // J6/Yaw is mechanically free-spinning on this robot, so do not apply
+                        // an operator soft stop in normal or near-full jog mode.
+                        break;
+                    }
+                }
+
+                if (xboxSoftLimitTestWindowEnabled && axis >= 3 && axis <= 5)
+                {
+                    const double windowDegrees = axis == 3
+                        ? EndpointCartesianJogTestWindowJ4Degrees
+                        : (axis == 4 ? EndpointCartesianJogTestWindowJ5Degrees : EndpointCartesianJogTestWindowJ6Degrees);
+                    softMax = std::min(softMax, keyboardJogStartUserUnits[axis] + windowDegrees / 360.0);
+                }
+
+                return softMax;
+            };
+
             double velocityScale = 1.0;
             int limitingAxis = -1;
             const char* limitingSide = "";
@@ -3597,9 +3734,12 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                     continue;
                 }
 
+                const double softMin = softMinForAxis(axis);
+                const double softMax = softMaxForAxis(axis);
+
                 if (jointVelocity > 0.0)
                 {
-                    const double remaining = EndpointCartesianJogSoftMaxUserUnits[axis] - actualUserUnits[axis];
+                    const double remaining = softMax - actualUserUnits[axis];
                     const double axisScale = remaining <= 0.0
                         ? 0.0
                         : std::min(1.0, remaining / (jointVelocity * EndpointCartesianJogSoftLimitLookaheadSeconds));
@@ -3613,7 +3753,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 }
                 else
                 {
-                    const double remaining = actualUserUnits[axis] - EndpointCartesianJogSoftMinUserUnits[axis];
+                    const double remaining = actualUserUnits[axis] - softMin;
                     const double axisScale = remaining <= 0.0
                         ? 0.0
                         : std::min(1.0, remaining / ((-jointVelocity) * EndpointCartesianJogSoftLimitLookaheadSeconds));
@@ -3643,9 +3783,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                           << " soft limit. actual="
                           << actualUserUnits[limitingAxis]
                           << " softRange=["
-                          << EndpointCartesianJogSoftMinUserUnits[limitingAxis]
+                          << softMinForAxis(limitingAxis)
                           << ", "
-                          << EndpointCartesianJogSoftMaxUserUnits[limitingAxis]
+                          << softMaxForAxis(limitingAxis)
                           << "] user-units. Move the opposite direction or press H-home.\n";
 
                 if (cartesianVelocityJogActive)
@@ -3667,9 +3807,9 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                       << " soft limit. actual="
                       << actualUserUnits[limitingAxis]
                       << " softRange=["
-                      << EndpointCartesianJogSoftMinUserUnits[limitingAxis]
+                      << softMinForAxis(limitingAxis)
                       << ", "
-                      << EndpointCartesianJogSoftMaxUserUnits[limitingAxis]
+                      << softMaxForAxis(limitingAxis)
                       << "] user-units.\n";
 
             for (double& value : velocity)
@@ -4231,7 +4371,6 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             lastCartesianVelocityCommand = velocity;
         };
 
-        JointVector keyboardJogStartUserUnits{};
         for (int index = 0; index < AxisCount; ++index)
         {
             keyboardJogStartUserUnits[index] = axes_[index] ? axes_[index]->ActualPositionGet() : 0.0;
@@ -4239,6 +4378,17 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
 
         std::cout << "Keyboard Cartesian jog H-home reference [J1..J6] actual user-units: ";
         printJointVector(keyboardJogStartUserUnits);
+        if (xboxSoftLimitTestWindowEnabled)
+        {
+            std::cout << "Xbox soft-limit test-window reference captured from run-start pose. "
+                      << "Direct wrist jogs should stop near J4 +/-"
+                      << EndpointCartesianJogTestWindowJ4Degrees
+                      << " deg, J5 +/-"
+                      << EndpointCartesianJogTestWindowJ5Degrees
+                      << " deg, J6 +/-"
+                      << EndpointCartesianJogTestWindowJ6Degrees
+                      << " deg from this pose.\n";
+        }
 
         auto returnToKeyboardJogStart = [&]()
         {
@@ -4577,13 +4727,26 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 std::fabs(activeDirection[4]) <= 1e-9 &&
                 std::fabs(activeDirection[5]) <= 1e-9 &&
                 magnitude > 1e-9;
-            if (motionConfirmed && activePlanarLinearRefresh && now >= nextLinearVelocityRefresh)
+            const bool activeDirectJointRefresh =
+                !directionChanged &&
+                cartesianVelocityJogActive &&
+                (std::fabs(activeDirection[1]) > 1e-9 ||
+                 std::fabs(activeDirection[3]) > 1e-9 ||
+                 std::fabs(activeDirection[4]) > 1e-9 ||
+                 std::fabs(activeDirection[5]) > 1e-9) &&
+                std::fabs(activeDirection[0]) <= 1e-9 &&
+                std::fabs(activeDirection[2]) <= 1e-9 &&
+                magnitude > 1e-9;
+            if (motionConfirmed && (activePlanarLinearRefresh || activeDirectJointRefresh) && now >= nextLinearVelocityRefresh)
             {
                 // Recompute W/S/R/F planar jog while held. This is important for
                 // tool-leading W/S reach because the Jacobian changes quickly as
                 // the arm extends; a stale velocity vector lets the endpoint sag
                 // in Z even when the commanded target twist has zero vertical
-                // velocity.
+                // velocity. Also recompute direct base/wrist jogs while held so
+                // the live soft-limit guard can stop a continuous held Xbox
+                // command at the test-window edge instead of only blocking the
+                // next re-start of that direction.
                 startCartesianVelocityJog(activeDirection);
                 nextLinearVelocityRefresh = now +
                     std::chrono::milliseconds(EndpointCartesianKeyboardJogLinearVelocityRefreshMs);

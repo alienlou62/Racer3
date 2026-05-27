@@ -45,7 +45,7 @@ public sealed class PowerShellRobotMotionService : IRobotMotionService
     {
         var command = BuildXboxControllerJogCommand();
 
-        output.Report(new ProcessOutputLine("ui", "Starting Xbox Controller Jog. Keep the controller centered until the backend reports ready; use B on the controller or Stop in the UI to exit."));
+        output.Report(new ProcessOutputLine("ui", "Starting Xbox Controller Jog with near-full operator soft limits. Keep the controller centered until the backend reports ready; use B on the controller or Stop in the UI to exit."));
         output.Report(new ProcessOutputLine("ui", "Xbox mapping: left stick Y=X reach/retract, left stick X=base rotate, right stick Y=Z up/down, right stick X=yaw, LB/RB=roll, LT/RT=pitch, Y=H-home, B/Back=exit."));
         output.Report(new ProcessOutputLine("cmd", command.DisplayText.Replace(Environment.NewLine, " ")));
 
@@ -163,7 +163,7 @@ public sealed class PowerShellRobotMotionService : IRobotMotionService
             "if ($LASTEXITCODE -ne 0) { throw \"rsiconfig failed with exit code $LASTEXITCODE\" }",
             "cd ..",
             "Start-Sleep -Seconds 8",
-            "& " + QuotePowerShell(executablePath) + " --keyboard-cartesian-jog-endpoint-only --xbox-controller --cartesian-jog-linear-speed 0.020 --keyboard-base-rotate-speed 0.022 --cartesian-jog-angular-speed 0.09 --cartesian-jog-gain-x 5.5 --cartesian-jog-gain-y 0.80 --cartesian-jog-gain-z 1.20 --cartesian-jog-max-joint-velocity 0.060 --keyboard-startup-delay-seconds 15 --confirm-keyboard-cartesian-jog",
+            "& " + QuotePowerShell(executablePath) + " --keyboard-cartesian-jog-endpoint-only --xbox-controller --xbox-soft-limit-near-full-range --cartesian-jog-linear-speed 0.020 --keyboard-base-rotate-speed 0.022 --cartesian-jog-angular-speed 0.09 --cartesian-jog-gain-x 5.5 --cartesian-jog-gain-y 0.80 --cartesian-jog-gain-z 1.20 --cartesian-jog-max-joint-velocity 0.060 --keyboard-startup-delay-seconds 15 --confirm-keyboard-cartesian-jog",
             "exit $LASTEXITCODE"
         });
 
@@ -236,6 +236,7 @@ public sealed class PowerShellRobotMotionService : IRobotMotionService
             @".\build-vs2022\Release\racer3-basic-motion.exe `",
             "  --keyboard-cartesian-jog-endpoint-only `",
             "  --xbox-controller `",
+            "  --xbox-soft-limit-near-full-range `",
             "  --cartesian-jog-linear-speed 0.020 `",
             "  --keyboard-base-rotate-speed 0.022 `",
             "  --cartesian-jog-angular-speed 0.09 `",

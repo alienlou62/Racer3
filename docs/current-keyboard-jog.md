@@ -127,3 +127,48 @@ Recommended first controller test command:
 ```
 
 Start slower than the validated keyboard profile, confirm there is no stick drift at center, then increase toward the keyboard profile after the mapping is verified.
+
+## Soft-limit test-window mode
+
+After live limit testing showed the modeled J4/Roll limit was too optimistic for the configured drive/RMP limits, controller limit validation should use the temporary test-window mode first:
+
+```powershell
+--xbox-soft-limit-test-window
+```
+
+This mode creates a narrow wrist-only software window around the run-start pose before jogging:
+
+- J4/Roll: +/-20 degrees from run-start
+- J5/Pitch: +/-20 degrees from run-start
+- J6/Yaw: +/-30 degrees from run-start
+
+Use this mode to prove the software guard stops/scales motion before approaching real limits. Expected behavior is that motion into the test-window edge stops or scales, while the opposite direction still moves away. Do not continue real-limit testing until this test-window behavior is confirmed.
+
+
+## Near-full operator soft-limit mode
+
+After the temporary test-window guard has been validated, use the broader near-full operator range for practical Xbox jogging:
+
+```powershell
+--xbox-soft-limit-near-full-range
+```
+
+This mode is intended to give the operator almost the full useful motion range while still avoiding hard/drive limits. It is mutually exclusive with `--xbox-soft-limit-test-window`. Initial conservative ranges are:
+
+- J1/Base: modeled XML range with about 10 degrees reserve
+- J2/J3 arm joints: modeled XML range with about 10 degrees reserve
+- J4/Roll: +/-120 degrees, intentionally below the modeled +/-180 degrees because earlier live testing showed the modeled J4 range was too optimistic for the current drive/RMP setup
+- J5/Pitch: modeled XML range with about 10 degrees reserve
+- J6/Yaw: free-spinning/unlimited in operator jog mode; verify jog/stop/H-home behavior, but do not treat yaw as a soft-limit validation axis
+
+Treat this as an operator soft range, not a hard-limit test. Approach the edges gradually and verify that the guard scales/stops while motion away remains available.
+
+### Soft-limit test-window validation note
+
+When `--xbox-soft-limit-test-window` is enabled, direct base/wrist velocity commands are refreshed while held so the software guard is re-evaluated continuously. This is required for limit testing: a held RB/LB/LT/RT/right-stick command must stop at the temporary window edge, not only after the user releases and presses the same direction again.
+
+Expected behavior near a test-window edge:
+
+- Continuing farther into the blocked direction prints a soft-limit stop message and sends no motion.
+- Moving the opposite direction is still allowed.
+- H-home remains available.

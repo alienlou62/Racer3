@@ -94,7 +94,9 @@ public:
         double gainZ,
         double maxJointVelocityUserUnitsPerSecond,
         double baseRotateVelocityUserUnitsPerSecond,
-        bool xboxControllerEnabled);
+        bool xboxControllerEnabled,
+        bool xboxSoftLimitTestWindowEnabled,
+        bool xboxSoftLimitNearFullRangeEnabled);
 
 private:
     void connectController();
