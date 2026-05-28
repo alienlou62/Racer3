@@ -1,4 +1,4 @@
-#include "Racer3BasicMotion.h"
+﻿#include "Racer3BasicMotion.h"
 
 #include <algorithm>
 #include <array>
@@ -153,7 +153,7 @@ static constexpr double EndpointCartesianXboxTriggerDeadzone = 0.15;
 static constexpr double EndpointCartesianXboxDirectionChangeThreshold = 0.08;
 static constexpr double EndpointCartesianXboxWristJointVelocityScale = 1.0;
 static constexpr double EndpointCartesianXboxQuantizationStep = 0.05;
-static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.025;
+static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.035;
 static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
 // Smooth keyboard Cartesian jog now uses a finite-difference Jacobian velocity solve
 // at the current pose. The earlier tiny endpoint-only IK lookahead worked for Z,
