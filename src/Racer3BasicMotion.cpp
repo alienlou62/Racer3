@@ -97,7 +97,7 @@ static constexpr double ArmedSessionAxis6JogJerkPercent = 5.0;
 // is medium non-append PVT smoothing spans with MotionDoneWait between spans.
 static constexpr double ArmedSessionCartesianJogDefaultSpeedMetersPerSecond = 0.003; // 3 mm/sec
 static constexpr double ArmedSessionCartesianJogMaxSpeedMetersPerSecond = 0.004;     // 4 mm/sec
-static constexpr double ArmedSessionCartesianJogMaxJointVelocity = 0.060;            // 21.6 deg/sec; temporary faster keyboard jog test cap
+static constexpr double ArmedSessionCartesianJogMaxJointVelocity = 0.070;            // 21.6 deg/sec; temporary faster keyboard jog test cap
 static constexpr int ArmedSessionCartesianJogLoopPeriodMs = 500;                    // 0.5 sec backend-owned non-append PVT smoothing span
 static constexpr double ArmedSessionCartesianJogLoopPeriodSeconds =
     static_cast<double>(ArmedSessionCartesianJogLoopPeriodMs) / 1000.0;
@@ -153,7 +153,7 @@ static constexpr double EndpointCartesianXboxTriggerDeadzone = 0.15;
 static constexpr double EndpointCartesianXboxDirectionChangeThreshold = 0.08;
 static constexpr double EndpointCartesianXboxWristJointVelocityScale = 1.0;
 static constexpr double EndpointCartesianXboxQuantizationStep = 0.05;
-static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.035;
+static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.045;
 static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
 // Smooth keyboard Cartesian jog now uses a finite-difference Jacobian velocity solve
 // at the current pose. The earlier tiny endpoint-only IK lookahead worked for Z,
@@ -11163,13 +11163,4 @@ void Racer3BasicMotion::safeShutdown() noexcept
         // Best effort cleanup; do not throw from destructor.
     }
 }
-
-
-
-
-
-
-
-
-
 
