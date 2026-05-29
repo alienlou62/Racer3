@@ -33,6 +33,7 @@ struct Racer3RunOptions
     bool robotModelProbe = false;
     bool robotPoseProbe = false;
     bool kinematicsDryRun = false;
+    bool kinematicsModelDiagnostic = false;
     bool cartesianVectorMotion = false;
     bool cartesianTraceMotion = false;
     bool positionOnlyIk = false;
@@ -89,6 +90,7 @@ public:
         double loopPeriodSeconds,
         bool motionConfirmed,
         bool diagnostics,
+        const std::string& modelDiagnosticsCsvPath,
         double gainX,
         double gainY,
         double gainZ,
@@ -121,6 +123,7 @@ private:
     void runRobotModelProbe();
     void runRobotPoseProbe();
     void runKinematicsDryRun();
+    void runKinematicsModelDiagnostic();
     void runCartesianVectorMotion();
     void runCartesianTraceMotion();
     void printMotionPlan() const;

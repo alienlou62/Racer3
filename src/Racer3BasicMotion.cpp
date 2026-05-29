@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <limits>
@@ -47,6 +48,7 @@ namespace
 {
 using JointVector = std::array<double, Racer3BasicMotion::AxisCount>;
 using CartesianVector = std::array<double, Racer3BasicMotion::AxisCount>;
+using JacobianMatrix = std::array<std::array<double, Racer3BasicMotion::AxisCount>, Racer3BasicMotion::AxisCount>;
 
 static constexpr int MultiAxisIndex = 6;
 static constexpr int Axis5Index = 4;
@@ -232,6 +234,7 @@ static bool JointVectorMotionEnabled = false;
 static bool RobotModelProbeEnabled = false;
 static bool RobotPoseProbeEnabled = false;
 static bool KinematicsDryRunEnabled = false;
+static bool KinematicsModelDiagnosticEnabled = false;
 static bool CartesianVectorMotionEnabled = false;
 static bool CartesianTraceMotionEnabled = false;
 static bool PositionOnlyIkEnabled = false;
@@ -709,6 +712,121 @@ CartesianVector subtractPoseVectorWrapped(const CartesianVector& target, const C
         wrapToPi(target[4] - current[4]),
         wrapToPi(target[5] - current[5])
     };
+}
+
+JacobianMatrix finiteDifferenceJacobianFromPose(
+    const JointVector& jointRadians,
+    const CartesianVector& currentPose,
+    double stepRadians)
+{
+    JacobianMatrix jacobian{};
+
+    for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
+    {
+        JointVector perturbedRadians = jointRadians;
+        perturbedRadians[joint] += stepRadians;
+
+        const CartesianVector perturbedPose = poseVectorFromJoints(perturbedRadians);
+        const CartesianVector poseDifference = subtractPoseVectorWrapped(perturbedPose, currentPose);
+
+        for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+        {
+            jacobian[row][joint] = poseDifference[row] / stepRadians;
+        }
+    }
+
+    return jacobian;
+}
+
+JacobianMatrix finiteDifferenceJacobianFromJoints(
+    const JointVector& jointRadians,
+    double stepRadians)
+{
+    return finiteDifferenceJacobianFromPose(
+        jointRadians,
+        poseVectorFromJoints(jointRadians),
+        stepRadians);
+}
+
+CartesianVector predictedTwistFromJacobian(
+    const JacobianMatrix& jacobian,
+    const JointVector& velocityUserUnitsPerSecond)
+{
+    CartesianVector twist{};
+
+    for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+    {
+        double value = 0.0;
+        for (int joint = 0; joint < Racer3BasicMotion::AxisCount; ++joint)
+        {
+            value += jacobian[row][joint] *
+                velocityUserUnitsPerSecond[joint] *
+                RevolutionsToRadians;
+        }
+        twist[row] = value;
+    }
+
+    return twist;
+}
+
+void printJacobianColumn(
+    const JacobianMatrix& jacobian,
+    int jointIndex,
+    const char* label)
+{
+    std::cout << "  " << label
+              << " dTCP/dq [x,y,z m/rad, roll,pitch,yaw rad/rad]: "
+              << std::fixed << std::setprecision(9);
+
+    for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+    {
+        std::cout << std::setw(14) << jacobian[row][jointIndex] << ' ';
+    }
+    std::cout << '\n';
+}
+
+void printJacobianStepCheck(
+    const JointVector& jointRadians,
+    int jointIndex,
+    double stepRadians)
+{
+    const CartesianVector basePose = poseVectorFromJoints(jointRadians);
+    const JacobianMatrix jacobian = finiteDifferenceJacobianFromPose(
+        jointRadians,
+        basePose,
+        EndpointCartesianKeyboardJogJacobianStepRadians);
+
+    JointVector stepped = jointRadians;
+    stepped[jointIndex] += stepRadians;
+    const CartesianVector steppedPose = poseVectorFromJoints(stepped);
+    const CartesianVector actualDelta = subtractPoseVectorWrapped(steppedPose, basePose);
+
+    CartesianVector predictedDelta{};
+    for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+    {
+        predictedDelta[row] = jacobian[row][jointIndex] * stepRadians;
+    }
+
+    CartesianVector residual{};
+    for (int row = 0; row < Racer3BasicMotion::AxisCount; ++row)
+    {
+        residual[row] = actualDelta[row] - predictedDelta[row];
+    }
+
+    std::ostringstream label;
+    label << "  J" << (jointIndex + 1)
+          << " +" << std::fixed << std::setprecision(3)
+          << (stepRadians * 180.0 / Pi)
+          << " deg actual FK delta";
+    printCartesianVector(label.str().c_str(), actualDelta);
+
+    label.str("");
+    label << "  J" << (jointIndex + 1) << " Jacobian-predicted delta";
+    printCartesianVector(label.str().c_str(), predictedDelta);
+
+    label.str("");
+    label << "  J" << (jointIndex + 1) << " actual-minus-predicted residual";
+    printCartesianVector(label.str().c_str(), residual);
 }
 
 double residualNorm(const CartesianVector& residual)
@@ -3033,6 +3151,7 @@ void Racer3BasicMotion::startArmedSession(double velocityUserUnitsPerSecond, boo
     RobotModelProbeEnabled = false;
     RobotPoseProbeEnabled = false;
     KinematicsDryRunEnabled = false;
+    KinematicsModelDiagnosticEnabled = false;
     CartesianVectorMotionEnabled = false;
     CartesianTraceMotionEnabled = false;
     PositionOnlyIkEnabled = true;
@@ -3279,6 +3398,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     double loopPeriodSeconds,
     bool motionConfirmed,
     bool diagnostics,
+    const std::string& modelDiagnosticsCsvPath,
     double gainX,
     double gainY,
     double gainZ,
@@ -3294,6 +3414,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
     (void)loopPeriodSeconds;
     (void)motionConfirmed;
     (void)diagnostics;
+    (void)modelDiagnosticsCsvPath;
     (void)gainX;
     (void)gainY;
     (void)gainZ;
@@ -3528,9 +3649,211 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
         bool cartesianVelocityJogActive = false;
         std::string cartesianVelocityJogLabel = "idle";
         JointVector lastCartesianVelocityCommand{};
+        CartesianVector lastTargetTwist{};
+        CartesianVector lastPredictedTwist{};
+        JacobianMatrix lastRawModelJacobian{};
+        double lastSoftLimitScale = 1.0;
+        std::string lastSoftLimitReason = "none";
         CartesianVector cartesianVelocityJogStartPose{};
         JointVector cartesianVelocityJogStartUserUnits{};
         JointVector keyboardJogStartUserUnits{};
+        const auto jogDiagnosticStart = std::chrono::steady_clock::now();
+
+        struct JogSoftLimitGuardResult
+        {
+            bool allowed = true;
+            double scale = 1.0;
+            int limitingAxis = -1;
+            std::string reason = "none";
+        };
+
+        auto softMinForAxis = [&](int axis) -> double
+        {
+            double softMin = EndpointCartesianJogSoftMinUserUnits[axis];
+
+            if (axis == 3)
+            {
+                softMin = std::max(softMin, -EndpointCartesianJogWristGuardJ4LimitDegrees / 360.0);
+            }
+            if (axis == 4)
+            {
+                softMin = std::max(softMin, -EndpointCartesianJogWristGuardJ5LimitDegrees / 360.0);
+            }
+            if (xboxSoftLimitNearFullRangeEnabled)
+            {
+                switch (axis)
+                {
+                case 0:
+                    softMin = std::max(softMin, (-150.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 1:
+                    softMin = (-75.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0;
+                    break;
+                case 2:
+                    softMin = std::max(softMin, (-155.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 3:
+                    softMin = std::max(softMin, -EndpointCartesianJogNearFullJ4LimitDegrees / 360.0);
+                    break;
+                case 4:
+                    softMin = std::max(softMin, (-105.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 5:
+                    break;
+                }
+            }
+
+            if (xboxSoftLimitTestWindowEnabled && axis >= 3 && axis <= 5)
+            {
+                const double windowDegrees = axis == 3
+                    ? EndpointCartesianJogTestWindowJ4Degrees
+                    : (axis == 4 ? EndpointCartesianJogTestWindowJ5Degrees : EndpointCartesianJogTestWindowJ6Degrees);
+                softMin = std::max(softMin, keyboardJogStartUserUnits[axis] - windowDegrees / 360.0);
+            }
+
+            return softMin;
+        };
+
+        auto softMaxForAxis = [&](int axis) -> double
+        {
+            double softMax = EndpointCartesianJogSoftMaxUserUnits[axis];
+
+            if (axis == 3)
+            {
+                softMax = std::min(softMax, EndpointCartesianJogWristGuardJ4LimitDegrees / 360.0);
+            }
+            if (axis == 4)
+            {
+                softMax = std::min(softMax, EndpointCartesianJogWristGuardJ5LimitDegrees / 360.0);
+            }
+            if (xboxSoftLimitNearFullRangeEnabled)
+            {
+                switch (axis)
+                {
+                case 0:
+                    softMax = std::min(softMax, (150.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 1:
+                    softMax = std::min(softMax, (115.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 2:
+                    softMax = std::min(softMax, (90.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 3:
+                    softMax = std::min(softMax, EndpointCartesianJogNearFullJ4LimitDegrees / 360.0);
+                    break;
+                case 4:
+                    softMax = std::min(softMax, (105.0 - EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                    break;
+                case 5:
+                    break;
+                }
+            }
+
+            if (xboxSoftLimitTestWindowEnabled && axis >= 3 && axis <= 5)
+            {
+                const double windowDegrees = axis == 3
+                    ? EndpointCartesianJogTestWindowJ4Degrees
+                    : (axis == 4 ? EndpointCartesianJogTestWindowJ5Degrees : EndpointCartesianJogTestWindowJ6Degrees);
+                softMax = std::min(softMax, keyboardJogStartUserUnits[axis] + windowDegrees / 360.0);
+            }
+
+            return softMax;
+        };
+
+        std::ofstream modelDiagnosticsCsv;
+        if (!modelDiagnosticsCsvPath.empty())
+        {
+            modelDiagnosticsCsv.open(modelDiagnosticsCsvPath, std::ios::out | std::ios::trunc);
+            if (!modelDiagnosticsCsv)
+            {
+                throw std::runtime_error("Could not open Cartesian jog model diagnostic CSV: " + modelDiagnosticsCsvPath);
+            }
+
+            modelDiagnosticsCsv
+                << "time_s,command_dir,"
+                << "j1_actual_uu,j2_actual_uu,j3_actual_uu,j4_actual_uu,j5_actual_uu,j6_actual_uu,"
+                << "j1_cmd_vel_uu_s,j2_cmd_vel_uu_s,j3_cmd_vel_uu_s,j4_cmd_vel_uu_s,j5_cmd_vel_uu_s,j6_cmd_vel_uu_s,"
+                << "fk_x_m,fk_y_m,fk_z_m,fk_roll_rad,fk_pitch_rad,fk_yaw_rad,"
+                << "target_x_mps,target_y_mps,target_z_mps,target_roll_rps,target_pitch_rps,target_yaw_rps,"
+                << "predicted_x_mps,predicted_y_mps,predicted_z_mps,predicted_roll_rps,predicted_pitch_rps,predicted_yaw_rps,"
+                << "j2_dx_drad,j2_dy_drad,j2_dz_drad,j2_droll_drad,j2_dpitch_drad,j2_dyaw_drad,"
+                << "j3_dx_drad,j3_dy_drad,j3_dz_drad,j3_droll_drad,j3_dpitch_drad,j3_dyaw_drad,"
+                << "j5_dx_drad,j5_dy_drad,j5_dz_drad,j5_droll_drad,j5_dpitch_drad,j5_dyaw_drad,"
+                << "soft_limit_scale,soft_limit_reason,j5_dist_to_min_uu,j5_dist_to_max_uu\n";
+            std::cout << "  Passive model diagnostic CSV: " << modelDiagnosticsCsvPath << "\n";
+        }
+
+        auto writeCsvTextField = [&](const std::string& value)
+        {
+            modelDiagnosticsCsv << '"';
+            for (char character : value)
+            {
+                if (character == '"')
+                {
+                    modelDiagnosticsCsv << "\"\"";
+                }
+                else
+                {
+                    modelDiagnosticsCsv << character;
+                }
+            }
+            modelDiagnosticsCsv << '"';
+        };
+
+        auto writeCsvVector = [&](const auto& values)
+        {
+            for (double value : values)
+            {
+                modelDiagnosticsCsv << ',' << value;
+            }
+        };
+
+        auto writeJacobianColumnCsv = [&](const JacobianMatrix& jacobian, int jointIndex)
+        {
+            for (int row = 0; row < AxisCount; ++row)
+            {
+                modelDiagnosticsCsv << ',' << jacobian[row][jointIndex];
+            }
+        };
+
+        auto writeModelDiagnosticCsvSample = [&](
+            const std::string& commandLabel,
+            const JointVector& actualUserUnits,
+            const JointVector& commandVelocityUserUnits,
+            const CartesianVector& currentPose,
+            const CartesianVector& targetTwist,
+            const CartesianVector& predictedTwist,
+            const JacobianMatrix& rawJacobian,
+            double softLimitScale,
+            const std::string& softLimitReason)
+        {
+            if (!modelDiagnosticsCsv.is_open())
+            {
+                return;
+            }
+
+            const double timeSeconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - jogDiagnosticStart).count();
+
+            modelDiagnosticsCsv << std::fixed << std::setprecision(9) << timeSeconds << ',';
+            writeCsvTextField(commandLabel);
+            writeCsvVector(actualUserUnits);
+            writeCsvVector(commandVelocityUserUnits);
+            writeCsvVector(currentPose);
+            writeCsvVector(targetTwist);
+            writeCsvVector(predictedTwist);
+            writeJacobianColumnCsv(rawJacobian, 1);
+            writeJacobianColumnCsv(rawJacobian, 2);
+            writeJacobianColumnCsv(rawJacobian, 4);
+            modelDiagnosticsCsv << ',' << softLimitScale << ',';
+            writeCsvTextField(softLimitReason);
+            modelDiagnosticsCsv << ','
+                                << (actualUserUnits[4] - softMinForAxis(4))
+                                << ','
+                                << (softMaxForAxis(4) - actualUserUnits[4])
+                                << '\n';
+        };
 
         auto stopCartesianVelocityJog = [&](const char* reason)
         {
@@ -3612,11 +3935,15 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             cartesianVelocityJogActive = false;
             cartesianVelocityJogLabel = "idle";
             lastCartesianVelocityCommand.fill(0.0);
+            lastTargetTwist.fill(0.0);
+            lastPredictedTwist.fill(0.0);
+            lastSoftLimitScale = 1.0;
+            lastSoftLimitReason = "none";
         };
 
         auto applyJogSoftLimitGuard = [&](JointVector& velocity,
                                            const JointVector& actualUserUnits,
-                                           const std::string& commandLabel) -> bool
+                                           const std::string& commandLabel) -> JogSoftLimitGuardResult
         {
             static const char* const jointLabels[AxisCount] = {"J1", "J2", "J3", "J4", "J5", "J6"};
 
@@ -3773,8 +4100,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
 
             if (limitingAxis < 0 || velocityScale >= 0.999999)
             {
-                return true;
+                return {};
             }
+
+            std::ostringstream reason;
+            reason << jointLabels[limitingAxis] << " " << limitingSide << " soft limit";
 
             if (velocityScale <= 0.0)
             {
@@ -3797,7 +4127,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                     stopCartesianVelocityJog("soft joint limit guard");
                 }
 
-                return false;
+                return {false, 0.0, limitingAxis, reason.str()};
             }
 
             std::cout << "Soft-limit guard scaled "
@@ -3832,10 +4162,10 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                     stopCartesianVelocityJog("soft joint limit guard near-zero scale");
                 }
 
-                return false;
+                return {false, 0.0, limitingAxis, reason.str() + " near-zero scale"};
             }
 
-            return true;
+            return {true, velocityScale, limitingAxis, reason.str()};
         };
 
         auto startCartesianVelocityJog = [&](const CartesianVector& direction)
@@ -3855,6 +4185,10 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             }
 
             const CartesianVector currentPose = poseVectorFromJoints(actualRadians);
+            const JacobianMatrix rawModelJacobian = finiteDifferenceJacobianFromPose(
+                actualRadians,
+                currentPose,
+                EndpointCartesianKeyboardJogJacobianStepRadians);
             const bool directBaseRotateJog =
                 std::fabs(direction[1]) > 1e-9 &&
                 std::fabs(direction[0]) <= 1e-9 &&
@@ -3892,10 +4226,30 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 }
 
                 const std::string newDirectionName = directionName(direction);
-                if (!applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName))
+                const CartesianVector targetTwist = predictedTwistFromJacobian(rawModelJacobian, velocity);
+                const JogSoftLimitGuardResult softLimit =
+                    applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName);
+                if (!softLimit.allowed)
                 {
+                    JointVector zeroVelocity{};
+                    lastTargetTwist = targetTwist;
+                    lastPredictedTwist.fill(0.0);
+                    lastRawModelJacobian = rawModelJacobian;
+                    lastSoftLimitScale = softLimit.scale;
+                    lastSoftLimitReason = softLimit.reason;
+                    writeModelDiagnosticCsvSample(
+                        newDirectionName,
+                        actualUserUnits,
+                        zeroVelocity,
+                        currentPose,
+                        lastTargetTwist,
+                        lastPredictedTwist,
+                        lastRawModelJacobian,
+                        lastSoftLimitScale,
+                        lastSoftLimitReason);
                     return;
                 }
+                const CartesianVector predictedTwist = predictedTwistFromJacobian(rawModelJacobian, velocity);
 
                 const bool continuingSameVelocityJog =
                     cartesianVelocityJogActive &&
@@ -3922,6 +4276,21 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 cartesianVelocityJogActive = true;
                 cartesianVelocityJogLabel = newDirectionName;
                 lastCartesianVelocityCommand = velocity;
+                lastTargetTwist = targetTwist;
+                lastPredictedTwist = predictedTwist;
+                lastRawModelJacobian = rawModelJacobian;
+                lastSoftLimitScale = softLimit.scale;
+                lastSoftLimitReason = softLimit.reason;
+                writeModelDiagnosticCsvSample(
+                    newDirectionName,
+                    actualUserUnits,
+                    lastCartesianVelocityCommand,
+                    currentPose,
+                    lastTargetTwist,
+                    lastPredictedTwist,
+                    lastRawModelJacobian,
+                    lastSoftLimitScale,
+                    lastSoftLimitReason);
                 return;
             }
 
@@ -3978,10 +4347,30 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 }
 
                 const std::string newDirectionName = directionName(direction);
-                if (!applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName))
+                const CartesianVector targetTwist = predictedTwistFromJacobian(rawModelJacobian, velocity);
+                const JogSoftLimitGuardResult softLimit =
+                    applyJogSoftLimitGuard(velocity, actualUserUnits, newDirectionName);
+                if (!softLimit.allowed)
                 {
+                    JointVector zeroVelocity{};
+                    lastTargetTwist = targetTwist;
+                    lastPredictedTwist.fill(0.0);
+                    lastRawModelJacobian = rawModelJacobian;
+                    lastSoftLimitScale = softLimit.scale;
+                    lastSoftLimitReason = softLimit.reason;
+                    writeModelDiagnosticCsvSample(
+                        newDirectionName,
+                        actualUserUnits,
+                        zeroVelocity,
+                        currentPose,
+                        lastTargetTwist,
+                        lastPredictedTwist,
+                        lastRawModelJacobian,
+                        lastSoftLimitScale,
+                        lastSoftLimitReason);
                     return;
                 }
+                const CartesianVector predictedTwist = predictedTwistFromJacobian(rawModelJacobian, velocity);
 
                 const bool continuingSameVelocityJog =
                     cartesianVelocityJogActive &&
@@ -4007,6 +4396,21 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 cartesianVelocityJogActive = true;
                 cartesianVelocityJogLabel = newDirectionName;
                 lastCartesianVelocityCommand = velocity;
+                lastTargetTwist = targetTwist;
+                lastPredictedTwist = predictedTwist;
+                lastRawModelJacobian = rawModelJacobian;
+                lastSoftLimitScale = softLimit.scale;
+                lastSoftLimitReason = softLimit.reason;
+                writeModelDiagnosticCsvSample(
+                    newDirectionName,
+                    actualUserUnits,
+                    lastCartesianVelocityCommand,
+                    currentPose,
+                    lastTargetTwist,
+                    lastPredictedTwist,
+                    lastRawModelJacobian,
+                    lastSoftLimitScale,
+                    lastSoftLimitReason);
                 return;
             }
 
@@ -4075,20 +4479,7 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 targetTwist[index] = direction[index] * angularSpeedRadiansPerSecond;
             }
 
-            std::array<std::array<double, Racer3BasicMotion::AxisCount>, AxisCount> jacobian{};
-            for (int joint = 0; joint < AxisCount; ++joint)
-            {
-                JointVector perturbedRadians = actualRadians;
-                perturbedRadians[joint] += EndpointCartesianKeyboardJogJacobianStepRadians;
-
-                const CartesianVector perturbedPose = poseVectorFromJoints(perturbedRadians);
-                const CartesianVector poseDifference = subtractPoseVectorWrapped(perturbedPose, currentPose);
-
-                for (int row = 0; row < AxisCount; ++row)
-                {
-                    jacobian[row][joint] = poseDifference[row] / EndpointCartesianKeyboardJogJacobianStepRadians;
-                }
-            }
+            JacobianMatrix jacobian = rawModelJacobian;
 
             if (planarOperatorLinearJog)
             {
@@ -4270,8 +4661,26 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                 maxJointVelocity = maxAbsJointValue(velocity);
             }
 
-            if (!applyJogSoftLimitGuard(velocity, actualUserUnits, requestedDirectionName))
+            const JogSoftLimitGuardResult softLimit =
+                applyJogSoftLimitGuard(velocity, actualUserUnits, requestedDirectionName);
+            if (!softLimit.allowed)
             {
+                JointVector zeroVelocity{};
+                lastTargetTwist = targetTwist;
+                lastPredictedTwist.fill(0.0);
+                lastRawModelJacobian = rawModelJacobian;
+                lastSoftLimitScale = softLimit.scale;
+                lastSoftLimitReason = softLimit.reason;
+                writeModelDiagnosticCsvSample(
+                    requestedDirectionName,
+                    actualUserUnits,
+                    zeroVelocity,
+                    currentPose,
+                    lastTargetTwist,
+                    lastPredictedTwist,
+                    lastRawModelJacobian,
+                    lastSoftLimitScale,
+                    lastSoftLimitReason);
                 return;
             }
 
@@ -4373,6 +4782,21 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
             cartesianVelocityJogActive = true;
             cartesianVelocityJogLabel = directionName(direction);
             lastCartesianVelocityCommand = velocity;
+            lastTargetTwist = targetTwist;
+            lastPredictedTwist = predictedTwist;
+            lastRawModelJacobian = rawModelJacobian;
+            lastSoftLimitScale = velocityScale * softLimit.scale;
+            lastSoftLimitReason = softLimit.reason;
+            writeModelDiagnosticCsvSample(
+                cartesianVelocityJogLabel,
+                actualUserUnits,
+                lastCartesianVelocityCommand,
+                currentPose,
+                lastTargetTwist,
+                lastPredictedTwist,
+                lastRawModelJacobian,
+                lastSoftLimitScale,
+                lastSoftLimitReason);
         };
 
         for (int index = 0; index < AxisCount; ++index)
@@ -4642,6 +5066,10 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
 
                 activeDirection.fill(0.0);
                 lastCartesianVelocityCommand.fill(0.0);
+                lastTargetTwist.fill(0.0);
+                lastPredictedTwist.fill(0.0);
+                lastSoftLimitScale = 1.0;
+                lastSoftLimitReason = "none";
                 cartesianVelocityJogLabel = "idle";
                 ++cartesianJogTransitions;
 
@@ -4847,6 +5275,27 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                           << pose[0] << ", " << pose[1] << ", " << pose[2]
                           << ", " << pose[3] << ", " << pose[4] << ", " << pose[5] << ")"
                           << "\n";
+
+                JointVector commandVelocityUserUnits{};
+                for (int index = 0; index < AxisCount; ++index)
+                {
+                    commandVelocityUserUnits[index] = axes_[index] ? axes_[index]->CommandVelocityGet() : 0.0;
+                }
+
+                const JacobianMatrix telemetryJacobian = finiteDifferenceJacobianFromPose(
+                    actualRadians,
+                    pose,
+                    EndpointCartesianKeyboardJogJacobianStepRadians);
+                writeModelDiagnosticCsvSample(
+                    directionName(activeDirection),
+                    actualUserUnits,
+                    commandVelocityUserUnits,
+                    pose,
+                    lastTargetTwist,
+                    lastPredictedTwist,
+                    telemetryJacobian,
+                    lastSoftLimitScale,
+                    lastSoftLimitReason);
 
                 nextTelemetry = now + std::chrono::milliseconds(EndpointCartesianKeyboardJogTelemetryPeriodMs);
             }
@@ -6319,6 +6768,7 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
     RobotModelProbeEnabled = options.robotModelProbe;
     RobotPoseProbeEnabled = options.robotPoseProbe;
     KinematicsDryRunEnabled = options.kinematicsDryRun;
+    KinematicsModelDiagnosticEnabled = options.kinematicsModelDiagnostic;
     CartesianVectorMotionEnabled = options.cartesianVectorMotion;
     CartesianTraceMotionEnabled = options.cartesianTraceMotion;
     PositionOnlyIkEnabled = options.positionOnlyIk;
@@ -6512,6 +6962,13 @@ void Racer3BasicMotion::run(const Racer3RunOptions& options)
             return;
         }
 
+        if (options.kinematicsModelDiagnostic)
+        {
+            runKinematicsModelDiagnostic();
+            safeShutdown();
+            return;
+        }
+
         if (options.cartesianVectorMotion)
         {
             runCartesianVectorMotion();
@@ -6696,6 +7153,7 @@ void Racer3BasicMotion::configureAxes()
         JointVectorMotionEnabled ||
         RobotPoseProbeEnabled ||
         KinematicsDryRunEnabled ||
+        KinematicsModelDiagnosticEnabled ||
         CartesianVectorMotionEnabled ||
         CartesianTraceMotionEnabled)
     {
@@ -8055,6 +8513,76 @@ void printSyntheticFkComparisonSet(RC::Robot* robot)
     printFkForSyntheticVector(robot, "all axes +0.01", all);
 }
 
+void printOpenRaveModelSourceSummary()
+{
+    std::cout << "\nOpenRAVE hardcoded articulated model summary:\n";
+    std::cout << "  Units: meters and radians. Runtime conversion is user_units * 2*pi.\n";
+    std::cout << "  Tool/TCP point at zero: ["
+              << OpenRaveToolPointAtZero.x << ", "
+              << OpenRaveToolPointAtZero.y << ", "
+              << OpenRaveToolPointAtZero.z << "] meters.\n";
+    std::cout << "  Joint order: J1..J6 maps directly to RapidCode Axis 0..5 after runtime AxisAdd.\n";
+    std::cout << "  No sign flips or zero offsets are applied in the live jog FK/Jacobian path.\n";
+    std::cout << "  RapidRobot AbsoluteSingleTurn home offset [rad]: ";
+    printJointVector(RapidRobotAbsoluteSingleTurnHomeRadians);
+
+    for (int index = 0; index < Racer3BasicMotion::AxisCount; ++index)
+    {
+        const FkVec3& anchor = OpenRaveJointAnchors[index];
+        const FkVec3& axis = OpenRaveJointAxes[index];
+        std::cout << "  J" << (index + 1)
+                  << " anchor_m=("
+                  << std::fixed << std::setprecision(6)
+                  << anchor.x << ", " << anchor.y << ", " << anchor.z
+                  << ") axis=("
+                  << axis.x << ", " << axis.y << ", " << axis.z
+                  << ") limit_deg=["
+                  << (OpenRaveJointMinRadians[index] * 180.0 / Pi)
+                  << ", "
+                  << (OpenRaveJointMaxRadians[index] * 180.0 / Pi)
+                  << "]\n";
+    }
+
+    const FkVec3 j5ToToolAtZero = subtractVec(OpenRaveToolPointAtZero, OpenRaveJointAnchors[4]);
+    const FkVec3 j5Axis = normalizeVec(OpenRaveJointAxes[4]);
+    const FkVec3 j5TcpTranslationPerRad = crossVec(j5Axis, j5ToToolAtZero);
+    std::cout << "  J5 zero-pose TCP lever arm from J5 axis anchor to tool: ("
+              << j5ToToolAtZero.x << ", "
+              << j5ToToolAtZero.y << ", "
+              << j5ToToolAtZero.z << ") m.\n";
+    std::cout << "  Model expectation: J5 is not orientation-only for this TCP. "
+              << "At zero, +J5 predicts dTCP/dq translation=("
+              << j5TcpTranslationPerRad.x << ", "
+              << j5TcpTranslationPerRad.y << ", "
+              << j5TcpTranslationPerRad.z
+              << ") m/rad before any base/shoulder transform.\n";
+}
+
+void printOpenRaveModelDiagnosticSample(
+    const char* label,
+    const JointVector& jointRadians)
+{
+    printOpenRaveFkReport(label, jointRadians);
+
+    const CartesianVector pose = poseVectorFromJoints(jointRadians);
+    const JacobianMatrix jacobian = finiteDifferenceJacobianFromPose(
+        jointRadians,
+        pose,
+        EndpointCartesianKeyboardJogJacobianStepRadians);
+
+    std::cout << "  Finite-difference Jacobian step: "
+              << EndpointCartesianKeyboardJogJacobianStepRadians
+              << " rad.\n";
+    printJacobianColumn(jacobian, 1, "J2");
+    printJacobianColumn(jacobian, 2, "J3");
+    printJacobianColumn(jacobian, 4, "J5");
+
+    const double checkStep = degreesToRadians(1.0);
+    printJacobianStepCheck(jointRadians, 1, checkStep);
+    printJacobianStepCheck(jointRadians, 2, checkStep);
+    printJacobianStepCheck(jointRadians, 4, checkStep);
+}
+
 
 template <typename Callable>
 void probeReadOnlyRobotCall(const char* label, Callable callable)
@@ -8410,6 +8938,121 @@ void Racer3BasicMotion::runRobotModelProbe()
     std::cout << "  - Count=0 on Probe 2 means RSI_Racer3 can create a configured Robot when Axis labels and JointAdd mappings match.\n";
     std::cout << "  - Count=0 on Probe 3 means the known generic XYZABC linear model path works.\n";
     std::cout << "  - Even if Probe 2 succeeds, this does not prove true articulated Racer3 FK/IK. It may be a linear Cartesian mapping.\n";
+}
+
+
+void Racer3BasicMotion::runKinematicsModelDiagnostic()
+{
+    std::cout << "Starting no-motion OpenRAVE/FK/Jacobian model diagnostic.\n";
+    std::cout << "No amp enable and no motion commands will be sent in this mode.\n";
+    std::cout << "This mode checks the exact custom FK/Jacobian path used by Xbox Cartesian jog telemetry and DLS solves.\n";
+
+    if (!controller_)
+    {
+        throw std::runtime_error("MotionController object is not initialized.");
+    }
+
+    if (!multiAxis_)
+    {
+        throw std::runtime_error("MultiAxis object is not initialized.");
+    }
+
+    printOpenRaveModelSourceSummary();
+
+    JointVector actualUserUnits{};
+    JointVector commandUserUnits{};
+    JointVector commandVelocityUserUnits{};
+
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        if (!axes_[index])
+        {
+            throw std::runtime_error("Axis " + std::to_string(index + 1) + " is not initialized.");
+        }
+
+        actualUserUnits[index] = axes_[index]->ActualPositionGet();
+        commandUserUnits[index] = axes_[index]->CommandPositionGet();
+        commandVelocityUserUnits[index] = axes_[index]->CommandVelocityGet();
+    }
+
+    std::cout << "\nRuntime/controller joint state after configureAxes():\n";
+    std::cout << "  Actual positions [J1..J6] user-units/revolutions: ";
+    printJointVector(actualUserUnits);
+    std::cout << "  Command positions [J1..J6] user-units/revolutions: ";
+    printJointVector(commandUserUnits);
+    std::cout << "  Command velocities [J1..J6] user-units/sec: ";
+    printJointVector(commandVelocityUserUnits);
+    std::cout << "  Note: configureAxes() sets all axes to one-revolution user units and PositionSet(0.0) for this diagnostic mode.\n";
+
+    JointVector actualRadians{};
+    JointVector commandRadians{};
+    JointVector homeAdjustedActualRadians{};
+    for (int index = 0; index < AxisCount; ++index)
+    {
+        actualRadians[index] = actualUserUnits[index] * RevolutionsToRadians;
+        commandRadians[index] = commandUserUnits[index] * RevolutionsToRadians;
+        homeAdjustedActualRadians[index] = actualRadians[index] + RapidRobotAbsoluteSingleTurnHomeRadians[index];
+    }
+
+    printOpenRaveModelDiagnosticSample(
+        "Diagnostic sample: current actual joints interpreted as software-zero OpenRAVE radians",
+        actualRadians);
+    printOpenRaveModelDiagnosticSample(
+        "Diagnostic sample: current command joints interpreted as software-zero OpenRAVE radians",
+        commandRadians);
+    printOpenRaveModelDiagnosticSample(
+        "Diagnostic sample: current actual joints plus RapidRobot AbsoluteSingleTurn home offset",
+        homeAdjustedActualRadians);
+
+    struct Sample
+    {
+        const char* label;
+        JointVector jointRadians;
+    };
+
+    std::vector<Sample> samples;
+
+    JointVector zero{};
+    samples.push_back({"Synthetic all zeros", zero});
+
+    auto addSingleJointSample = [&](const char* label, int jointIndex, double degrees)
+    {
+        JointVector q{};
+        q[jointIndex] = degreesToRadians(degrees);
+        samples.push_back({label, q});
+    };
+
+    addSingleJointSample("Synthetic J2 +10 deg", 1, 10.0);
+    addSingleJointSample("Synthetic J2 -10 deg", 1, -10.0);
+    addSingleJointSample("Synthetic J3 +10 deg", 2, 10.0);
+    addSingleJointSample("Synthetic J3 -10 deg", 2, -10.0);
+    addSingleJointSample("Synthetic J5 +10 deg", 4, 10.0);
+    addSingleJointSample("Synthetic J5 -10 deg", 4, -10.0);
+
+    JointVector lowerZReachA{};
+    lowerZReachA[1] = degreesToRadians(-45.0);
+    lowerZReachA[2] = degreesToRadians(70.0);
+    lowerZReachA[4] = degreesToRadians(-70.0);
+    samples.push_back({"Synthetic lower-Z/reach suspect A: J2=-45 J3=+70 J5=-70 deg", lowerZReachA});
+
+    JointVector lowerZReachB{};
+    lowerZReachB[1] = degreesToRadians(-65.0);
+    lowerZReachB[2] = degreesToRadians(85.0);
+    lowerZReachB[4] = degreesToRadians(-95.0);
+    samples.push_back({"Synthetic lower-Z/reach suspect B: J2=-65 J3=+85 J5=-95 deg", lowerZReachB});
+
+    std::cout << "\nSynthetic FK/Jacobian samples for sign, zero-offset, and J5 coupling checks:\n";
+    for (const Sample& sample : samples)
+    {
+        printOpenRaveModelDiagnosticSample(sample.label, sample.jointRadians);
+    }
+
+    std::cout << "\nModel diagnostic interpretation checklist:\n";
+    std::cout << "  - If measured J2/J3/J5 physical motion signs disagree with these FK deltas, fix signs before solver tuning.\n";
+    std::cout << "  - If the physical software-zero pose looks like RapidRobot AbsoluteSingleTurn home, the live jog FK may need zero offsets.\n";
+    std::cout << "  - If the tool/TCP is not at the modeled [0,0,1.012] point, J5 translation/orientation coupling will be wrong.\n";
+    std::cout << "  - The Jacobian predicted-vs-actual FK step residual should be tiny; a large residual means the finite-difference path itself is inconsistent.\n";
+    std::cout << "OpenRAVE/FK/Jacobian model diagnostic complete.\n";
 }
 
 
@@ -10045,6 +10688,15 @@ void Racer3BasicMotion::printMotionPlan() const
         std::cout << "Current implementation: FK scaffold plus wide-J1 multi-seed numerical IK dry-run with residual/joint-delta gates. Motion execution is intentionally not enabled yet.\n";
         printCartesianVector("Requested Cartesian delta", RequestedCartesianVector);
         std::cout << "\n";
+        return;
+    }
+
+    if (KinematicsModelDiagnosticEnabled)
+    {
+        std::cout << "\nOpenRAVE/FK/Jacobian model diagnostic plan\n";
+        std::cout << "Purpose: verify lower-level model assumptions before changing Xbox jog solver behavior.\n";
+        std::cout << "This mode connects to RMP and reads joints, but it does not enable amps or command motion.\n";
+        std::cout << "It prints hardcoded link anchors/axes/tool frame, software-zero and RapidRobot-home-offset FK, J2/J3/J5 Jacobian columns, and small-step FK-vs-Jacobian checks.\n\n";
         return;
     }
 

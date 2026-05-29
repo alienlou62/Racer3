@@ -48,6 +48,7 @@ void printUsage()
         << "  racer3-basic-motion --robot-model-probe [--diagnostics]\n"
         << "  racer3-basic-motion --robot-pose-probe [--diagnostics]\n"
         << "  racer3-basic-motion --kinematics-dry-run [--cartesian dx,dy,dz,dr,dp,dy] [--diagnostics]\n"
+        << "  racer3-basic-motion --kinematics-model-diagnostic [--diagnostics]\n"
         << "  racer3-basic-motion --cartesian-vector [--position-only] [--compact-motion] [--trajectory-motion] [--endpoint-only] [--segment-goal] [--confirm-motion] --cartesian dx,dy,dz,dr,dp,dy [--velocity 0.02] [--diagnostics]\n\n"
         << "  racer3-basic-motion --cartesian-trace --position-only --endpoint-only [--compact-motion] [--confirm-motion] --cartesian-waypoints \"dx,dy,dz,dr,dp,dy;...\" [--velocity 0.02] [--diagnostics]\n"
         << "  racer3-basic-motion --session-server\n"
@@ -64,6 +65,7 @@ void printUsage()
         << "  --robot-model-probe Connect/load MultiAxis and probe the RSI_Racer3 Cartesian Robot model. No amp enable or motion.\n"
         << "  --robot-pose-probe  Connect/load MultiAxis and probe read-only Robot pose/FK/IK APIs. No amp enable or motion.\n"
         << "  --kinematics-dry-run Connect/read joints and run the custom OpenRAVE Racer3 FK scaffold. No amp enable or motion.\n"
+        << "  --kinematics-model-diagnostic Connect/read joints and print OpenRAVE FK/Jacobian samples for J2/J3/J5 sign, zero, and TCP coupling checks. No amp enable or motion.\n"
         << "  --cartesian-vector Compute a guarded Cartesian IK candidate; with --confirm-motion, execute only if validation gates pass.\n"
         << "  --cartesian-trace Validate a multi-waypoint Cartesian trace; with --confirm-motion, stream the validated joint waypoints as one outbound PVT phase, then return to software zero.\n"
         << "  --session-server Start a persistent local armed session. Connects RMP, enables amps once, accepts status/stop/shutdown, trace, backend-owned Axis 6 velocity diagnostics, backend-owned Cartesian X+/Z- jog commands, and no-motion RTTask probe commands.\n"
@@ -91,6 +93,7 @@ void printUsage()
         << "  --keyboard-base-rotate-speed <value> Direct J1/base rotate speed for A/D in user-units/sec. Default 0.015.\n"
         << "  --cartesian-jog-gain-z <value> Multiplier for Z jog target speed. Default 0.65.\n"
         << "  --cartesian-jog-max-joint-velocity <value> Max absolute joint velocity for Cartesian keyboard jog in user-units/sec. Default 0.030.\n"
+        << "  --cartesian-jog-model-csv <path> Optional passive model diagnostic CSV during keyboard/Xbox Cartesian jog. Does not change jog behavior.\n"
         << "  --keyboard-jog-period-ms <value> Pulse loop period for endpoint-only keyboard jog. Default 20 ms.\n"
         << "  --diagnostics      Print full diagnostic dumps. Default output is compact.\n"
         << "  --step <value>     Relative move in user units for tiny/dual/all modes. Default 0.05.\n"
@@ -998,6 +1001,7 @@ int main(int argc, char* argv[])
             const double loopPeriodMs = getDoubleOption(args, "--keyboard-jog-period-ms", DefaultKeyboardJogLoopPeriodMilliseconds);
             const bool confirmed = hasArg(args, "--confirm-keyboard-cartesian-jog");
             const bool diagnostics = hasArg(args, "--diagnostics");
+            const std::string modelDiagnosticsCsvPath = getStringOption(args, "--cartesian-jog-model-csv", "");
             const bool xboxControllerEnabled = hasArg(args, "--xbox-controller") || hasArg(args, "--xbox-cartesian-jog");
             const bool xboxSoftLimitTestWindowEnabled = hasArg(args, "--xbox-soft-limit-test-window");
             const bool xboxSoftLimitNearFullRangeEnabled = hasArg(args, "--xbox-soft-limit-near-full-range");
@@ -1019,6 +1023,7 @@ int main(int argc, char* argv[])
                 loopPeriodMs / 1000.0,
                 confirmed,
                 diagnostics,
+                modelDiagnosticsCsvPath,
                 gainX,
                 gainY,
                 gainZ,
@@ -1098,6 +1103,7 @@ int main(int argc, char* argv[])
         options.robotModelProbe = hasArg(args, "--robot-model-probe");
         options.robotPoseProbe = hasArg(args, "--robot-pose-probe");
         options.kinematicsDryRun = hasArg(args, "--kinematics-dry-run");
+        options.kinematicsModelDiagnostic = hasArg(args, "--kinematics-model-diagnostic");
         options.cartesianVectorMotion = hasArg(args, "--cartesian-vector");
         options.cartesianTraceMotion = hasArg(args, "--cartesian-trace");
         options.positionOnlyIk = hasArg(args, "--position-only");
@@ -1106,7 +1112,7 @@ int main(int argc, char* argv[])
         options.trajectoryMotion = hasArg(args, "--trajectory-motion");
         options.endpointOnlyMotion = hasArg(args, "--endpoint-only");
         options.segmentGoalMotion = hasArg(args, "--segment-goal");
-        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.cartesianVectorMotion && !options.cartesianTraceMotion);
+        options.enableOnly = hasArg(args, "--enable-only") || (!options.dryRun && !options.tinyMotion && !options.dualMotion && !options.allMotion && !options.jointVectorMotion && !options.robotModelProbe && !options.robotPoseProbe && !options.kinematicsDryRun && !options.kinematicsModelDiagnostic && !options.cartesianVectorMotion && !options.cartesianTraceMotion);
         options.motionConfirmed = hasArg(args, "--confirm-motion");
         options.diagnostics = hasArg(args, "--diagnostics");
         options.stepUserUnits = getDoubleOption(args, "--step", DefaultStepUserUnits);
@@ -1156,11 +1162,12 @@ int main(int argc, char* argv[])
             (options.robotModelProbe ? 1 : 0) +
             (options.robotPoseProbe ? 1 : 0) +
             (options.kinematicsDryRun ? 1 : 0) +
+            (options.kinematicsModelDiagnostic ? 1 : 0) +
             (options.cartesianVectorMotion ? 1 : 0) +
             (options.cartesianTraceMotion ? 1 : 0);
         if (motionModeCount > 1)
         {
-            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, --robot-pose-probe, --kinematics-dry-run, --cartesian-vector, or --cartesian-trace.\n";
+            std::cerr << "Use only one motion mode: --tiny-motion, --dual-motion, --all-motion, --joint-vector, --robot-model-probe, --robot-pose-probe, --kinematics-dry-run, --kinematics-model-diagnostic, --cartesian-vector, or --cartesian-trace.\n";
             return 2;
         }
 
@@ -1210,6 +1217,10 @@ int main(int argc, char* argv[])
         else if (options.kinematicsDryRun)
         {
             std::cout << "Mode: KINEMATICS DRY RUN - custom OpenRAVE Racer3 FK scaffold, no amp enable, no motion.\n";
+        }
+        else if (options.kinematicsModelDiagnostic)
+        {
+            std::cout << "Mode: KINEMATICS MODEL DIAGNOSTIC - OpenRAVE FK/Jacobian sign, zero, and TCP coupling report, no amp enable, no motion.\n";
         }
         else if (options.cartesianVectorMotion)
         {
