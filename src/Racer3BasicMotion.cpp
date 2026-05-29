@@ -97,7 +97,7 @@ static constexpr double ArmedSessionAxis6JogJerkPercent = 5.0;
 // is medium non-append PVT smoothing spans with MotionDoneWait between spans.
 static constexpr double ArmedSessionCartesianJogDefaultSpeedMetersPerSecond = 0.003; // 3 mm/sec
 static constexpr double ArmedSessionCartesianJogMaxSpeedMetersPerSecond = 0.004;     // 4 mm/sec
-static constexpr double ArmedSessionCartesianJogMaxJointVelocity = 0.070;            // 21.6 deg/sec; temporary faster keyboard jog test cap
+static constexpr double ArmedSessionCartesianJogMaxJointVelocity = 0.285;            // 21.6 deg/sec; temporary faster keyboard jog test cap
 static constexpr int ArmedSessionCartesianJogLoopPeriodMs = 500;                    // 0.5 sec backend-owned non-append PVT smoothing span
 static constexpr double ArmedSessionCartesianJogLoopPeriodSeconds =
     static_cast<double>(ArmedSessionCartesianJogLoopPeriodMs) / 1000.0;
@@ -153,7 +153,7 @@ static constexpr double EndpointCartesianXboxTriggerDeadzone = 0.15;
 static constexpr double EndpointCartesianXboxDirectionChangeThreshold = 0.08;
 static constexpr double EndpointCartesianXboxWristJointVelocityScale = 1.0;
 static constexpr double EndpointCartesianXboxQuantizationStep = 0.05;
-static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.045;
+static constexpr double EndpointCartesianKeyboardJogMaxSpeedMetersPerSecond = 0.140;
 static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSecond = 0.35;
 // Smooth keyboard Cartesian jog now uses a finite-difference Jacobian velocity solve
 // at the current pose. The earlier tiny endpoint-only IK lookahead worked for Z,
@@ -162,7 +162,7 @@ static constexpr double EndpointCartesianKeyboardJogMaxAngularSpeedRadiansPerSec
 // loop closer to the future RTTask/Xbox jog-intent architecture.
 static constexpr double EndpointCartesianKeyboardJogJacobianStepRadians = 1e-5;
 static constexpr double EndpointCartesianKeyboardJogJacobianDamping = 0.035;
-static constexpr double EndpointCartesianKeyboardJogTranslationPriorityDamping = 0.003;
+static constexpr double EndpointCartesianKeyboardJogTranslationPriorityDamping = 0.0015;
 static constexpr double EndpointCartesianKeyboardJogYDamping = 0.010;
 static constexpr double EndpointCartesianKeyboardJogLinearRotationHoldWeight = 0.18;
 // Operator-planar W/S should feel like the tool leads forward/back while the
@@ -172,8 +172,8 @@ static constexpr double EndpointCartesianKeyboardJogLinearRotationHoldWeight = 0
 static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldWeight = 12.0;
 static constexpr double EndpointCartesianKeyboardJogPlanarForwardRollYawHoldWeight = 0.25;
 static constexpr double EndpointCartesianKeyboardJogPlanarForwardPitchHoldWeight = 8.0;
-static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldGainPerSecond = 4.5;
-static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldMaxCorrectionMetersPerSecond = 0.020;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldGainPerSecond = 2.0;
+static constexpr double EndpointCartesianKeyboardJogPlanarForwardZHoldMaxCorrectionMetersPerSecond = 0.006;
 static constexpr int EndpointCartesianKeyboardJogLinearVelocityRefreshMs = 100;
 static constexpr double EndpointCartesianKeyboardJogYRotationHoldWeight = 0.10;
 // Y jogging from the upright pose legitimately needs base rotation, but it must
@@ -188,7 +188,7 @@ static constexpr double EndpointCartesianKeyboardJogYMinEfficiency = 0.08;
 static constexpr int EndpointCartesianKeyboardJogYVelocityRefreshMs = 100;
 static constexpr double EndpointCartesianKeyboardJogNearZeroJointVelocityUserUnitsPerSecond = 1e-7;
 static constexpr double EndpointCartesianKeyboardJogMaxJointVelocityUserUnitsPerSecond = ArmedSessionCartesianJogMaxJointVelocity;
-static constexpr double EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2 = 0.20;
+static constexpr double EndpointCartesianKeyboardJogJointAccelerationUserUnitsPerSecond2 = 0.30;
 static constexpr double EndpointCartesianKeyboardJogJerkPercent = 5.0;
 static constexpr int EndpointCartesianKeyboardJogVelocityStopSettleMs = 150;
 static constexpr int EndpointCartesianKeyboardJogVelocityStopDoneWaitMs = 1500;
@@ -202,11 +202,11 @@ static constexpr double EndpointCartesianJogSoftLimitReserveDegrees = 5.0;
 static constexpr double EndpointCartesianJogSoftLimitLookaheadSeconds = 0.40;
 static constexpr double EndpointCartesianJogSoftLimitNearZeroVelocityUserUnitsPerSecond = 1e-6;
 static constexpr double EndpointCartesianJogWristGuardJ4LimitDegrees = 135.0;
-static constexpr double EndpointCartesianJogWristGuardJ5LimitDegrees = 95.0;
+static constexpr double EndpointCartesianJogWristGuardJ5LimitDegrees = 100.0;
 static constexpr double EndpointCartesianJogTestWindowJ4Degrees = 20.0;
 static constexpr double EndpointCartesianJogTestWindowJ5Degrees = 20.0;
 static constexpr double EndpointCartesianJogTestWindowJ6Degrees = 30.0;
-static constexpr double EndpointCartesianJogNearFullRangeReserveDegrees = 10.0;
+static constexpr double EndpointCartesianJogNearFullRangeReserveDegrees = 2.0;
 static constexpr double EndpointCartesianJogNearFullJ4LimitDegrees = 120.0;
 static constexpr std::array<double, Racer3BasicMotion::AxisCount> EndpointCartesianJogSoftMinUserUnits = {
     (-150.0 + EndpointCartesianJogSoftLimitReserveDegrees) / 360.0,
@@ -3644,7 +3644,11 @@ void Racer3BasicMotion::runEndpointOnlyCartesianKeyboardJog(
                         softMin = std::max(softMin, (-150.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
                         break;
                     case 1:
-                        softMin = std::max(softMin, (-75.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
+                        // Near-full Xbox jog intentionally allows J2 closer to the modeled
+                        // shoulder negative limit than the normal conservative soft-limit array.
+                        // The earlier std::max() kept the normal soft min active and caused X
+                        // reach to collapse early around -70 deg even in near-full mode.
+                        softMin = (-75.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0;
                         break;
                     case 2:
                         softMin = std::max(softMin, (-155.0 + EndpointCartesianJogNearFullRangeReserveDegrees) / 360.0);
@@ -11163,4 +11167,27 @@ void Racer3BasicMotion::safeShutdown() noexcept
         // Best effort cleanup; do not throw from destructor.
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
